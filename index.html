@@ -1,8 +1,6 @@
+<!-- PM-Core (c) 2026 Paul Hsu. All Rights Reserved. Proprietary — see LICENSE. -->
 <!DOCTYPE html>
-<!--
-  PM-Core — Copyright (c) 2026 Paul Hsu (PaulHsu02060). All Rights Reserved.
-  專有軟體·保留一切權利。非經著作權人書面同意，禁止複製、修改、逆向再構築、散布或商業利用。詳見 repo 根目錄 LICENSE。
--->
+
 <html lang="zh-TW">
 <head>
 <meta charset="UTF-8">
@@ -21,9 +19,9 @@
 </head>
 <body>
 
-<!-- ─── LOGIN OVERLAY ─── -->
+
 <div class="login-overlay" id="loginOverlay">
-  <!-- §26 登入落地頁（方案 A）·登入前零真資料（§8f.6）·剪影全去資料化·純 Google 帳號登入（身分/權限由後端 Script Properties 判定·§8f.6） -->
+  
   <div class="lg-wrap">
     <div class="lg-nav">
       <div class="lg-brand"><span class="lg-logo">P</span><span class="js-brand-name">PM-Core</span></div>
@@ -50,11 +48,11 @@
   </div>
 </div>
 
-<!-- ─── APP SHELL ─── -->
+
 <div class="app">
 
   <aside class="sidebar">
-    <!-- 固定頂：品牌＋摺疊鈕＋使用者＋導覽＋建案 CTA -->
+    
     <div class="sb-top">
       <div class="sb-brand">
         <div class="sb-brand-row">
@@ -93,12 +91,12 @@
       </button>
     </div>
 
-    <!-- 捲動中段：NPI／ECN 兩群清單（App.renderSidebar 動態生成，案子多時只捲這段） -->
+    
     <div class="sb-scroll">
       <div class="sb-proj-list" id="projectList"></div>
     </div>
 
-    <!-- 固定底：報告／設定／登出 -->
+    
     <div class="sb-bottom">
       <div class="sb-section">
         <div class="sb-nav">
@@ -133,7 +131,7 @@
         👁 你目前是「僅檢視」模式。需要編輯請重新整理頁面後登入。
       </div>
 
-      <!-- Pages are rendered dynamically -->
+      
       <div class="page active" id="page-home"></div>
       <div class="page" id="page-workspace"></div>
       <div class="page" id="page-portfolio"></div>
@@ -152,21 +150,18 @@
   </main>
 </div>
 
-<!-- ─── MODAL CONTAINER ─── -->
+
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal" id="modal"></div>
 </div>
 
-<!-- ─── CONFIRM OVERLAY（§6.5 塊三：第二層確認框，不覆寫 #modal 表單）─── -->
+
 <div id="confirmOverlay" class="confirm-overlay" style="display:none;"></div>
 
-<!-- ─── TOAST ─── -->
+
 <div class="toast-container" id="toastContainer"></div>
 
-<!-- ─── CONFIG + SEED 載入順序 ───────────────────────────────
-     鐵則：假值模板先載 → .local 真值後載覆蓋 → 最後才 app.js。
-     config.local.js / seed.local.js 不進 git；本機不存在時瀏覽器僅
-     在 console 印 404（非致命），APP_CONFIG / SEED_* 自動沿用假值 fallback。 -->
+
 <script src="config/config.js?v=20260711-3"></script>
 <script src="config.local.js?v=20260605-1"></script>
 <script src="config/seed.sample.js?v=20260605-1"></script>
