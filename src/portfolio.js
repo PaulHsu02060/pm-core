@@ -1,0 +1,1797 @@
+// portfolio.js — 全專案總覽（Portfolio.*）。app.js 之後載入；TDZ 鐵則見 docs §18.7.1。
+// ═══════════════════════════════════════════════════════
+//  PAGE: DASHBOARD
+// ═══════════════════════════════════════════════════════
+Portfolio.buildTabsHtml = function() {
+  const v = App.currentView;
+  return `
+    <div class="tabs">
+      <button class="tab-btn ${v === 'overview' ? 'active' : ''}" onclick="Portfolio.switchTab('overview')">總覽</button>
+      <button class="tab-btn ${v === 'gantt' ? 'active' : ''}" onclick="Portfolio.switchTab('gantt')">跨專案時程</button>
+      <button class="tab-btn ${v === 'month' ? 'active' : ''}" onclick="Portfolio.switchTab('month')">歷史月曆</button>
+    </div>`;
+};
+
+Portfolio.render = function() {
+  document.getElementById('page-portfolio').innerHTML =
+    `<div class="view-tabs-bar">${this.buildTabsHtml()}</div><div id="portfolio-body"></div>`;
+  this.renderBody();
+};
+
+Portfolio.switchTab = function(view) {
+  App.currentView = view;
+  if (view === 'gantt') { App.ganttProjectFilter = new Set(DATA.projects.map(p => p.id)); App.ganttStageFilter = null; App.ganttOwnerFilter = null; }
+  document.getElementById('page-portfolio').innerHTML =
+    `<div class="view-tabs-bar">${this.buildTabsHtml()}</div><div id="portfolio-body"></div>`;
+  this.renderBody();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+};
+
+Portfolio.renderBody = function() {
+  const v = App.currentView;
+  if (v === 'gantt') {   // §18.16：跨專案時程＝月/季戰略甘特（舊 14 天任務級甘特已拔除，改「點專案名跳單案詳細」）
+    this.renderStrategicGantt('portfolio-body');
+    const el = document.getElementById('portfolio-body');
+    if (el) { el.insertAdjacentHTML('afterbegin', '<div id="pf-pmband">' + this._pmBandHtml() + '</div>'); this._pmScrollEnd(); }
+    this._deptHeadcountNudge();   // 主動通知：已設擔當但未登記人數的多人部門
+    return;
+  }
+  if (v === 'month') return App.renderMonth('portfolio-body');
+  this.renderOverview('portfolio-body');
+};
+
+// ═══════════════════════════════════════════════════════
+//  §18.16 跨專案時程 戰略甘特（月/季·階段區塊＋里程碑鑽石＋撞期帶＋PM 負荷帶）
+//  純顯示層·引擎零變更：階段起訖讀 getProjectStages、致命傷讀 _projKeyRisk、
+//  PM 帶讀 _pmWindowLoad（與 P1/總覽同口徑，規則13/15）。等寬月欄，日期以「月內天數比例」定位。
+// ═══════════════════════════════════════════════════════
+Portfolio._sgSpan = 6;        // 顯示月數：1(月)／3(季)／6(半年·預設)／12(年)
+Portfolio._sgAnchorISO = '';  // 視窗第一個月 1 號（ISO）；空＝本月
+
+// 視窗第一個月（Date·當月 1 號）；首次預設「上月」1 號（含 1 個月近期脈絡，進行中案看得到真實起點）
+Portfolio._sgAnchor = function() {
+  if (!this._sgAnchorISO) {
+    const t = D.today();
+    this._sgAnchorISO = D.fmt(new Date(t.getFullYear(), t.getMonth() - 1, 1), 'iso');
+  }
+  const a = new Date(this._sgAnchorISO);
+  return new Date(a.getFullYear(), a.getMonth(), 1);
+};
+// 視窗涵蓋的月份陣列（各月 1 號 Date）
+Portfolio._sgMonths = function() {
+  const a = this._sgAnchor(), out = [];
+  for (let i = 0; i < this._sgSpan; i++) out.push(new Date(a.getFullYear(), a.getMonth() + i, 1));
+  return out;
+};
+// 日期→視窗內 x%（等寬月欄：月序 + 月內天數比例）；早於窗回 0、晚於窗回 100
+Portfolio._sgPct = function(iso) {
+  if (!iso) return null;
+  const a = this._sgAnchor(), N = this._sgSpan;
+  const winEnd = new Date(a.getFullYear(), a.getMonth() + N, 1);   // 窗尾（不含）
+  const d = new Date(iso); d.setHours(0, 0, 0, 0);
+  if (d < a) return 0;
+  if (d >= winEnd) return 100;
+  const mi = (d.getFullYear() - a.getFullYear()) * 12 + (d.getMonth() - a.getMonth());
+  const dim = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  return (mi + (d.getDate() - 1) / dim) / N * 100;
+};
+// 階段色調：完成綠／落後超期紅／進行中琥珀／未來灰（與甘特三色語意一致）
+Portfolio._sgStageTone = function(sm, todayIso) {
+  if (sm.itemCount > 0 && sm.doneCount >= sm.itemCount) return 'done';
+  if (sm.latestEnd && sm.latestEnd < todayIso) return 'late';
+  if (sm.earliestStart && sm.earliestStart <= todayIso) return 'wip';
+  return 'future';
+};
+// 某案里程碑：milestone 型任務＋上市日(NPI)／生效日(ECN)。回 [{iso,name,kind}]
+Portfolio._sgMilestones = function(p) {
+  const out = [];
+  this._live().filter(t => t.project === p.id && t.taskType === 'milestone').forEach(t => {
+    const e = getEffectiveSchedule(t), iso = e.end || e.start;
+    if (iso) out.push({ iso, name: t.name, kind: 'task', done: t.status === 'done' });
+  });
+  if (p.ecnType) {
+    if (p.effectiveDate) out.push({ iso: p.effectiveDate, name: '生效日', kind: 'effective' });
+  } else {
+    const vs = p.variants || []; let any = false;
+    vs.forEach(v => { const d = v.schedule && (v.schedule.endDate || v.schedule.targetEndDate); if (d) { any = true; out.push({ iso: d, name: (v.name ? v.name + ' ' : '') + '上市', kind: 'launch' }); } });
+    if (!any && p.pdcaData && p.pdcaData.targetDate) out.push({ iso: p.pdcaData.targetDate, name: '上市', kind: 'launch' });
+  }
+  return out;
+};
+// 里程碑色調：已達成（milestone 任務 done）一律綠、不因日期過了報紅；未達成且已過今天＝超期紅、否則安全綠
+Portfolio._sgMsTone = function(m, p, todayIso) {
+  if (m.done) return 'ok';
+  const overdue = m.iso < todayIso && (p.status || 'active') !== 'closed';
+  return overdue ? 'late' : 'ok';
+};
+
+Portfolio.setSgSpan = function(n) { this._sgSpan = n; this.renderStrategicGantt('portfolio-body'); this._sgReprepend(); };
+Portfolio.sgShift = function(months) {
+  const a = this._sgAnchor();
+  this._sgAnchorISO = D.fmt(new Date(a.getFullYear(), a.getMonth() + months, 1), 'iso');
+  this.renderStrategicGantt('portfolio-body'); this._sgReprepend();
+};
+Portfolio.sgToday = function() { this._sgAnchorISO = ''; this.renderStrategicGantt('portfolio-body'); this._sgReprepend(); };
+// §18.16 Phase 2：部門人力水位帶折疊（狀態記 localStorage·比照側欄·預設展開）
+Portfolio.toggleDeptBand = function() {
+  const cur = localStorage.getItem('pm_sg_deptband') === '1';
+  try { localStorage.setItem('pm_sg_deptband', cur ? '0' : '1'); } catch (e) {}
+  this.renderStrategicGantt('portfolio-body'); this._sgReprepend();
+};
+// 切換/導覽重繪 body 後補回頁頂 PM 負荷卡（與 renderBody 同結構）
+Portfolio._sgReprepend = function() {
+  const el = document.getElementById('portfolio-body');
+  if (el) { el.insertAdjacentHTML('afterbegin', '<div id="pf-pmband">' + this._pmBandHtml() + '</div>'); this._pmScrollEnd(); }
+};
+
+Portfolio.renderStrategicGantt = function(targetId) {
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  const projs = (DATA.projects || []).filter(p => (p.status || 'active') === 'active');
+  const months = this._sgMonths(), N = this._sgSpan;
+  const today = D.today(), todayIso = D.fmt(today, 'iso');
+  const spanLabel = { 1: '月', 3: '季', 6: '半年', 12: '年' };
+  const step = Math.max(1, Math.round(N / 2));   // 導覽步距隨跨度自適應（月±1/季±2/半年±3/年±6），每按半個窗、有重疊
+  const fmtYM = d => d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0');   // 半形斜線＋補零，格式整齊（2026/06）
+
+  const toolbar = `<div class="sg-toolbar">
+    <div class="sg-range">${fmtYM(months[0])} – ${fmtYM(months[N - 1])}</div>
+    <div class="sg-spanbtns">
+      ${[1, 3, 6, 12].map(n => `<button class="sg-spanbtn ${this._sgSpan === n ? 'active' : ''}" onclick="Portfolio.setSgSpan(${n})">${spanLabel[n]}</button>`).join('')}
+    </div>
+    <div class="sg-nav">
+      <button onclick="Portfolio.sgShift(-${step})">‹ 前 ${step} 月</button>
+      <button onclick="Portfolio.sgToday()">今天</button>
+      <button onclick="Portfolio.sgShift(${step})">後 ${step} 月 ›</button>
+    </div>
+  </div>`;
+
+  if (!projs.length) {
+    el.innerHTML = `<div class="sg-card">${toolbar}
+      <div class="sg-empty"><i class="ti ti-timeline"></i>目前沒有進行中的專案。建立專案（NPI 或 ECN）後，這裡會用月/季戰略視圖呈現各案的階段節奏、里程碑與撞期預警。</div>
+    </div>`;
+    return;
+  }
+
+  // 今日線（落在窗內才畫）；「今天」標籤改掛在月標頭上、對齊線位（見 head）
+  const todayPct = (today >= months[0] && today < new Date(months[0].getFullYear(), months[0].getMonth() + N, 1)) ? this._sgPct(todayIso) : null;
+  const todayMark = todayPct !== null ? `<div class="sg-today" style="left:${todayPct.toFixed(2)}%"></div>` : '';
+
+  // 里程碑撞期：全案里程碑按 yyyy-mm 分桶計數（≥2＝撞期）
+  const clashByMonth = {};
+  projs.forEach(p => this._sgMilestones(p).forEach(m => {
+    const key = m.iso.slice(0, 7); (clashByMonth[key] = clashByMonth[key] || []).push({ p, m });
+  }));
+
+  // 排序：以最早階段起始（時間線順序）
+  const stageMap = new Map();
+  projs.forEach(p => stageMap.set(p.id, App.getProjectStages(p.id).filter(s => s.name !== '未分階段')));
+  projs.sort((a, b) => {
+    const ea = (stageMap.get(a.id).map(s => s.earliestStart).filter(Boolean).sort()[0]) || '9999';
+    const eb = (stageMap.get(b.id).map(s => s.earliestStart).filter(Boolean).sort()[0]) || '9999';
+    return ea < eb ? -1 : (ea > eb ? 1 : 0);
+  });
+
+  // ── 表頭：月欄 ──
+  let head = '<div class="sg-corner">專案／部門</div>';
+  months.forEach(mo => {
+    const isCur = mo.getFullYear() === today.getFullYear() && mo.getMonth() === today.getMonth();
+    // 當月標頭掛「今天」標籤，left% 對齊下方今日線（月內天數比例，與 _sgPct 同算法）
+    let todayTag = '';
+    if (isCur) {
+      const dim = new Date(mo.getFullYear(), mo.getMonth() + 1, 0).getDate();
+      const tp = (today.getDate() - 1) / dim * 100;
+      todayTag = `<span class="sg-hd-today" style="left:${tp.toFixed(1)}%">今天</span>`;
+    }
+    head += `<div class="sg-mhead ${isCur ? 'cur' : ''}">${todayTag}<span class="sg-mh-y">${mo.getFullYear()}</span><b>${mo.getMonth() + 1}月</b></div>`;
+  });
+
+  // ── 撞期帶 ──
+  let clashBand = '<div class="sg-band-label"><i class="ti ti-alert-triangle"></i>里程碑衝突</div>';
+  months.forEach(mo => {
+    const arr = clashByMonth[D.fmt(mo, 'iso').slice(0, 7)] || [];
+    const hot = arr.length >= 2;
+    const tip = hot ? U.esc(arr.map(x => x.p.name + '·' + x.m.name).join('｜')) : '';
+    clashBand += `<div class="sg-clash ${hot ? 'hot' : ''}"${hot ? ` data-tip="里程碑衝突|${tip}"` : ''}>${hot ? arr.length + ' 案衝突' : (arr.length === 1 ? '<span class="sg-clash-1">◆</span>' : '')}</div>`;
+  });
+
+  // ── PM 負荷帶（按月）──
+  let pmBand = '<div class="sg-band-label"><i class="ti ti-user-cog"></i>PM 協調負荷</div>';
+  months.forEach(mo => {
+    const mEnd = new Date(mo.getFullYear(), mo.getMonth() + 1, 0);
+    const rate = this._pmWindowLoad(mo, mEnd).rate;
+    const tone = rate > 100 ? 'over' : (rate >= 80 ? 'warn' : (rate > 0 ? 'ok' : 'none'));
+    pmBand += `<div class="sg-pm sg-pm-${tone}" data-tip="PM 負荷|${mo.getMonth() + 1}月 稼動 ${rate}%">${rate > 0 ? rate + '%' : '—'}</div>`;
+  });
+
+  // ── 部門人力水位帶（§18.16 Phase 2·可折疊·C 混合容量）──
+  const deptCollapsed = localStorage.getItem('pm_sg_deptband') === '1';
+  const deptHead = `<div class="sg-band-label sg-dept-head${deptCollapsed ? ' collapsed' : ''}" onclick="Portfolio.toggleDeptBand()"><i class="ti ti-chevron-down sg-chev"></i><i class="ti ti-building-community"></i>部門人力水位<i class="ti ti-settings sg-gear" title="編輯部門人數" onclick="event.stopPropagation();Portfolio.openDeptHeadcount()"></i></div>`
+    + months.map(() => '<div class="sg-dhblank"></div>').join('');
+  let deptBand = deptHead;
+  if (!deptCollapsed) {
+    if (!this._deptTaggedAny()) {
+      deptBand += `<div class="sg-empty-band"><i class="ti ti-info-circle"></i><span>目前尚無任務編配至部門，無法計算人力水位。請先至各專案任務清單的「部門」欄位<b>為任務指定部門</b>，並點擊本區塊右上角的齒輪圖示，或此處<span class="sg-link" onclick="Portfolio.openDeptHeadcount()">登記部門人數</span>，即可啟用水位帶計算。</span></div>`;
+    } else {
+      const rosterCounts = this._deptRosterCounts();
+      const drows = [];
+      this._deptNameUnion().forEach(name => {
+        const hcInfo = this._deptHeadcount(name, rosterCounts);
+        const cells = months.map(mo => this._deptWindowLoad(name, mo, new Date(mo.getFullYear(), mo.getMonth() + 1, 0), hcInfo.count));
+        if (cells.reduce((a, c) => a + c.needHrs, 0) <= 0) return;   // 只顯本視窗有負荷的部門（無負荷不硬塞·維持乾淨）
+        drows.push({ name, hcInfo, cells, peak: Math.max(0, ...cells.map(c => c.rate)) });
+      });
+      drows.sort((a, b) => b.peak - a.peak);   // 峰值高→低（爆的排上面）
+      if (!drows.length) {
+        deptBand += `<div class="sg-empty-band"><i class="ti ti-info-circle"></i><span>本區間各部門皆無在途負荷。</span></div>`;
+      } else {
+        deptBand += drows.map(r => {
+          const cnt = r.hcInfo.estimated ? `<span class="sg-dept-est">推估 ${r.hcInfo.count} 人</span>` : `<span class="sg-dept-cnt">${r.hcInfo.count} 人</span>`;
+          const lbl = `<div class="sg-band-label sg-dept-lbl${r.hcInfo.estimated ? ' est' : ''}">${U.esc(r.name)}${cnt}</div>`;
+          return lbl + r.cells.map((c, i) => {
+            const tone = c.rate > 100 ? 'over' : (c.rate >= 80 ? 'warn' : (c.rate > 0 ? 'ok' : 'none'));
+            const tip = `部門水位|${U.esc(r.name)} ${months[i].getMonth() + 1}月 水位 ${c.rate}%（負荷 ${c.needHrs}h／容量 ${c.capHrs}h · ${r.hcInfo.count}人）`;
+            return `<div class="sg-wl sg-wl-${tone}" data-tip="${tip}">${c.rate > 0 ? c.rate + '%' : '—'}</div>`;
+          }).join('');
+        }).join('');
+      }
+    }
+  }
+
+  // ── 專案列 ──
+  const rows = projs.map(p => {
+    const kr = this._projKeyRisk(p);
+    const stages = stageMap.get(p.id);
+    // 階段區塊：先算位置，再貪心分軌——時間重疊的階段疊到不同列、互不覆蓋（硬體常有並行階段）
+    const segs = [];
+    stages.forEach(sm => {
+      const l = this._sgPct(sm.earliestStart), r0 = this._sgPct(sm.latestEnd);
+      if (l === null || r0 === null || r0 <= 0 || l >= 100 || r0 - l <= 0) return;
+      segs.push({ l, r: Math.max(r0, l + 1.2), sm });
+    });
+    segs.sort((a, b) => a.l - b.l);
+    const laneRight = [];   // 各列目前最右緣%；新段起點 ≥ 某列最右緣即可共用該列，否則開新列
+    segs.forEach(s => {
+      let lane = laneRight.findIndex(rt => s.l >= rt - 0.3);
+      if (lane < 0) lane = laneRight.length;
+      laneRight[lane] = s.r; s.lane = lane;
+    });
+    const laneCount = Math.max(1, laneRight.length);
+    const trackH = laneCount * 26 + 8;   // 每列 22px 條＋4px 間距，上下留餘白
+    const blocks = segs.map(s => {
+      const w = s.r - s.l, tone = this._sgStageTone(s.sm, todayIso), sm = s.sm;
+      const tip = `${U.esc(sm.name)}｜${sm.doneCount}/${sm.itemCount} 完成｜${sm.earliestStart ? D.fmt(sm.earliestStart, 'md') : '?'}–${sm.latestEnd ? D.fmt(sm.latestEnd, 'md') : '?'}`;
+      return `<div class="sg-stage sg-t-${tone}" style="left:${s.l.toFixed(2)}%; width:${w.toFixed(2)}%; top:${5 + s.lane * 26}px" data-tip="階段|${tip}">${w > 5 ? U.esc(sm.name) : ''}</div>`;
+    }).join('');
+    // 里程碑鑽石
+    const diamonds = this._sgMilestones(p).map(m => {
+      const x = this._sgPct(m.iso);
+      if (x === null || x <= 0 || x >= 100) return '';
+      const tone = this._sgMsTone(m, p, todayIso);
+      return `<div class="sg-ms sg-ms-${tone}" style="left:${x.toFixed(2)}%; top:16px" data-tip="里程碑|${U.esc(m.name)}·${D.fmt(m.iso, 'md')}">◆</div>`;
+    }).join('');
+    const hasBlock = segs.length > 0;
+    const riskTone = { green: 'ok', yellow: 'warn', red: 'over', muted: 'none' }[kr.tone] || 'none';
+    // 無資料（muted）＝顯「—」不塞落落長文字（減視覺雜訊·規則16 仍常駐欄位）；完整說明移到 hover title
+    const riskVal = kr.tone === 'muted' ? '—' : U.esc(String(kr.value));
+    const riskTitle = kr.tone === 'muted' ? ' title="' + U.esc(String(kr.value) + (kr.sub ? '·' + kr.sub : '')) + '"' : '';
+    return `<div class="sg-plabel" onclick="App.openProject('${p.id}')" title="點擊進入單案詳細">
+        <div class="sg-pname"><span class="sg-pn">${U.esc(p.name)}</span><span class="sg-kind sg-kind-${p.ecnType ? 'ecn' : 'npi'}">${p.ecnType ? 'ECN' : 'NPI'}</span></div>
+        <div class="sg-prisk sg-risk-${riskTone}"${riskTitle}>${U.esc(kr.label)}：<b>${riskVal}</b></div>
+      </div>
+      <div class="sg-track" style="height:${hasBlock ? trackH : 40}px">${todayMark}${blocks}${diamonds}${hasBlock ? '' : '<span class="sg-noplan">此案在本區間無排程階段</span>'}</div>`;
+  }).join('');
+
+  el.innerHTML = `<div class="sg-card">${toolbar}
+    <div class="sg-scroll">
+      <div class="sg-grid" style="--sg-cols:${N}; min-width:${230 + N * 72}px">
+        ${head}
+        ${clashBand}
+        ${pmBand}
+        ${deptBand}
+        ${rows}
+      </div>
+    </div>
+    <div class="sg-legend">
+      <span class="sg-lg"><span class="sg-sw sg-t-done"></span>已完成</span>
+      <span class="sg-lg"><span class="sg-sw sg-t-wip"></span>進行中</span>
+      <span class="sg-lg"><span class="sg-sw sg-t-late"></span>落後超期</span>
+      <span class="sg-lg"><span class="sg-sw sg-t-future"></span>未來</span>
+      <span class="sg-lg"><span class="sg-lg-ms">◆</span>里程碑</span>
+      <span class="sg-lg" style="margin-left:auto">點專案名 → 進單案詳細甘特</span>
+    </div>
+  </div>`;
+  // 最小顯示寬度原則：實測每個色塊，文字塞不下（scrollWidth 溢出）就清掉、只留 hover tooltip（不硬縮、不裁字）
+  el.querySelectorAll('.sg-stage').forEach(s => {
+    if (s.textContent && s.scrollWidth > s.clientWidth + 1) s.textContent = '';
+  });
+};
+
+// ═══ Phase 1 總覽算法 helper（§18.8，純資料層，不碰 DOM/Storage）═══
+Portfolio._live = function() { return (DATA.tasks || []).filter(t => !t._deleted); };
+
+// 逾期口徑（與 §4.6/KPI 一致）：未完成/未擱置且有效完成日 < 今天
+Portfolio._overdue = function(t, today) {
+  return isTaskDelayed(t, today);   // 逾期口徑單一來源（§4.6：未完成/未擱置 + 有效迄日<今天）
+};
+
+// §18.15：舊 KPI 計算層（projectHealth/healthCounts/totalProgress/overdueTasks/choreRatio）已隨 4 KPI 改版移除——
+// 新 KPI 改用「與 P1 差異表同口徑」的落差/達成率/過載人數（見 renderOverview），舊逾期式健康度不再是單一真實來源（規則15）。
+
+// ═══ 較上週 KPI 輕量週快照（§18.12，純前端 localStorage，與 §17 後端全量快照獨立）═══
+// 只快取「當下算出的 4 個 KPI 值」做週對比，不碰 DATA、不進雲端 blob、不被 migration 影響。
+Portfolio._KPI_SNAP_KEY = 'pm_kpi_snapshot_v1';
+Portfolio._kpiSnapRead = function() {
+  try { return JSON.parse(localStorage.getItem(this._KPI_SNAP_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+};
+// upsert 本週快照（idempotent）＋只留最近 2 週（本週＋上週），回傳上週快照（無則 null）。
+Portfolio._kpiSnap = function(cur) {
+  const monday = D.monday();
+  const curKey = D.weekKey(monday), prevKey = D.weekKey(D.addDays(monday, -7));
+  const store = this._kpiSnapRead();
+  const prev = store[prevKey] || null;
+  store[curKey] = { ...cur, ts: D.fmt(D.today(), 'iso') };
+  const keep = [curKey, prevKey];
+  Object.keys(store).forEach(k => { if (!keep.includes(k)) delete store[k]; });
+  try { localStorage.setItem(this._KPI_SNAP_KEY, JSON.stringify(store)); } catch (e) {}
+  return prev;
+};
+// 趨勢徽章：cur/prev 同指標數值。opt.betterWhenDown=數字變小=改善；opt.neutral=不判好壞（雜事偏忙）。
+// 無上週（prev null）或本期無值→灰「—」。色義看「好壞」不看箭頭方向（§18.12）。
+Portfolio._trendBadge = function(cur, prev, opt) {
+  opt = opt || {};
+  if (prev === null || prev === undefined || cur === null || cur === undefined)
+    return '<span class="pf-trend pf-trend-none">—</span>';
+  const d = cur - prev, suffix = opt.suffix || '', prefix = opt.prefix || '';
+  if (d === 0) return `<span class="pf-trend pf-trend-flat"><i class="ti ti-minus"></i>${prefix}0${suffix}</span>`;
+  const arrow = d > 0 ? 'ti-arrow-up' : 'ti-arrow-down';
+  let tone;
+  if (opt.neutral) tone = 'busy';
+  else tone = (opt.betterWhenDown ? d < 0 : d > 0) ? 'good' : 'bad';
+  return `<span class="pf-trend pf-trend-${tone}"><i class="ti ${arrow}"></i>${prefix}${Math.abs(d)}${suffix}</span>`;
+};
+
+// C 當前階段：首個未全完成階段顯示名（getProjectStages 的 minWbs 序）
+Portfolio.currentStage = function(projId) {
+  const stages = App.getProjectStages(projId).filter(s => s.name !== '未分階段');
+  if (!stages.length) return '—';
+  const inc = stages.find(s => s.doneCount < s.itemCount);
+  return inc ? inc.name : '已完成';
+};
+
+// 專案實際/預計總進度（雙列，§18.15 按工作量加權·目前/預期同一組權重確保落差同口徑）。
+// 實際＝任務進度加權；預期＝各任務「到今天依時程應完成%」加權（只納入有日期任務）。
+Portfolio.projectProgress = function(projId, today) {
+  const ts = this._live().filter(t => t.project === projId);
+  if (!ts.length) return { actual: null, planned: null };
+  const actual = weightedProgress(ts);
+  const todayIso = D.fmt(today, 'iso');
+  let pAcc = 0, pW = 0;
+  ts.forEach(t => {
+    const e = getEffectiveSchedule(t);
+    if (!e || !e.start || !e.end) return;   // 無日期不計入預期
+    let pct;
+    if (todayIso <= e.start) pct = 0;
+    else if (todayIso >= e.end) pct = 100;
+    else pct = D.workdaysBetween(e.start, todayIso) / D.workdaysBetween(e.start, e.end) * 100;
+    pct = Math.max(0, Math.min(100, pct));
+    const w = taskWorkload(t);
+    if (w > 0) { pAcc += pct * w; pW += w; }
+  });
+  const planned = pW > 0 ? Math.round(pAcc / pW) : null;
+  return { actual, planned };
+};
+
+// ═══ §18.15 P1 差異表 helper（全純算·讀既有 baked 資料·不碰排程引擎/_tplPreview）═══
+// 專案階段清單：把該案 live 任務依階段名彙整（跨案別合併），算每階段起訖日＋完成數＋主責部門；依起始日排序（＝里程碑時序）。
+Portfolio._projStages = function(p) {
+  const byStage = {}, order = [];
+  this._live().filter(t => t.project === p.id).forEach(t => {
+    const s = (t.stage && String(t.stage).trim()) || '未分階段';
+    if (!byStage[s]) { byStage[s] = { name: s, start: '', end: '', total: 0, done: 0, deptCount: {} }; order.push(s); }
+    const g = byStage[s], e = getEffectiveSchedule(t);
+    if (e.start && (!g.start || e.start < g.start)) g.start = e.start;
+    if (e.end && (!g.end || e.end > g.end)) g.end = e.end;
+    g.total++; if (t.status === 'done') g.done++;
+    if (t.dept) g.deptCount[t.dept] = (g.deptCount[t.dept] || 0) + 1;
+  });
+  const idToName = {}; (DATA.projects || []).forEach(pp => (pp.depts || []).forEach(d => { idToName[d.id] = d.name; }));
+  return order.map(s => {
+    const g = byStage[s]; let dept = '', mx = 0;
+    Object.keys(g.deptCount).forEach(k => { if (g.deptCount[k] > mx) { mx = g.deptCount[k]; dept = k; } });
+    return { name: g.name, start: g.start, end: g.end, total: g.total, done: g.done, dept: dept ? (idToName[dept] || dept) : '' };
+  }).sort((a, b) => (a.start || '9999') < (b.start || '9999') ? -1 : ((a.start || '9999') > (b.start || '9999') ? 1 : 0));
+};
+// 近期里程碑：時序上第一個「尚未全完成且結束日未過今天」的階段（＝目前/接下來要顧的段）。無則回 null。
+Portfolio._projNextMilestone = function(p, todayIso) {
+  const stages = this._projStages(p);
+  return stages.find(s => s.done < s.total && (!s.end || s.end >= todayIso))
+      || stages.find(s => s.done < s.total) || null;
+};
+// 剩餘緩衝天（NPI）：各案別最末 plannedEnd → 目標上市日 的工作天，取最緊那案（正＝有緩衝／負＝超出）。讀既有 baked 排程，不重算。無目標上市日回 null。
+Portfolio._projSlackDays = function(p) {
+  const tasksByVar = {};
+  this._live().filter(t => t.project === p.id).forEach(t => { (tasksByVar[t.variant || ''] = tasksByVar[t.variant || ''] || []).push(t); });
+  let worst = null;
+  const consider = (targetEnd, tasks) => {
+    if (!targetEnd || !tasks || !tasks.length) return;
+    let maxEnd = ''; tasks.forEach(t => { const e = getEffectiveSchedule(t).end; if (e && e > maxEnd) maxEnd = e; });
+    if (!maxEnd) return;
+    const s = (maxEnd <= targetEnd) ? D.workdaysBetween(maxEnd, targetEnd) - 1 : -(D.workdaysBetween(targetEnd, maxEnd) - 1);
+    if (worst === null || s < worst) worst = s;
+  };
+  const variants = p.variants || [];
+  if (variants.length) variants.forEach(v => consider((v.schedule && (v.schedule.endDate || v.schedule.targetEndDate)) || '', tasksByVar[v.id] || []));
+  if (worst === null && p.pdcaData && p.pdcaData.targetDate) consider(p.pdcaData.targetDate, this._live().filter(t => t.project === p.id));
+  return worst;
+};
+// 致命傷指標（本案特定健康指標）：ECN→成本調降達成率%（目標成本調降/台 vs 實際整機成本調降）；NPI→剩餘緩衝天。回 {label, value, tone, sub, note}。
+Portfolio._projKeyRisk = function(p) {
+  const note = (p.keyRiskNote || '').trim();
+  if (p.ecnType) {
+    const target = Number(p.targetSavePerUnit) || 0;
+    const wt = (typeof App._bomWholeTotals === 'function') ? App._bomWholeTotals(p) : { ok: false };
+    if (target > 0 && wt && wt.ok) {
+      const actualSave = -(wt.delta), pct = Math.round(actualSave / target * 100);   // 成本調降＝舊−新＝−delta（每台整機成本）
+      return { label: '成本調降達成率', value: pct + '%', tone: pct >= 100 ? 'green' : (pct >= 60 ? 'yellow' : 'red'),
+        sub: `目標 ${U.esc(String(Math.round(target)))}／台 · 實際 ${U.esc(String(Math.round(actualSave)))}／台`, note };
+    }
+    return { label: '成本調降達成率', value: target > 0 ? '尚未建立成本基準' : '未設目標成本調降', tone: 'muted',
+      sub: target > 0 ? '到 BOM 頁上傳新舊料表' : '開案「目標成本調降/台」未填', note };
+  }
+  const slack = this._projSlackDays(p);
+  if (slack === null) return { label: '剩餘緩衝', value: '無目標上市日', tone: 'muted', sub: '此案未設上市日、只填開始日', note };
+  return { label: '剩餘緩衝', value: slack >= 0 ? slack + ' 個工作天' : '超出 ' + (-slack) + ' 工作天',
+    tone: slack >= 5 ? 'green' : (slack >= 0 ? 'yellow' : 'red'), sub: '最末完工日 → 目標上市日', note };
+};
+
+// 週容量（部門負載容量線）：每日工時 × 每週工作日數 ＝ KPI4 availableHours（單一口徑，§18.10）
+Portfolio.weekCapacity = function() {
+  return weekCapacityHours();
+};
+
+// §18.16 P3 v2：舊「部門負載本週長條」deptLoad 已隨 P3 重構移除——部門負荷改由資源熱點矩陣「部門」視角呈現（deptHeat·未來時段峰值），孤兒清除（規則10）。
+// §18.15 P2：舊「當週待處理 weeklyTop」已隨 P2 異常任務表改版移除（孤兒·規則10）。
+
+// ═══ PM 跨案協調負荷（§19.10 F）═══
+// 所有 active 案內「掛 PM 的工作項目」（isPmCoord／role=PM／部門名=PM，§18.10c 單一判定），按選定期間換算「工時 vs 容量」負荷率。
+// 不誇飾（不用每天%）、不少算（工時實加）、零手動改%；依實際日期 getEffectiveSchedule → 延遲自動延長。零 schema 變更。
+Portfolio._pmGran = 'day';         // 趨勢分段單位（日/週/月/年）
+Portfolio._pmStart = '';           // 分析區間 起（ISO）；空＝首次以本月填入
+Portfolio._pmEnd = '';             // 分析區間 迄（ISO）
+Portfolio._pmRangeLabel = '本月';  // 區間顯示名（快捷名或「自訂」）
+Portfolio._PM_ST = { late: ['pf-pm-st-late', '延遲'], run: ['pf-pm-st-run', '進行中'], done: ['pf-pm-st-done', '完工'] };
+
+// 某期間 [start,end] 的 PM 負荷：回 {rate, needHrs, capHrs, items[]}
+Portfolio._pmWindowLoad = function(start, end) {
+  const daily = DATA.settings.dailyHours || 6;
+  const capWd = D.workdaysBetween(start, end);          // 期間工作天（含頭尾、跳假日四層日曆）
+  const capHrs = capWd * daily;
+  const today = D.today();
+  const items = [];
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;   // 只 active（ECN＋NPI 合流，決策 B §19.10 F.2）
+    (DATA.tasks || []).forEach(t => {
+      if (t.project !== p.id || t._deleted) return;
+      if (t.measureType === 'hours') return;             // 時段制雜事不計（規則15·補齊·同其他四支負荷函式）
+      if (!isPmTask(t, p)) return;                 // 只掛 PM 的項目（§18.10c 單一判定：isPmCoord／role／部門名=PM，含顯性 PM 任務）
+      if (t.epoch != null && t.epoch !== (p.version || 1)) return;   // §19.5 洞4：ECN 翻案後舊 epoch 凍結、不進當前 PM 負荷（NPI 任務 epoch 天然 null）
+      const e = getEffectiveSchedule(t);
+      if (!e || !e.start || !e.end) return;
+      const eS = new Date(e.start), eE = new Date(e.end);
+      if (isNaN(eS) || isNaN(eE)) return;
+      const ovS = eS > start ? eS : start, ovE = eE < end ? eE : end;
+      if (ovS > ovE) return;                                         // 與期間無重疊
+      const wd = D.workdaysBetween(ovS, ovE);
+      if (wd <= 0) return;
+      const hrs = taskIntensity(t) * daily * wd;   // §18.10d 日均強度（netWorkDays 未填＝effortRatio/100 等值）
+      let st = 'run';
+      if (isTaskDone(t)) st = 'done';                                // 規則15：完工單一判定（原只認 actualEnd→status=done 無 actualEnd 者被多算進 PM 負荷率）
+      else if (eE < today) st = 'late';                              // 計畫結束已過、未完工＝延遲
+      items.push({ pid: p.id, projName: p.name, itemName: t.name, color: p.color || '', st: st, hrsRaw: hrs, effStart: e.start, effEnd: e.end, kind: p.ecnType ? 'ECN' : 'NPI' });
+    });
+  });
+  const needRaw = items.reduce((a, c) => a + (c.st === 'done' ? 0 : c.hrsRaw), 0);   // §18.10c：完工不進當前負荷（灰列僅供參考）
+  items.forEach(it => { it.hrs = Math.round(it.hrsRaw); it.pct = capHrs > 0 ? Math.round(it.hrsRaw / capHrs * 100) : 0; });
+  const pr = { late: 0, run: 1, done: 2 };
+  items.sort((a, b) => (pr[a.st] - pr[b.st]) || (b.hrsRaw - a.hrsRaw));   // 延遲>進行中>完工，同組工時降序
+  return { rate: capHrs > 0 ? Math.round(needRaw / capHrs * 100) : 0, needHrs: Math.round(needRaw), capHrs: Math.round(capHrs), items };
+};
+
+// ═══ §18.16 Phase 2：部門人力水位帶（負荷 ÷ 人力容量·C 混合容量·規則15 同 _pmWindowLoad 算法）═══
+// 全域部門名聯集（各 active 專案 depts[].name·同 deptNameSet）
+Portfolio._deptNameUnion = function() {
+  const set = new Set();
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;
+    (p.depts || []).forEach(d => { if (d.name) set.add(d.name); });
+  });
+  return [...set];
+};
+// 名冊推估人數：每部門的不重複真人數（排除 deptOnly＝部門名本身那種）→ { 部門名: N }
+Portfolio._deptRosterCounts = function() {
+  const out = {};
+  this.personRoster().forEach(r => { if (!r.deptOnly && r.dept) out[r.dept] = (out[r.dept] || 0) + 1; });
+  return out;
+};
+// C 混合容量人數：登記值優先（>0），否則退名冊推估；estimated 供 UI 標「推估」
+Portfolio._deptHeadcount = function(name, rosterCounts) {
+  const reg = (DATA.settings.deptHeadcount || {})[name];
+  if (reg != null && Number(reg) > 0) return { count: Number(reg), estimated: false };
+  return { count: (rosterCounts || this._deptRosterCounts())[name] || 0, estimated: true };
+};
+// 部門某期間水位＝_pmWindowLoad 的 dept 版：把 isPmTask 過濾換成「任務 dept＝本部門」、容量乘人數。
+// hc 由呼叫端預算傳入（避免逐格重算名冊）。負荷口徑（active/未完工/工期制/epoch 凍結/日均強度）全沿用 PM 帶。
+Portfolio._deptWindowLoad = function(deptName, start, end, hc) {
+  const daily = DATA.settings.dailyHours || 6;
+  const capHrs = D.workdaysBetween(start, end) * daily * (hc || 0);
+  let needRaw = 0;
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;   // 只 active
+    const idToName = {}; (p.depts || []).forEach(d => idToName[d.id] = d.name);
+    (DATA.tasks || []).forEach(t => {
+      if (t.project !== p.id || t._deleted) return;
+      if (t.measureType === 'hours') return;             // 只算工期制（時段制雜事不計·同 dailyHeat）
+      if (isTaskDone(t)) return;                          // 完工不進當前負荷（§18.10c·規則15 完工單一判定）
+      if (t.epoch != null && t.epoch !== (p.version || 1)) return;   // ECN 翻案舊 epoch 凍結
+      const dn = t.dept ? (idToName[t.dept] || t.dept) : '';
+      if (dn !== deptName) return;                       // 只本部門
+      const e = getEffectiveSchedule(t);
+      if (!e || !e.start || !e.end) return;
+      const eS = new Date(e.start), eE = new Date(e.end);
+      if (isNaN(eS) || isNaN(eE)) return;
+      const ovS = eS > start ? eS : start, ovE = eE < end ? eE : end;
+      if (ovS > ovE) return;                             // 與期間無重疊
+      const wd = D.workdaysBetween(ovS, ovE);
+      if (wd <= 0) return;
+      needRaw += taskIntensity(t) * daily * wd;          // §18.10d 日均強度（同 PM 帶）
+    });
+  });
+  return { rate: capHrs > 0 ? Math.round(needRaw / capHrs * 100) : 0, needHrs: Math.round(needRaw), capHrs: Math.round(capHrs) };
+};
+// 空狀態判定：是否有任一任務掛得出部門（無則水位帶顯引導·規則16）
+Portfolio._deptTaggedAny = function() {
+  return (DATA.projects || []).some(p =>
+    (p.status || 'active') === 'active' &&
+    (DATA.tasks || []).some(t => t.project === p.id && !t._deleted && t.measureType !== 'hours' && t.dept && String(t.dept).trim())
+  );
+};
+// 部門人力登記 UI（設定區塊與齒輪 Modal 共用同一份·規則13）。extraOn＝額外 input 屬性（設定頁傳 dirty 追蹤·Modal 不傳）
+Portfolio._deptRegistryHtml = function(extraOn) {
+  const names = this._deptNameUnion();
+  if (!names.length) return '<div class="reg-empty">目前尚無部門資料。請先至專案的「部門與負責人」建立部門，系統即會在此生成可登記清單。</div>';
+  const rosterCounts = this._deptRosterCounts();
+  const reg = DATA.settings.deptHeadcount || {};
+  const rows = names.map(nm => {
+    const est = rosterCounts[nm] || 0;
+    const has = reg[nm] != null && Number(reg[nm]) > 0;
+    // 單人部門（推估＝1、未登記）：容量已明確＝1，自動帶、不強調（點4）；多人未登記→代入推估；已登記/未知→單位
+    const solo = !has && est === 1;
+    const tail = solo ? '<span class="reg-solo">單人 · 自動帶 1 人</span>'
+      : (!has && est > 1) ? `<span class="reg-fill" onclick="Portfolio._deptFill(this,${est})">代入推估 ${est}</span>`
+      : '<span class="reg-unit">人</span>';
+    return `<div class="reg-row${has ? '' : (solo ? ' solo' : ' empty')}"><span class="reg-rnm"><span class="reg-dot"></span>${U.esc(nm)}</span>`
+      + `<span class="reg-rin"><input type="number" min="0" max="999" step="1" class="reg-in" data-dept="${U.esc(nm)}" value="${has ? Number(reg[nm]) : ''}" placeholder="${est > 0 ? est : ''}" ${extraOn || ''}>`
+      + tail + '</span></div>';
+  }).join('');
+  const collapsible = names.length > 3;   // 緊湊表格·預設顯 3 列·其餘收合可展開
+  return '<div class="reg-grid' + (collapsible ? ' collapsed' : '') + '">'
+    + '<div class="reg-ghead"><span>部門</span><span>每月人力（人）</span></div>'
+    + rows + '</div>'
+    + (collapsible ? '<button type="button" class="reg-more" onclick="Portfolio._regToggle(this)"><i class="ti ti-chevron-down"></i>展開其餘 ' + (names.length - 3) + ' 個部門</button>' : '');
+};
+// 展開/收合部門登記表其餘列（純顯示·container class 切換）
+Portfolio._regToggle = function(btn) {
+  const grid = btn.previousElementSibling; if (!grid || !grid.classList.contains('reg-grid')) return;
+  const collapsed = grid.classList.toggle('collapsed');
+  const n = grid.querySelectorAll('.reg-row').length;
+  btn.innerHTML = collapsed ? '<i class="ti ti-chevron-down"></i>展開其餘 ' + Math.max(0, n - 3) + ' 個部門' : '<i class="ti ti-chevron-up"></i>收合';
+};
+// 代入推估：填入該值並轉「已套用」回饋（按鈕換成打勾標記·隱藏防重複點）
+Portfolio._deptFill = function(btn, n) {
+  const item = btn.closest('.reg-row'); if (!item) return;
+  const inp = item.querySelector('.reg-in'); if (inp) inp.value = n;
+  item.classList.remove('empty');
+  btn.outerHTML = '<span class="reg-applied"><i class="ti ti-check"></i>已套用</span>';
+};
+// 蒐集某容器內部門人數輸入 → { 部門名: 正整數 }（只留 >0）
+Portfolio._collectDeptHeadcount = function(root) {
+  const map = {};
+  (root || document).querySelectorAll('.reg-in').forEach(inp => {
+    const nm = inp.getAttribute('data-dept'), v = parseInt(inp.value, 10);
+    if (nm && !isNaN(v) && v > 0) map[nm] = v;
+  });
+  return map;
+};
+// 齒輪 Modal：就地改人數（不切設定頁），存後即時 async 重繪水位帶
+Portfolio.openDeptHeadcount = function() {
+  // 狀態分流：無部門＝純空狀態引導（無輸入說明·避免互斥文案並存）；有部門＝標題→操作說明→輸入區→補充機制
+  const hasDept = this._deptNameUnion().length > 0;
+  let body, footer;
+  if (!hasDept) {
+    body = '<div class="reg-emptybox">'
+      + '<div class="reg-empty-hd"><i class="ti ti-ban"></i>目前尚無部門資料，無法進行登記</div>'
+      + '<p class="reg-empty-desc">請先點擊下方<b>「一鍵配置部門與負責人」</b>按鈕，系統即會在此生成可登記的人數清單，並進行部門和擔當的負荷計算。</p>'
+      + '<div class="reg-empty-warn"><i class="ti ti-alert-triangle"></i><span>若未設定部門，「部門人力水位帶」將無法正常啟用計算。</span></div>'
+      + '</div>';
+    footer = '<button class="tb-action ghost" onclick="App.closeModal()">關閉</button><button class="tb-action" onclick="Portfolio.openDeptSetupAll()"><i class="ti ti-plus"></i>一鍵配置部門與負責人</button>';
+  } else {
+    body = '<p class="reg-sub">設定各部門的實際在職人數，用以計算跨專案的「部門人力水位帶」。</p>'
+      + '<div class="reg-guide"><div class="reg-guide-hd"><i class="ti ti-bulb"></i>操作說明</div>'
+      + '<ul class="reg-guide-list"><li><b>實際人數</b>：請依各部門現況輸入。</li>'
+      + '<li><b>快速輸入</b>：可點擊「代入推估 N」一鍵套用系統依名冊計算的建議人數。</li></ul></div>'
+      + this._deptRegistryHtml()
+      + '<div class="reg-foot"><i class="ti ti-info-circle"></i><span><b>運作機制</b>：部門清單自動同步各專案之設定；每月人力容量 ＝ 人數 × 每日工時 × 當月工作天。</span></div>';
+    footer = '<button class="tb-action ghost" onclick="App.closeModal()">取消</button><button class="tb-action ghost" onclick="Portfolio.openDeptSetupAll()">編輯部門與負責人</button><button class="tb-action" onclick="Portfolio._deptHeadcountModalSave()">儲存</button>';
+  }
+  App.openModal({
+    title: '部門人力登記',
+    body: body,
+    footer: footer
+  });
+};
+Portfolio._deptHeadcountModalSave = function() {
+  DATA.settings.deptHeadcount = this._collectDeptHeadcount(document.getElementById('modal'));
+  Store.settings.save();
+  App.closeModal();
+  U.toast('已更新部門人數', 'success');
+  this.renderStrategicGantt('portfolio-body'); this._sgReprepend();   // 即時 async 重繪
+};
+
+// 一鍵配置：列所有 active 專案的「部門與負責人」（複用 buildDeptRowsHtml + deptUI mode='edit'·即時存·段間分隔線·規則13）
+// 預載：某案無 depts → 依 ecnType 帶入範本標準部門 roles（各一個空擔當·就地存·空擔當顯空值符合規則16）；已有 depts 的案不動。
+Portfolio.openDeptSetupAll = function() {
+  const projs = (DATA.projects || []).filter(p => (p.status || 'active') === 'active');
+  let seeded = false;
+  projs.forEach(p => {
+    if (p.depts && p.depts.length) return;
+    const t = p.ecnType ? (typeof tplEcn === 'function' ? tplEcn() : null) : (typeof tplNpi === 'function' ? tplNpi() : null);
+    const roles = (t && t.roles && t.roles.length) ? t.roles : [];
+    if (!roles.length) return;
+    p.depts = roles.map(r => ({ id: U.id(), name: r, members: [{ id: U.id(), name: '' }] }));
+    seeded = true;
+  });
+  if (seeded) Store.projects.save();
+  let inner;
+  if (!projs.length) {
+    inner = '<div class="reg-empty">目前沒有進行中的專案可設定。</div>';
+  } else {
+    inner = projs.map(p => {
+      const tag = p.ecnType ? 'ECN' : 'NPI';
+      const n = (p.depts || []).length;
+      const collapsible = n > 2;
+      const moreBtn = collapsible ? `<button class="dset-more" onclick="Portfolio._deptSecToggle(this)"><i class="ti ti-chevron-down"></i>展開其餘 ${n - 2} 個部門</button>` : '';
+      return `<div class="dset-sec${collapsible ? ' collapsed' : ''}">`
+        + `<div class="dset-phd"><span class="dset-pnm">${U.esc(p.name)}</span><span class="dset-ptag">${tag}</span></div>`
+        + '<div class="dept-editor-head"><span class="dept-head-name">部門名稱</span><span class="dept-head-members">擔當姓名</span></div>'
+        + `<div class="dept-edit-list" id="deptEditorList-${p.id}">${App.buildDeptRowsHtml(p.depts || [], 'edit', p.id)}</div>`
+        + moreBtn
+        + `<button class="tb-action ghost dept-add-btn" onclick="App.deptUI.addDept('edit','${p.id}')">＋ 新增部門</button>`
+        + '</div>';
+    }).join('<div class="dset-div"></div>');
+  }
+  App.openModal({
+    title: '一鍵配置部門與負責人',
+    wide: true,
+    body: '<p class="reg-sub">為各專案建立「部門與負責人」；建立後即可登記人數、啟用部門人力水位帶。每格修改即時儲存。</p>'
+      + '<div class="dset-wrap">' + inner + '</div>',
+    footer: '<button class="tb-action" onclick="Portfolio._deptSetupDone()">完成</button>'
+  });
+};
+// 主動通知：進「跨專案時程」頁時，若有「多人部門（推估>1·＝擔當已填）但未登記實際人數」→ 提醒去登記精算水位（單人免登記·點4）。每 session 只跳一次避免煩。
+Portfolio._deptHeadcountNudge = function() {
+  if (this._deptNudged) return;
+  const reg = DATA.settings.deptHeadcount || {};
+  const rosterCounts = this._deptRosterCounts();
+  const need = this._deptNameUnion().filter(nm => {
+    const hasReg = reg[nm] != null && Number(reg[nm]) > 0;
+    return (rosterCounts[nm] || 0) > 1 && !hasReg;
+  });
+  if (need.length) {
+    this._deptNudged = true;
+    U.toast('有 ' + need.length + ' 個多人部門尚未登記實際人數，點「部門人力水位」表頭齒輪登記可精算水位帶', 'info');
+  }
+};
+// 展開/收合某專案段其餘部門（純顯示·container class 切換·不動 deptEditorList 內容故 rerender 不影響）
+Portfolio._deptSecToggle = function(btn) {
+  const sec = btn.closest('.dset-sec'); if (!sec) return;
+  const collapsed = sec.classList.toggle('collapsed');
+  const n = sec.querySelectorAll('.dept-edit-row').length;
+  btn.innerHTML = collapsed ? `<i class="ti ti-chevron-down"></i>展開其餘 ${Math.max(0, n - 2)} 個部門` : '<i class="ti ti-chevron-up"></i>收合部門';
+};
+Portfolio._deptSetupDone = function() {
+  // soft-gate（軟性放行）：掃「有部門名、無任何擔當」者→警告將無法計算負荷/顯空值→「仍要繼續」才關閉、「返回填寫」留在填寫畫面（confirmModal 疊 confirmOverlay·不動底層 modal）
+  const missing = [];
+  (DATA.projects || []).filter(p => (p.status || 'active') === 'active').forEach(p => {
+    (p.depts || []).forEach(d => {
+      if (d.name && !(d.members || []).some(m => (m.name || '').trim())) missing.push(U.esc(p.name) + ' — ' + U.esc(d.name));
+    });
+  });
+  const finish = () => {
+    App.closeModal();
+    this.renderStrategicGantt('portfolio-body'); this._sgReprepend();   // 重繪水位帶（可能已從空狀態轉為有部門）
+    U.toast('已更新部門設定', 'success');
+  };
+  if (missing.length) {
+    const list = missing.slice(0, 12).map(s => '<li>' + s + '</li>').join('') + (missing.length > 12 ? '<li>…共 ' + missing.length + ' 個部門</li>' : '');
+    App.confirmModal({ icon: 'ti-alert-triangle', iconBg: '--amber-l', iconColor: '--amber-ink',
+      title: '有部門尚未指定擔當',
+      msg: '以下部門沒有擔當，將無法計算人力負荷、水位帶顯示空值：<ul class="dset-miss">' + list + '</ul>可稍後補上；仍要繼續嗎？',
+      okText: '仍要繼續', cancelText: '返回填寫', onConfirm: finish });
+    return;
+  }
+  finish();
+};
+
+// 分段期間工具（趨勢桶用）：某日期所屬分段的起 / 迄 / 下一段起 / 標籤
+Portfolio._pmFloor = function(d, gran) {
+  const x = new Date(d); x.setHours(0, 0, 0, 0);
+  if (gran === 'week') return D.monday(x);
+  if (gran === 'month') return new Date(x.getFullYear(), x.getMonth(), 1);
+  if (gran === 'year') return new Date(x.getFullYear(), 0, 1);
+  return x;
+};
+Portfolio._pmPerEnd = function(s, gran) {
+  const y = s.getFullYear(), m = s.getMonth();
+  if (gran === 'week') return D.addDays(s, 6);
+  if (gran === 'month') return new Date(y, m + 1, 0);
+  if (gran === 'year') return new Date(y, 11, 31);
+  return new Date(y, m, s.getDate());
+};
+Portfolio._pmNext = function(s, gran) {
+  const y = s.getFullYear(), m = s.getMonth();
+  if (gran === 'week') return D.addDays(s, 7);
+  if (gran === 'month') return new Date(y, m + 1, 1);
+  if (gran === 'year') return new Date(y + 1, 0, 1);
+  return D.addDays(s, 1);
+};
+Portfolio._pmBucketLabel = function(s, gran) {
+  if (gran === 'month') return (s.getMonth() + 1) + '月';
+  if (gran === 'year') return s.getFullYear() + '';
+  return (s.getMonth() + 1) + '/' + s.getDate();
+};
+
+// 把 [startISO,endISO] 依分段切成桶（趨勢長條）；每桶＝完整分段期的負荷率
+Portfolio._pmBuckets = function(startISO, endISO, gran) {
+  const end = new Date(endISO); end.setHours(0, 0, 0, 0);
+  let cur = this._pmFloor(new Date(startISO), gran), guard = 0;
+  const out = [];
+  while (cur <= end && guard++ < 400) {
+    const be = this._pmPerEnd(cur, gran), w = this._pmWindowLoad(cur, be);
+    out.push({ label: this._pmBucketLabel(cur, gran), rate: w.rate, sISO: D.fmt(cur, 'iso'), eISO: D.fmt(be, 'iso') });
+    cur = this._pmNext(cur, gran);
+  }
+  return out;
+};
+
+// 首次進入預設「本月」
+Portfolio._pmEnsure = function() {
+  if (this._pmStart && this._pmEnd) return;
+  const t = new Date(D.today());
+  this._pmStart = D.fmt(new Date(t.getFullYear(), t.getMonth(), 1), 'iso');
+  this._pmEnd = D.fmt(new Date(t.getFullYear(), t.getMonth() + 1, 0), 'iso');
+  this._pmGran = 'day'; this._pmRangeLabel = '本月';
+};
+
+// 顯示標籤：具名（本月/7月/7/1…）直接用；自訂區間顯示實際起訖日
+Portfolio._pmLabel = function() {
+  if (this._pmRangeLabel && this._pmRangeLabel !== '自訂') return this._pmRangeLabel;
+  return D.fmt(this._pmStart, 'md') + '~' + D.fmt(this._pmEnd, 'md');
+};
+
+// 主算法：分析區間負荷 + 明細 + 趨勢桶
+Portfolio.pmLoad = function() {
+  this._pmEnsure();
+  const w = this._pmWindowLoad(new Date(this._pmStart), new Date(this._pmEnd));
+  return { rate: w.rate, needHrs: w.needHrs, capHrs: w.capHrs, items: w.items, buckets: this._pmBuckets(this._pmStart, this._pmEnd, this._pmGran), label: this._pmLabel() };
+};
+
+// 明細列（band 與彈窗共用）；opts.inModal 先關彈窗再跳專案，opts.hideSt 隱狀態徽章（彈窗分組已標）
+Portfolio._pmRowHtml = function(c, opts) {
+  opts = opts || {};
+  const s = this._PM_ST[c.st];
+  const dot = c.st === 'done' ? '<span class="pf-pm-dot pf-pm-dot-done"></span>' : '';   // 完工態保留狀態指示；其餘原專案色點已移除
+  const nav = (opts.inModal ? 'App.closeModal();' : '') + "App.openProject('" + c.pid + "')";
+  const stCell = opts.hideSt ? '<span></span>' : '<span class="pf-pm-st ' + s[0] + '">' + s[1] + '</span>';
+  return '<div class="pf-pm-row" onclick="' + nav + '" title="點擊進入戰情室">' + dot +
+    '<span class="pf-pm-name"><b><span class="pf-pm-pn">' + U.esc(c.projName) + '</span><span class="pf-pm-kind pf-pm-kind-' + (c.kind === 'ECN' ? 'ecn' : 'npi') + '">' + (c.kind || 'NPI') + '</span></b><span class="ct">' + U.esc(c.itemName) + '</span></span>' +
+    stCell +
+    '<span class="pf-pm-date">' + D.fmt(c.effStart, 'md') + '–' + D.fmt(c.effEnd, 'md') + '</span>' +
+    '<span class="pf-pm-hrs">' + c.hrs + 'h <small>(' + c.pct + '%)</small></span></div>';
+};
+
+// ─── 同人爆表告警（Phase 2a-4，§18.10c 統一核心）：跨案同人單日 Σ投入% >100% 紅旗 ───
+// 口徑：掃今日起 30 天內的工作日；active 專案、未完成工期制任務、依 getEffectiveSchedule 重疊；
+// 多人掛名（Paul、彥彬／Paul+豪哥）拆開後每人都算該任務全額投入%（投入%語意＝吃掉「某人」一天的%）；
+// 人＝owner 字串比對（同名視為同一人，真身分模型留 2b）。常駐列 owner 空、時段制雜事不掃。
+Portfolio._OL_DAYS = 30;
+Portfolio.overloadAlerts = function() {
+  const eff = t => taskIntensity(t) * 100;   // §18.10d 日均強度→%（netWorkDays 未填＝effortRatio 等值）
+  const today = D.today(); today.setHours(0, 0, 0, 0);
+  const wEnd = D.addDays(today, this._OL_DAYS);
+  const per = {};   // person → { iso → { pct, items:[{projName,taskName,eff}] } }
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;
+    (DATA.tasks || []).forEach(t => {
+      if (t.project !== p.id || t._deleted || isTaskDone(t) || t.measureType === 'hours') return;
+      if (t.epoch != null && t.epoch !== (p.version || 1)) return;   // §19.5 洞4：ECN 翻案後舊 epoch 凍結、不進爆表告警
+      const names = String(t.owner || '').split(/[、,，\/+＋&]/).map(s => s.trim()).filter(Boolean);
+      if (!names.length) return;
+      const e = getEffectiveSchedule(t);
+      if (!e || !e.start || !e.end) return;
+      const s0 = new Date(e.start), e0 = new Date(e.end);
+      if (isNaN(s0) || isNaN(e0)) return;
+      const ovS = s0 > today ? s0 : today, ovE = e0 < wEnd ? e0 : wEnd;
+      if (ovS > ovE) return;
+      for (let d = new Date(ovS); d <= ovE; d = D.addDays(d, 1)) {
+        if (!D.isWorkday(d)) continue;
+        const iso = D.fmt(d, 'iso');
+        names.forEach(nm => {
+          const pd = (per[nm] = per[nm] || {});
+          const cell = (pd[iso] = pd[iso] || { pct: 0, items: [] });
+          cell.pct += eff(t);
+          cell.items.push({ projName: p.name, taskName: t.name, eff: eff(t) });
+        });
+      }
+    });
+  });
+  const alerts = [];
+  Object.keys(per).forEach(nm => {
+    const days = Object.keys(per[nm]).filter(iso => per[nm][iso].pct > 100).sort();
+    if (!days.length) return;
+    const peak = days.reduce((m, iso) => Math.max(m, per[nm][iso].pct), 0);
+    alerts.push({ name: nm, days, peak, detail: per[nm] });
+  });
+  alerts.sort((a, b) => b.peak - a.peak);
+  return alerts;
+};
+// §18.16 P3 v2：爆表告警卡已併入「嚴重超載警報」_alertHtml（overloadAlerts 仍供警報 peak/爆天＋下方明細彈窗）。
+// 逐日明細彈窗：該人哪幾天爆、每天哪幾件疊出來
+Portfolio.openOverloadDetail = function(name) {
+  const a = this.overloadAlerts().find(x => x.name === name);
+  if (!a) { U.toast('此人已無爆表（資料已更新）', 'success'); return; }
+  const body = a.days.map(iso => {
+    const cell = a.detail[iso];
+    return '<div class="pf-old-day"><div class="pf-old-dh"><b>' + D.fmt(iso, 'md') + '</b><span class="pf-old-pct">合計 ' + Math.round(cell.pct) + '%</span></div>' +
+      cell.items.map(it => '<div class="pf-old-item"><span class="pf-old-eff">' + Math.round(it.eff) + '%</span><span class="pf-old-tn">' + U.esc(it.taskName) + '</span><span class="pf-old-pn">' + U.esc(it.projName) + '</span></div>').join('') +
+    '</div>';
+  }).join('');
+  App.openModal({
+    title: '🚩 ' + name + ' 的爆表明細（' + a.days.length + ' 天）',
+    body: '<div class="pf-old-wrap">' + body + '</div><div class="field-hint">解法：把當天某件的投入%下修、改負責人分工，或挪動日期錯開。</div>',
+    footer: '<button class="tb-action ghost" onclick="App.closeModal()">關閉</button>',
+  });
+};
+
+// 區塊 HTML；無 active ECN → 顯示標題＋空狀態（B 方案，Paul：一律顯示才不會誤以為沒部署）
+Portfolio._pmBandHtml = function() {
+  if (!(DATA.projects || []).some(p => (p.status || 'active') === 'active')) {
+    return '<div class="pf-pm"><div class="pf-pm-head"><div class="pf-pm-title">PM 跨案負荷</div></div>' +
+      '<div class="pf-pm-empty"><i class="ti ti-info-circle"></i>目前無進行中的專案。建立專案（ECN 或 NPI）後，這裡會顯示你（PM）在各案的跨案工時負荷。</div></div>';
+  }
+  this._pmEnsure();
+  const L = this.pmLoad();
+  const over = L.rate > 100, warn = L.rate >= 80 && L.rate <= 100;
+  const numCls = over ? 'pf-pm-num-over' : (warn ? 'pf-pm-num-warn' : '');
+  const granSeg = ['day', 'week', 'month', 'year'].map(g =>
+    '<button class="' + (g === this._pmGran ? 'on' : '') + '" onclick="Portfolio.setPmGran(\'' + g + '\')">' + { day: '日', week: '週', month: '月', year: '年' }[g] + '</button>').join('');
+  // 趨勢：可捲動長條 + 0/50/100 網格線（PH=繪圖區高 60px；topP 留 15% 頂部餘裕，避免 100% 線頂到邊）
+  const PH = 60, topP = Math.max(100, ...L.buckets.map(b => b.rate)) * 1.15;
+  // 日檔桶多時每隔 3 桶才標日期（字級維持 ≥12px 不硬縮·未標的長條 hover title 仍顯日期%）
+  const lblEvery = (this._pmGran === 'day' && L.buckets.length > 10) ? 3 : 1;
+  const bars = L.buckets.map((b, i) => {
+    const cls = b.rate > 100 ? 'r' : (b.rate >= 80 ? 'a' : 'g');
+    const showLbl = i % lblEvery === 0;
+    return '<div class="pf-pm-mcol" onclick="Portfolio.setPmBucket(\'' + b.sISO + '\',\'' + b.eISO + '\',\'' + b.label + '\')" title="' + b.label + '：' + b.rate + '%">' +
+      '<div class="pf-pm-barbox"><div class="pf-pm-mbar ' + cls + '" style="height:' + Math.round(b.rate / topP * PH) + 'px"></div></div>' +
+      '<div class="pf-pm-mx">' + (showLbl ? b.label : '') + '</div></div>';
+  }).join('');
+  const gl = '<div class="pf-pm-glover">' +
+    '<div class="pf-pm-gl g100" style="bottom:' + Math.round(100 / topP * PH) + 'px"><span>100%</span></div>' +
+    '<div class="pf-pm-gl" style="bottom:' + Math.round(50 / topP * PH) + 'px"><span>50%</span></div>' +
+    '<div class="pf-pm-gl zero" style="bottom:0"><span>0%</span></div></div>';
+  const hint = App.buildHintBox({ key: 'portfolio-pmload', icon: 'ti-help-circle', collapsed: true, title: '圖表說明', summary: '顯示優先級：延遲 ➔ 進行中 ➔ 完工 ｜ 最多顯示 9 件 ｜ 點擊甘特條可錨定至該時段',
+    bodyHtml: '<ul class="pf-pm-hint">' +
+      '<li>排序：<b>延遲 → 進行中 → 完工</b>。延遲和進行中一定顯示；完工排最後，位置不夠就收起。</li>' +
+      '<li>外層最多 <b>9 件</b>，超過點「負荷明細」開彈窗看完整清單＋加總。</li>' +
+      '<li>圓點＝該案<b>產品線色</b>，完工轉灰；案名旁 <b>ECN／NPI</b> 標籤＝案別。<b>專案名</b>（粗）＝產品線／母案、<b>工作項目</b>（細）＝這條線在做什麼。</li>' +
+      '<li><b>選區間</b>：上方快捷（本週/月/季/年）或自訂起訖日；<b>分段</b>決定長條一根＝幾天/週/月；點某根長條＝把區間縮到那一段。</li></ul>' });
+  const rows = L.items.length ? L.items.slice(0, 9).map(c => this._pmRowHtml(c)).join('') : '<div class="pf-mini-empty">此區間無 PM 負荷</div>';
+  const detailBtn = L.items.length ? '<button class="pf-pm-detail" onclick="Portfolio.openPmDetail()"><i class="ti ti-arrows-maximize"></i>負荷明細（' + L.items.length + ' 件）</button>' : '';
+  const sub = over ? '<div class="pf-pm-over">超出 ' + (L.needHrs - L.capHrs) + 'h</div>'
+                   : '<div class="pf-pm-ok">剩餘可排程 ' + Math.max(0, L.capHrs - L.needHrs) + 'h</div>';
+  const tip = L.label + ' PM 負荷|此區間所有 ECN／NPI 案要你（PM）花的工時 ÷ 你此區間的可用工時（完工＝過往帳、不計入當前）|排程需求 ÷ 總可用工時 × 100%';
+  return '<div class="pf-pm">' +
+    '<div class="pf-pm-head"><div class="pf-pm-title">PM 跨案負荷</div></div>' +
+    '<div class="pf-pm-body">' +
+      '<div class="pf-pm-metric"><div class="lbl">' + L.label + ' PM 負荷 <i class="ti ti-info-circle pf-pm-i" data-tip="' + tip + '"></i></div>' +
+        '<div class="num ' + numCls + '">' + L.rate + '%</div>' +
+        '<div class="hrs">排程需求 ' + L.needHrs + 'h ／ 總可用工時 ' + L.capHrs + 'h</div>' + sub + '</div>' +
+      '<div class="pf-pm-right">' +
+        '<div class="pf-pm-rangebar"><span class="pf-pm-rl">區間</span><input type="date" class="pf-pm-din" value="' + this._pmStart + '" onchange="Portfolio.setPmRange(\'s\', this.value)"><span class="pf-pm-rt">~</span><input type="date" class="pf-pm-din" value="' + this._pmEnd + '" onchange="Portfolio.setPmRange(\'e\', this.value)"><span class="pf-pm-rl" style="margin-left:10px">分段</span><span class="pf-pm-seg pf-pm-seg-sm">' + granSeg + '</span></div>' +
+        '<div class="pf-pm-chart">' + gl + '<div class="pf-pm-plotwrap"><div class="pf-pm-strip">' + bars + '</div></div></div>' +
+        hint +
+        '<div class="pf-pm-chd"><div class="pf-pm-ct">' + L.label + '哪幾件疊起來</div>' + detailBtn + '</div>' +
+        '<div class="pf-pm-th"><span class="pf-pm-doth" title="圓點＝該案產品線色；完工的案子轉灰">●</span><span>專案 · 工作項目</span><span>狀態</span><span>期間</span><span>工時（佔比）</span></div>' +
+        rows +
+      '</div>' +
+    '</div></div>';
+};
+
+// 自訂起訖日（起>迄自動對調）
+Portfolio.setPmRange = function(which, iso) {
+  if (!iso) return;
+  if (which === 's') this._pmStart = iso; else this._pmEnd = iso;
+  if (new Date(this._pmStart) > new Date(this._pmEnd)) { const tmp = this._pmStart; this._pmStart = this._pmEnd; this._pmEnd = tmp; }
+  this._pmRangeLabel = '自訂';
+  this._pmRerender(true);
+};
+
+// 換分段（不改區間）
+Portfolio.setPmGran = function(gran) { this._pmGran = gran; this._pmRerender(true); };
+
+// 點長條＝把分析區間縮到該段，並把分段細一級（年→月→週→日）以便鑽入後仍看得到子分段
+Portfolio.setPmBucket = function(sISO, eISO, label) {
+  this._pmStart = sISO; this._pmEnd = eISO; this._pmRangeLabel = label;
+  this._pmGran = { year: 'month', month: 'week', week: 'day', day: 'day' }[this._pmGran] || 'day';
+  this._pmRerender(true);
+};
+
+// 重繪本區塊；scrollEnd=捲到最新（右端），否則保留捲動位置
+Portfolio._pmRerender = function(scrollEnd) {
+  const el = document.getElementById('pf-pmband');
+  if (!el) return;
+  const sc0 = el.querySelector('.pf-pm-plotwrap'), keep = sc0 ? sc0.scrollLeft : 0;
+  el.innerHTML = this._pmBandHtml();
+  const sc = el.querySelector('.pf-pm-plotwrap');
+  if (sc) sc.scrollLeft = scrollEnd ? sc.scrollWidth : keep;
+};
+
+// 趨勢長條捲到最新（右端）——renderOverview 初次載入用
+Portfolio._pmScrollEnd = function() {
+  const sc = document.querySelector('#pf-pmband .pf-pm-plotwrap');
+  if (sc) sc.scrollLeft = sc.scrollWidth;
+};
+
+// 負荷明細彈窗：一案一列、延遲/進行中/完工分組＋小計＋總計（不逐日列）；率做成 badge、狀態徽章由分組承載
+Portfolio.openPmDetail = function() {
+  const L = this.pmLoad();
+  const over = L.rate > 100, warn = L.rate >= 80 && L.rate <= 100;
+  const bdg = over ? 'pf-pm-bdg-over' : (warn ? 'pf-pm-bdg-warn' : 'pf-pm-bdg-ok');
+  let body = '<div class="pf-pm-mosum">共 ' + L.items.length + ' 件（含完工參考）· 當前負荷 ' + L.needHrs + 'h ／ 總可用工時 ' + L.capHrs + 'h <span class="pf-pm-bdg ' + bdg + '">' + L.rate + '%' + (over ? ' 超載' : '') + '</span></div>';
+  body += '<div class="pf-pm-th"><span class="pf-pm-doth">●</span><span>專案 · 工作項目</span><span>狀態</span><span>期間</span><span>工時（佔比）</span></div>';
+  [['late', '延遲', 'late'], ['run', '進行中', ''], ['done', '完工（參考·不計當前）', '']].forEach(g => {
+    const its = L.items.filter(c => c.st === g[0]);
+    if (!its.length) return;
+    const subH = its.reduce((a, c) => a + c.hrs, 0);
+    body += '<div class="pf-pm-grp ' + g[2] + '"><span>' + g[1] + '（' + its.length + ' 件）</span><span>' + subH + 'h</span></div>';
+    body += its.map(c => this._pmRowHtml(c, { inModal: true, hideSt: true })).join('');
+  });
+  const _liveCnt = L.items.filter(c => c.st !== 'done').length;
+  body += '<div class="pf-pm-motot"><span class="tt">當前負荷合計（不含完工·' + _liveCnt + ' 件）</span><span class="tv">' + L.needHrs + 'h · ' + L.rate + '%</span></div>';
+  App.openModal({ title: L.label + ' PM 負荷明細', body: body, wide: true, footer: '<button class="tb-action ghost" onclick="App.closeModal()">關閉</button>' });
+};
+
+// ═══ Phase 2b #4：全員跨案負荷（字串版）＝把 _pmWindowLoad「只 PM」放寬成「按 owner 歸戶所有人」，複用 overloadAlerts 拆人法。引擎零變更。 ═══
+Portfolio._plStart = ''; Portfolio._plEnd = ''; Portfolio._plRangeLabel = '本月';
+Portfolio._plEnsure = function() {
+  if (this._plStart && this._plEnd) return;
+  const t = new Date(D.today());
+  this._plStart = D.fmt(new Date(t.getFullYear(), t.getMonth(), 1), 'iso');
+  this._plEnd = D.fmt(new Date(t.getFullYear(), t.getMonth() + 1, 0), 'iso');
+  this._plRangeLabel = '本月';
+};
+Portfolio._plLabel = function() {
+  return (this._plRangeLabel && this._plRangeLabel !== '自訂') ? this._plRangeLabel : D.fmt(this._plStart, 'md') + '~' + D.fmt(this._plEnd, 'md');
+};
+// 某期間 [start,end] 各人負荷：拆 owner 多人掛名、每人算全額投入%（同 overloadAlerts）；回 {people[], capHrs}
+Portfolio._personWindowLoad = function(start, end) {
+  const daily = DATA.settings.dailyHours || 6;
+  const capHrs = D.workdaysBetween(start, end) * daily;
+  const today = D.today();
+  const per = {};
+  const deptNameSet = new Set();   // 全案部門名集合：判「owner 本身就是部門名」→ 顯「品保部」（多人掛名時 dept 欄不可靠，改看名字本身）
+  (DATA.projects || []).forEach(p => (p.depts || []).forEach(d => { if (d.name) deptNameSet.add(d.name); }));
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;
+    const idToName = {}; (p.depts || []).forEach(d => idToName[d.id] = d.name);
+    (DATA.tasks || []).forEach(t => {
+      if (t.project !== p.id || t._deleted || t.measureType === 'hours') return;
+      if (t.epoch != null && t.epoch !== (p.version || 1)) return;   // §19.5 洞4：舊 epoch 凍結、不進當前負荷
+      const names = String(t.owner || '').split(/[、,，\/+＋&]/).map(s => s.trim()).filter(Boolean);
+      if (!names.length) return;
+      const e = getEffectiveSchedule(t);
+      if (!e || !e.start || !e.end) return;
+      const eS = new Date(e.start), eE = new Date(e.end);
+      if (isNaN(eS) || isNaN(eE)) return;
+      const ovS = eS > start ? eS : start, ovE = eE < end ? eE : end;
+      if (ovS > ovE) return;
+      const wd = D.workdaysBetween(ovS, ovE);
+      if (wd <= 0) return;
+      const hrs = taskIntensity(t) * daily * wd;   // §18.10d 日均強度（netWorkDays 未填＝effortRatio/100 等值）
+      let st = 'run'; if (isTaskDone(t)) st = 'done'; else if (eE < today) st = 'late';
+      const deptName = t.dept ? (idToName[t.dept] || t.dept) : '';
+      const pmFlag = isPmTask(t, p);
+      names.forEach(nm => {
+        const rec = per[nm] || (per[nm] = { name: nm, dept: deptName, isPm: false, items: [] });
+        if (!rec.dept && deptName) rec.dept = deptName;
+        if (pmFlag) rec.isPm = true;
+        rec.items.push({ tid: t.id, owner: t.owner || '', pid: p.id, projName: p.name, itemName: t.name, color: p.color || '', st: st, hrsRaw: hrs, effStart: e.start, effEnd: e.end, kind: p.ecnType ? 'ECN' : 'NPI' });
+      });
+    });
+  });
+  const people = Object.values(per).map(r => {
+    const needRaw = r.items.reduce((a, c) => a + (c.st === 'done' ? 0 : c.hrsRaw), 0);
+    r.items.forEach(it => { it.hrs = Math.round(it.hrsRaw); it.pct = capHrs > 0 ? Math.round(it.hrsRaw / capHrs * 100) : 0; });
+    const pr = { late: 0, run: 1, done: 2 };
+    r.items.sort((a, b) => (pr[a.st] - pr[b.st]) || (b.hrsRaw - a.hrsRaw));
+    r.needHrs = Math.round(needRaw);
+    r.rate = capHrs > 0 ? Math.round(needRaw / capHrs * 100) : 0;
+    r.over = r.rate > 100;
+    r.deptOnly = deptNameSet.has(r.name);   // owner 名即部門名（品保/採購/PM…）→ 顯「X部」、不看 task 的 dept 欄
+    r.liveCnt = r.items.filter(c => c.st !== 'done').length;
+    return r;
+  }).filter(r => r.needHrs > 0);
+  people.sort((a, b) => (b.rate - a.rate) || (b.needHrs - a.needHrs));
+  return { people: people, capHrs: Math.round(capHrs) };
+};
+Portfolio.setPlRange = function(which, iso) {
+  if (!iso) return;
+  if (which === 's') this._plStart = iso; else this._plEnd = iso;
+  if (new Date(this._plStart) > new Date(this._plEnd)) { const tmp = this._plStart; this._plStart = this._plEnd; this._plEnd = tmp; }
+  this._plRangeLabel = '自訂';
+  this._plRerender();
+};
+Portfolio.setPlQuick = function(preset) {
+  const t = new Date(D.today());
+  if (preset === 'week') { const mon = D.monday(t); this._plStart = D.fmt(mon, 'iso'); this._plEnd = D.fmt(D.addDays(mon, 6), 'iso'); this._plRangeLabel = '本週'; }
+  else if (preset === 'quarter') { const q = Math.floor(t.getMonth() / 3) * 3; this._plStart = D.fmt(new Date(t.getFullYear(), q, 1), 'iso'); this._plEnd = D.fmt(new Date(t.getFullYear(), q + 3, 0), 'iso'); this._plRangeLabel = '本季'; }
+  else { this._plStart = D.fmt(new Date(t.getFullYear(), t.getMonth(), 1), 'iso'); this._plEnd = D.fmt(new Date(t.getFullYear(), t.getMonth() + 1, 0), 'iso'); this._plRangeLabel = '本月'; }
+  this._plRerender();
+};
+// §18.16 P3 v2：全員負荷卡＋爆表告警已合併進「嚴重超載警報」_alertHtml；區間切換重繪指向警報。
+Portfolio._plRerender = function() { const el = document.getElementById('pf-alertband'); if (el) el.innerHTML = this._alertHtml(); };
+// 下鑽（列唯讀·點列跳專案）＋底部「轉移任務」reassign（Phase 2b #2：改 owner 字串·多人掛名只換此人·不動日期/工期）
+Portfolio.openPersonDetail = function(name) {
+  const { people, capHrs } = this._personWindowLoad(new Date(this._plStart), new Date(this._plEnd));
+  const pp = people.find(x => x.name === name);
+  if (!pp) return;
+  const disp = pp.deptOnly ? pp.name + '部' : pp.name;
+  const over = pp.rate > 100, warn = pp.rate >= 80 && pp.rate <= 100;
+  const bdg = over ? 'pf-pm-bdg-over' : (warn ? 'pf-pm-bdg-warn' : 'pf-pm-bdg-ok');
+  let body = '<div class="pf-pm-mosum">' + U.esc(disp) + (pp.dept && !pp.deptOnly ? '（' + U.esc(pp.dept) + '）' : '') + ' · 共 ' + pp.items.length + ' 件（含完工參考）· 當前負荷 ' + pp.needHrs + 'h ／ 容量 ' + capHrs + 'h <span class="pf-pm-bdg ' + bdg + '">' + pp.rate + '%' + (over ? ' 過載' : '') + '</span></div>';
+  body += '<div class="pf-pm-th"><span class="pf-pm-doth">●</span><span>專案 · 工作項目</span><span>狀態</span><span>期間</span><span>工時（佔比）</span></div>';
+  [['late', '延遲', 'late'], ['run', '進行中', ''], ['done', '完工（參考·不計當前）', '']].forEach(g => {
+    const its = pp.items.filter(c => c.st === g[0]);
+    if (!its.length) return;
+    const subH = its.reduce((a, c) => a + c.hrs, 0);
+    body += '<div class="pf-pm-grp ' + g[2] + '"><span>' + g[1] + '（' + its.length + ' 件）</span><span>' + subH + 'h</span></div>';
+    body += its.map(c => this._pmRowHtml(c, { inModal: true, hideSt: true })).join('');
+  });
+  body += '<div class="pf-pm-motot"><span class="tt">當前負荷合計（不含完工·' + pp.liveCnt + ' 件）</span><span class="tv">' + pp.needHrs + 'h · ' + pp.rate + '%</span></div>';
+  // ── 轉移任務（reassign·#2）：挑一件未完成任務 → 改負責人 ──
+  const openItems = pp.items.filter(c => c.st !== 'done');
+  if (openItems.length) {
+    const roster = this.personRoster();
+    const taskOpts = openItems.map(c => '<option value="' + c.tid + '">' + U.esc(c.projName) + ' · ' + U.esc(c.itemName) + '（' + c.hrs + 'h）</option>').join('');
+    const toOpts = roster.filter(r => r.name !== name).map(r => '<option value="' + U.esc(r.name) + '">' + U.esc(r.deptOnly ? r.name + '部' : r.name + (r.dept ? '（' + r.dept + '）' : '')) + '</option>').join('') + '<option value="__custom__">＋ 自訂新負責人…</option>';
+    const nmArg = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    body += '<div class="pf-pl-reassign"><span class="pf-pl-rlbl"><i class="ti ti-arrows-exchange"></i> 轉移任務</span>' +
+      '<select id="pl-re-task" class="pf-pl-resel">' + taskOpts + '</select>' +
+      '<span class="pf-pl-rarrow">→</span>' +
+      '<select id="pl-re-to" class="pf-pl-resel">' + toOpts + '</select>' +
+      '<button class="tb-action ghost pf-pl-rbtn" onclick="Portfolio.doReassign(\'' + nmArg + '\')">轉移</button>' +
+      '<div class="pf-pl-rnote">改負責人不動日期/工期；多人掛名只換此人。改完自動存雲端＋重算負荷。</div></div>';
+  }
+  App.openModal({ title: disp + ' 跨案負荷明細', body: body, wide: true, footer: '<button class="tb-action ghost" onclick="App.closeModal()">關閉</button>' });
+};
+
+// ═══ §18.16 P3 v2 第一視覺區：嚴重超載警報（合併「同人爆表」＋「全員過載」·放大·直接列 >100% 名單） ═══
+Portfolio._alertRows = function() {
+  this._plEnsure();
+  const { people, capHrs } = this._personWindowLoad(new Date(this._plStart), new Date(this._plEnd));
+  const ol = {}; this.overloadAlerts().forEach(a => { ol[a.name] = a; });
+  const rows = people.map(pp => {
+    const byProj = {}; pp.items.forEach(c => { if (c.st !== 'done') byProj[c.projName] = (byProj[c.projName] || 0) + c.hrsRaw; });
+    let cause = '', cmx = 0; Object.keys(byProj).forEach(k => { if (byProj[k] > cmx) { cmx = byProj[k]; cause = k; } });
+    const a = ol[pp.name];
+    return { name: pp.name, dept: pp.dept, deptOnly: pp.deptOnly, color: pp.color, rate: pp.rate, over: pp.over, needHrs: pp.needHrs, cause, peak: a ? Math.round(a.peak) : null, burst: a ? a.days.length : 0 };
+  });
+  return { capHrs, rows };
+};
+Portfolio._alertHtml = function() {
+  const { rows, capHrs } = this._alertRows();
+  const overOnly = this._alertOverOnly !== false;
+  const overCnt = rows.filter(r => r.over).length;
+  const shown = overOnly ? rows.filter(r => r.over) : rows;
+  const label = this._plLabel();
+  const quick = [['week', '本週'], ['month', '本月'], ['quarter', '本季']];
+  const qseg = quick.map(q => '<b class="' + (this._plRangeLabel === q[1] ? 'on' : '') + '" onclick="Portfolio.setPlQuick(\'' + q[0] + '\')">' + q[1] + '</b>').join('');
+  const ovtog = '<span class="pf-pm-seg pf-pm-seg-sm pf-al-tog"><b class="' + (overOnly ? 'on' : '') + '" onclick="Portfolio.setAlertOverOnly(true)">只看過載' + (overCnt ? ' ' + overCnt : '') + '</b><b class="' + (overOnly ? '' : 'on') + '" onclick="Portfolio.setAlertOverOnly(false)">全部 ' + rows.length + '</b></span>';
+  const hint = App.buildHintBox({ key: 'portfolio-alert', icon: 'ti-help-circle', collapsed: true, title: '超載警報怎麼算', summary: '稼動率>100%·看明細可就地處置',
+    bodyHtml: '<ul class="pf-pm-hint">' +
+      '<li>稼動率＝該員區間任務工時 ÷ 上班時數；&gt;100%＝被壓爆。多人掛名每人算全額。已完工不計。</li>' +
+      '<li>「主因」＝佔他工時最多的專案；「峰值/爆N天」＝未來 30 天單日投入合計最高與爆表天數。</li>' +
+      '<li>點「看明細」＝攤開哪幾天哪幾件疊爆，並可就地把任務轉給別人（會顯示對方負荷、避免挖東牆補西牆）。</li></ul>' });
+  const body = shown.length ? shown.map(r => {
+    const nmArg = r.name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const dot = r.rate > 100 ? '🔴' : (r.rate >= 80 ? '🟡' : '🟢');
+    const who = r.deptOnly ? (U.esc(r.name) + '部') : (U.esc(r.name) + (r.dept ? '<span class="pf-al-dept">' + U.esc(r.dept) + '</span>' : ''));
+    return '<div class="pf-al-row' + (r.over ? ' over' : '') + '">' +
+      '<span class="pf-al-flag">' + dot + '</span>' +
+      '<span class="pf-al-name">' + who + '</span>' +
+      '<span class="pf-al-rate' + (r.rate > 100 ? ' over' : (r.rate >= 80 ? ' warn' : '')) + '">' + r.rate + '%</span>' +
+      '<span class="pf-al-cause">' + (r.cause ? '<span class="pf-al-causelb">主因</span><b class="pf-al-causep">' + U.esc(r.cause) + '</b>' : '—') + '</span>' +
+      '<span class="pf-al-peak">' + (r.peak != null ? '峰值 <b>' + r.peak + '%</b> · 爆 ' + r.burst + ' 天' : (r.needHrs + 'h / ' + capHrs + 'h')) + '</span>' +
+      '<button class="pf-al-btn" onclick="Portfolio.openOverloadDetail(\'' + nmArg + '\')">看明細</button>' +
+      '</div>';
+  }).join('') : '<div class="pf-al-ok"><i class="ti ti-circle-check"></i> 此區間無人過載（稼動率皆 ≤100%）——點「全部」看所有人負荷</div>';
+  return '<div class="pf-card pf-al' + (overCnt ? ' pf-al-hot' : '') + '">' +
+    '<div class="pf-pl-top"><div class="pf-card-t">🚩 嚴重超載警報<span class="pf-pl-subt"> · ' + label + ' · 稼動率 >100% · 區間容量 ' + capHrs + 'h · 過載 ' + overCnt + ' 人</span></div>' +
+      '<div class="pf-pl-rangebar">' + ovtog + '<span class="pf-pl-rl">區間</span><input type="date" class="pf-pm-din" value="' + this._plStart + '" onchange="Portfolio.setPlRange(\'s\', this.value)"><span class="pf-pl-rt">~</span><input type="date" class="pf-pm-din" value="' + this._plEnd + '" onchange="Portfolio.setPlRange(\'e\', this.value)"><span class="pf-pm-seg pf-pm-seg-sm pf-pl-seg">' + qseg + '</span></div>' +
+    '</div>' + hint +
+    '<div class="pf-al-body">' + body + '</div>' +
+    '<div class="pf-pl-foot">點「看明細」查逐日肇因、並就地把任務轉給別人（會顯示對方負荷）</div>' +
+    '</div>';
+};
+Portfolio.setAlertOverOnly = function(v) { this._alertOverOnly = !!v; this._alertRerender(); };
+Portfolio._alertRerender = function() { const el = document.getElementById('pf-alertband'); if (el) el.innerHTML = this._alertHtml(); };
+// 全域人員名冊（Phase 2b #2·字串版）：從各案名冊＋任務 owner 推「不重複人員＋部門（眾數）」·轉移下拉/未來人員目錄用
+Portfolio.personRoster = function() {
+  const deptNameSet = new Set();
+  (DATA.projects || []).forEach(p => (p.depts || []).forEach(d => { if (d.name) deptNameSet.add(d.name); }));
+  const per = {};
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;
+    const idToName = {}; (p.depts || []).forEach(d => idToName[d.id] = d.name);
+    (DATA.tasks || []).forEach(t => {
+      if (t.project !== p.id || t._deleted || t.measureType === 'hours') return;
+      String(t.owner || '').split(/[、,，\/+＋&]/).map(s => s.trim()).filter(Boolean).forEach(nm => {
+        const dept = t.dept ? (idToName[t.dept] || t.dept) : '';
+        const rec = per[nm] || (per[nm] = { name: nm, votes: {}, count: 0 });
+        rec.count++;
+        if (dept) rec.votes[dept] = (rec.votes[dept] || 0) + 1;
+      });
+    });
+  });
+  return Object.values(per).map(r => {
+    const dept = deptNameSet.has(r.name) ? r.name : (Object.keys(r.votes).sort((a, b) => r.votes[b] - r.votes[a])[0] || '');
+    return { name: r.name, dept: dept, deptOnly: deptNameSet.has(r.name), count: r.count };
+  }).sort((a, b) => b.count - a.count);
+};
+// 轉移觸發：讀兩個 select → reassign；自訂走 promptModal
+Portfolio.doReassign = function(fromName) {
+  const ts = document.getElementById('pl-re-task'), to = document.getElementById('pl-re-to');
+  if (!ts || !to || !ts.value) return;
+  const tid = ts.value, toV = to.value;
+  if (toV === '__custom__') { App.promptModal({ title: '轉移給新負責人', label: '新負責人姓名', value: '', okText: '轉移', onSubmit: (n) => this.reassignTask(tid, fromName, n) }); return; }
+  this.reassignTask(tid, fromName, toV);
+};
+// 改任務負責人（多人掛名只換 fromName 這人·保留分隔符與其他人）；不動日期/工期，存檔→雲端同步，重算總覽
+Portfolio.reassignTask = function(tid, fromName, toName) {
+  const t = (DATA.tasks || []).find(x => x.id === tid); if (!t) return;
+  toName = String(toName || '').trim(); if (!toName) return;
+  const parts = String(t.owner || '').split(/([、,，\/+＋&])/);   // 捕獲群組保留分隔符
+  let done = false;
+  const rebuilt = parts.map(seg => { if (!done && seg.trim() === fromName) { done = true; return seg.replace(fromName, toName); } return seg; }).join('');
+  t.owner = (done ? rebuilt : toName).trim();
+  Store.tasks.save();
+  U.toast('已轉移「' + t.name + '」：' + fromName + ' → ' + toName, 'success');
+  App.closeModal();
+  if (App.currentPage === 'portfolio') App.showPage('portfolio');
+};
+
+// ═══ Phase 2b #3 校準回路（MVP·由「完工任務 實際÷預估工期」推算階段偏差；主觀「重/輕」標記為後續加值） ═══
+Portfolio.calibrationStats = function() {
+  // §18.10d ③：比「實際淨工作天 ÷ 原估跨度」＝真工作量估準度（取代舊「實際跨度÷預估跨度」窗口比較，後者把拖延誤判成慢）。
+  // 資料來源＝完工任務中 PM 於結案輕彈填過 netWorkDays 者；沒填＝無訊號（誠實不謊報）。
+  const byStage = {};
+  (DATA.tasks || []).forEach(t => {
+    if (t._deleted || t.status !== 'done' || t.measureType === 'hours') return;
+    if (!(t.netWorkDays > 0) || !t.plannedStart || !t.plannedEnd) return;
+    const span = D.workdaysBetween(t.plannedStart, t.plannedEnd);   // 原估＝預計開始→完成的跨度工作天
+    if (span <= 0) return;
+    const st = (typeof t.stage === 'string' && t.stage.trim()) ? t.stage.trim() : '未分階段';
+    const entry = byStage[st] = byStage[st] || { ratios: [], feels: { lighter: 0, asExpected: 0, heavier: 0 } };
+    entry.ratios.push(t.netWorkDays / span);
+    if (t.calibFeel && entry.feels.hasOwnProperty(t.calibFeel)) entry.feels[t.calibFeel]++;
+  });
+  return Object.keys(byStage).map(st => {
+    const e = byStage[st], arr = e.ratios.slice().sort((a, b) => a - b);
+    return { stage: st, median: arr[Math.floor((arr.length - 1) / 2)], n: arr.length, feels: e.feels };
+  }).filter(x => x.n >= 2).sort((a, b) => Math.abs(b.median - 1) - Math.abs(a.median - 1));
+};
+Portfolio._calibHtml = function() {
+  const stats = this.calibrationStats();
+  const applied = (DATA.settings && DATA.settings.calibApplied) || {};
+  const hint = App.buildHintBox({ key: 'portfolio-calib', icon: 'ti-help-circle', collapsed: true, title: '什麼是「範本校準」？', summary: '完工實際 vs 預估·修正範本工期依據',
+    bodyHtml: '<div class="pf-cal-hint">' +
+      '系統自動比對「已結案專案的<b>實際</b>工期」與「原範本<b>預估</b>工期」，抓出估太寬或太緊的階段，讓以後排程越排越準。資料來自任務結案時填的「實際淨工作天」。' +
+      '<div class="pf-cal-hl"><span class="pf-cal-dot g"></span><b>指標偏左（綠）</b>：實際比預估<b>快</b>、範本估太寬 → 建議<b>縮短</b>工期。</div>' +
+      '<div class="pf-cal-hl"><span class="pf-cal-dot r"></span><b>指標偏右（紅）</b>：實際比預估<b>久</b>、範本估太短 → 建議<b>拉長</b>工期。</div>' +
+      '<div class="pf-cal-hl"><span class="pf-cal-dot n"></span><b>指標置中（藍）</b>：實際與預估相符，無需調整。</div>' +
+      '按「套用」會先跳<b>預覽</b>、勾選確認才寫入——只改<b>未來的範本</b>，不動任何進行中的專案。</div>' });
+  const legend = '<div class="pf-cal-legend">' +
+      '<span class="pf-cal-lh l">階段</span>' +
+      '<span class="pf-cal-scale"><span class="pf-cal-scale-track"></span><span class="pf-cal-scale-mid"></span>' +
+        '<span class="pf-cal-scale-lbls"><span>← 做得快 · 範本偏鬆</span><span class="c">準 1.0×</span><span>範本偏緊 · 做得久 →</span></span></span>' +
+      '<span class="pf-cal-lh">比值</span><span class="pf-cal-lh">判定</span><span class="pf-cal-lh">樣本</span><span class="pf-cal-lh">動作</span></div>';
+  const rows = stats.length ? (legend + stats.map(s => {
+    const dev = Math.round((s.median - 1) * 100);
+    const cls = s.median > 1.15 ? 'r' : (s.median < 0.85 ? 'g' : 'n');
+    const tag = s.median > 1.15 ? '低估·偏緊' : (s.median < 0.85 ? '高估·偏鬆' : '精準');
+    const rr = Math.max(0, Math.min(2, s.median));
+    const bar = cls === 'g' ? '<span class="dbar-fill g" style="width:' + ((1 - rr) * 50).toFixed(1) + '%"></span>'
+              : cls === 'r' ? '<span class="dbar-fill r" style="width:' + ((rr - 1) * 50).toFixed(1) + '%"></span>'
+              : '<span class="dbar-fill n"></span>';
+    const feels = (s.feels.lighter + s.feels.asExpected + s.feels.heavier > 0)
+      ? '<span class="pf-cal-feels">' +
+        (s.feels.lighter ? '<span class="pf-cal-f g" title="PM 標比預估輕">▽' + s.feels.lighter + '</span>' : '') +
+        (s.feels.asExpected ? '<span class="pf-cal-f n" title="PM 標差不多">≈' + s.feels.asExpected + '</span>' : '') +
+        (s.feels.heavier ? '<span class="pf-cal-f r" title="PM 標比預估重">△' + s.feels.heavier + '</span>' : '') + '</span>' : '';
+    const action = cls === 'n'
+      ? '<span class="cal-done" title="比值≈1·本就精準·從沒偏過">✓ 已達標</span>'
+      : (applied[s.stage]
+        ? '<span class="cal-done" title="已把校準寫進範本·灰掉防重複套用（避免連乘越縮越短）">✓ 已校準</span>'
+        : '<button class="cal-apply" onclick="Portfolio._calibPreview(\'' + U.esc(s.stage).replace(/'/g, "\\'") + '\',' + s.median.toFixed(4) + ')"><span class="i">' + (cls === 'g' ? '↧' : '↥') + '</span> 套用·' + (cls === 'g' ? '縮短' : '拉長') + '工期</button>');
+    return '<div class="pf-cal-row">' +
+      '<span class="pf-cal-st">' + U.esc(s.stage) + '</span>' +
+      '<span class="dbar"><span class="dbar-mid"></span>' + bar + '</span>' +
+      '<span class="pf-cal-val ' + cls + '">' + s.median.toFixed(2) + '×<small>' + (dev >= 0 ? '+' : '') + dev + '%</small></span>' +
+      '<span class="pf-cal-tag pf-cal-tag-' + cls + '">' + tag + '</span>' +
+      '<span class="pf-cal-n"><b>' + s.n + '</b> 件' + feels + '</span>' +
+      action + '</div>';
+  }).join('')) : '<div class="pf-mini-empty">尚無足夠資料（每階段需 ≥2 件完工任務·且結案時填過「實際淨工作天」）。任務結案時填實際天數後，這裡就會累積校準建議。</div>';
+  return '<div class="pf-card"><div class="pf-card-t">範本校準建議<span class="pf-pl-subt"> · 完工任務 實際淨工作天 vs 預估跨度</span></div>' + hint + '<div class="pf-cal-body">' + rows + '</div></div>';
+};
+
+// 階段別名解析（Phase 2 的「階段別名對照」填 DATA.settings.stageAliases，此處先支援·空表＝原樣比對）
+// §22-F Phase 2：階段別名（tpl-qualified·NPI/ECN 同名階段不混用）。回傳 {tpl,stage} 或 null。
+Portfolio._calibTplLabel = function(tplId) { return tplId === 'ecn-v1' ? 'ECN 範本' : 'NPI 標準範本'; };
+Portfolio._calibResolveStage = function(stage) {
+  const a = (DATA.settings && DATA.settings.stageAliases && DATA.settings.stageAliases[stage]) || null;
+  return (a && a.tpl && a.stage) ? a : null;
+};
+// 蒐集範本內符合此階段的可調任務·回傳含定位索引與 現在→校準後 天數。有別名＝只比對「別名指定的那本範本」的階段（不掃兩本混用）；無別名＝原樣兩本各自精確比對。
+Portfolio._calibTplMatches = function(stage, median) {
+  const alias = this._calibResolveStage(stage), out = [];
+  const scan = (tplId, matchStage) => {
+    const tpl = tplResolve(tplId); if (!tpl || !tpl.cases) return;
+    (tpl.cases || []).forEach((c, ci) => (c.modules || []).forEach((m, mi) => {
+      if (m.stage !== matchStage) return;
+      (m.tasks || []).forEach((tk, ti) => {
+        if (tk.durationDays > 0 && tk.type !== '里程碑')
+          out.push({ tplId, tplLabel: this._calibTplLabel(tplId), ci, mi, ti, name: tk.name || tk.title || '(未命名)', stage: m.stage, cur: tk.durationDays, next: Math.max(1, Math.round(tk.durationDays * median)) });
+      });
+    }));
+  };
+  if (alias) scan(alias.tpl, alias.stage);
+  else { scan('product-dev-v1', stage); scan('ecn-v1', stage); }
+  return out;
+};
+// 下拉 options：NPI／ECN 各成 optgroup·同名階段分開列·value = "tplId::stage"（Paul：不得混用）
+Portfolio._calibTplStageOptions = function(selectedVal) {
+  let html = '<option value="">請選擇範本標準階段…</option>';
+  [['product-dev-v1', 'NPI 標準範本'], ['ecn-v1', 'ECN 範本']].forEach(pair => {
+    const tpl = tplResolve(pair[0]); if (!tpl || !tpl.cases) return;
+    const set = {}; (tpl.cases || []).forEach(c => (c.modules || []).forEach(m => { if (m.stage) set[m.stage] = 1; }));
+    const opts = Object.keys(set); if (!opts.length) return;
+    html += '<optgroup label="' + U.esc(pair[1]) + '">';
+    opts.forEach(s => { const val = pair[0] + '::' + s; html += '<option value="' + U.esc(val) + '"' + (val === selectedVal ? ' selected' : '') + '>' + U.esc(s) + '</option>'; });
+    html += '</optgroup>';
+  });
+  return html;
+};
+// §18.10d ③ 套用校準比值至範本——先預覽（可勾選），確認才寫入；只改範本 durationDays·不動已建立專案
+Portfolio._calibPreview = function(stage, median) {
+  const matches = this._calibTplMatches(stage, median);
+  const dir = median < 1 ? '縮短' : '拉長', tone = median < 1 ? 'g' : 'r';
+  if (!matches.length) {
+    App.openModal({ title: '找不到對應階段 · ' + U.esc(stage),
+      body: '<div class="cal-modal">' +
+        '<p class="cal-modal-sub">範本裡沒有「<b>' + U.esc(stage) + '</b>」這個階段。設定一次<b>別名對照</b>，以後校準遇到「' + U.esc(stage) + '」就自動對上——不用每次都來。</p>' +
+        '<div class="al-form"><span class="fl">把任務階段「' + U.esc(stage) + '」對應到範本的哪個標準階段？（NPI／ECN 分開選）</span>' +
+        '<span class="chip">' + U.esc(stage) + '</span><span class="al-ar">→</span>' +
+        '<select id="calNomatchTo">' + this._calibTplStageOptions('') + '</select></div></div>',
+      footer: '<button class="tb-action ghost" onclick="App.closeModal()">取消</button>' +
+              '<button class="tb-action" onclick="Portfolio._calibAliasSetAndApply(\'' + U.esc(stage).replace(/'/g, "\\'") + '\',' + median.toFixed(4) + ')">存別名並套用</button>' });
+    return;
+  }
+  this._calibPending = { stage, median, matches };
+  const rowsHtml = matches.map((mm, i) =>
+    '<tr><td class="cal-pv-c"><input type="checkbox" class="cal-pv-ck" data-i="' + i + '" checked onchange="Portfolio._calibPvCount()"></td>' +
+    '<td class="cal-pv-task">' + U.esc(mm.name) + '<small>' + U.esc(mm.stage) + '</small></td>' +
+    '<td class="cal-pv-r cal-pv-from">' + mm.cur + ' 天</td><td class="cal-pv-ar">→</td>' +
+    '<td class="cal-pv-r cal-pv-to">' + mm.next + ' 天</td>' +
+    '<td class="cal-pv-r cal-pv-src">' + U.esc(mm.tplLabel) + '</td></tr>').join('');
+  App.openModal({ title: '套用校準至範本 · ' + U.esc(stage),
+    body: '<div class="cal-modal">' +
+      '<p class="cal-modal-sub">實際工時' + (median < 1 ? '只有' : '達到') + '預估的 <b class="' + tone + '">' + Math.round(median * 100) + '%</b>（' + median.toFixed(2) + '×）。以下範本任務工期將<b class="' + tone + '">' + dir + '</b>——勾選要套用的項目。只更新<b>未來的範本</b>，不影響進行中的專案。</p>' +
+      '<table class="cal-pv-tbl"><thead><tr><th class="cal-pv-c"><input type="checkbox" class="cal-pv-all" checked onchange="Portfolio._calibPvAll(this)"></th><th>範本任務</th><th class="cal-pv-r">現在</th><th></th><th class="cal-pv-r">校準後</th><th class="cal-pv-r">來源</th></tr></thead><tbody>' + rowsHtml + '</tbody></table></div>',
+    footer: '<span class="cal-pv-count" id="calPvCount"></span>' +
+            '<button class="tb-action ghost" onclick="App.closeModal()">取消</button>' +
+            '<button class="tb-action" onclick="Portfolio._calibConfirm()">確認套用</button>' });
+  this._calibPvCount();
+};
+Portfolio._calibPvAll = function(cb) { document.querySelectorAll('.cal-pv-ck').forEach(ck => { ck.checked = cb.checked; }); this._calibPvCount(); };
+Portfolio._calibPvCount = function() {
+  const all = document.querySelectorAll('.cal-pv-ck'), on = document.querySelectorAll('.cal-pv-ck:checked');
+  const el = document.getElementById('calPvCount'); if (el) el.textContent = '已勾選 ' + on.length + ' / ' + all.length + ' 項';
+  const allBox = document.querySelector('.cal-pv-all'); if (allBox) allBox.checked = all.length > 0 && on.length === all.length;
+};
+Portfolio._calibConfirm = function() {
+  const pend = this._calibPending; if (!pend) { App.closeModal(); return; }
+  const picks = [];
+  document.querySelectorAll('.cal-pv-ck:checked').forEach(ck => picks.push(pend.matches[+ck.getAttribute('data-i')]));
+  if (!picks.length) { U.toast('請至少勾選一項', 'warning'); return; }
+  const byTpl = {};
+  picks.forEach(p => { (byTpl[p.tplId] = byTpl[p.tplId] || []).push(p); });
+  let updated = 0;
+  Object.keys(byTpl).forEach(tplId => {
+    const base = tplResolve(tplId); if (!base) return;
+    let ov = (DATA.templates || []).find(t => t && t.templateId === tplId);
+    if (!ov) { ov = JSON.parse(JSON.stringify(base)); DATA.templates = DATA.templates || []; DATA.templates.push(ov); }
+    byTpl[tplId].forEach(p => {
+      try { const tk = ov.cases[p.ci].modules[p.mi].tasks[p.ti]; if (tk && tk.durationDays > 0 && tk.type !== '里程碑') { tk.durationDays = p.next; updated++; } } catch (e) {}
+    });
+  });
+  if (updated > 0) {
+    DATA.settings = DATA.settings || {};
+    DATA.settings.calibApplied = DATA.settings.calibApplied || {};
+    DATA.settings.calibApplied[pend.stage] = { ratio: pend.median, at: Date.now() };
+    Store.templates.save(); Store.settings.save();
+    this._calibPending = null; App.closeModal(); App.refreshAll();
+    U.toast('已套用校準至 ' + updated + ' 項範本任務（' + pend.stage + '）', 'success');
+  } else { U.toast('沒有可套用的項目', 'warning'); }
+};
+// §22-F Phase 2：no-match 彈窗就地設別名→存→當場重試套用（不跳頁）
+Portfolio._calibAliasSetAndApply = function(stage, median) {
+  const toEl = document.getElementById('calNomatchTo'), toVal = toEl ? toEl.value : '';
+  if (!toVal) { U.toast('請選對應的範本標準階段', 'warning'); return; }
+  const parts = toVal.split('::'), tpl = parts[0], s = parts.slice(1).join('::');
+  DATA.settings = DATA.settings || {}; DATA.settings.stageAliases = DATA.settings.stageAliases || {};
+  DATA.settings.stageAliases[stage] = { tpl, stage: s };
+  Store.settings.save();
+  App.closeModal();
+  this._calibPreview(stage, median);   // 重試——現在別名生效即可比對到
+};
+// 階段別名對照管理卡（校準卡正下方·排程 tab）
+Portfolio._calibAliasHtml = function() {
+  const aliases = (DATA.settings && DATA.settings.stageAliases) || {};
+  const keys = Object.keys(aliases).filter(k => aliases[k] && aliases[k].tpl && aliases[k].stage);
+  const kindCls = tpl => tpl === 'ecn-v1' ? 'ecn' : 'npi';
+  const kindLbl = tpl => tpl === 'ecn-v1' ? 'ECN' : 'NPI';
+  const list = keys.length
+    ? '<div class="al-list">' + keys.map(k => {
+        const a = aliases[k];
+        return '<div class="al-row"><span class="al-from">' + U.esc(k) + '</span><span class="al-ar">→</span>' +
+          '<span class="al-to"><span class="tag"><span class="al-kind ' + kindCls(a.tpl) + '">' + kindLbl(a.tpl) + '</span>' + U.esc(a.stage) + '</span></span>' +
+          '<button class="al-x" title="刪除此別名" onclick="Portfolio._calibAliasDel(\'' + U.esc(k).replace(/'/g, "\\'") + '\')">✕</button></div>';
+      }).join('') + '</div>'
+    : '<div class="al-empty">尚無別名對照。校準「套用」遇到對不上的階段時，會提示你當場設定；也可在下方直接新增。</div>';
+  const addRow = '<div class="al-add"><span class="al-lbl">新增別名</span>' +
+    '<input type="text" id="calAliasFrom" placeholder="任務階段名（如：性試）">' +
+    '<span class="al-ar">→</span>' +
+    '<select id="calAliasTo">' + this._calibTplStageOptions('') + '</select>' +
+    '<button class="al-add-btn" onclick="Portfolio._calibAliasAdd()">＋ 新增</button></div>';
+  return '<div class="pf-card cal-alias-card"><div class="pf-card-t">階段別名對照<span class="pf-pl-subt"> · 讓校準自動對上不同命名的階段</span></div>' +
+    '<div class="al-desc">各專案自訂的階段名（尤其空白/骨架案）可能跟標準範本不同。設定對照後，校準比對時自動換算——例如把「性試」算成範本的「性能測試」。<b>NPI／ECN 同名階段分開對照、不混用。</b></div>' +
+    list + addRow + '</div>';
+};
+Portfolio._calibAliasAdd = function() {
+  const fromEl = document.getElementById('calAliasFrom'), toEl = document.getElementById('calAliasTo');
+  const from = (fromEl ? fromEl.value : '').trim(), toVal = toEl ? toEl.value : '';
+  if (!from) { U.toast('請填任務階段名', 'warning'); return; }
+  if (!toVal) { U.toast('請選對應的範本標準階段', 'warning'); return; }
+  const parts = toVal.split('::'), tpl = parts[0], s = parts.slice(1).join('::');
+  DATA.settings = DATA.settings || {}; DATA.settings.stageAliases = DATA.settings.stageAliases || {};
+  DATA.settings.stageAliases[from] = { tpl, stage: s };
+  Store.settings.save(); App.refreshAll();
+  U.toast('已新增別名：' + from + ' → ' + s, 'success');
+};
+Portfolio._calibAliasDel = function(from) {
+  if (DATA.settings && DATA.settings.stageAliases && DATA.settings.stageAliases[from]) {
+    delete DATA.settings.stageAliases[from]; Store.settings.save(); App.refreshAll();
+    U.toast('已刪除別名：' + from, 'info');
+  }
+};
+
+// ═══ Phase 2b #5 逐日負荷熱度（人×未來工作日·格子色＝當日 Σ投入%；複用爆表的逐日拆人法） ═══
+Portfolio.dailyHeat = function(days) {
+  days = days || 20;
+  const eff = t => taskIntensity(t) * 100;   // §18.10d 日均強度→%（netWorkDays 未填＝effortRatio 等值）
+  const today = D.today(); today.setHours(0, 0, 0, 0);
+  const cols = []; let d = new Date(today), guard = 0;
+  while (cols.length < days && guard++ < 300) { if (D.isWorkday(d)) cols.push(D.fmt(d, 'iso')); d = D.addDays(d, 1); }
+  const colSet = new Set(cols);
+  const deptNameSet = new Set();
+  (DATA.projects || []).forEach(p => (p.depts || []).forEach(dd => { if (dd.name) deptNameSet.add(dd.name); }));
+  const per = {}, personDept = {};   // personDept：人→部門（供部門視角聚合·§18.16 P3 v2）
+  (DATA.projects || []).forEach(p => {
+    if ((p.status || 'active') !== 'active') return;
+    const idToName = {}; (p.depts || []).forEach(dd => idToName[dd.id] = dd.name);
+    (DATA.tasks || []).forEach(t => {
+      if (t.project !== p.id || t._deleted || isTaskDone(t) || t.measureType === 'hours') return;
+      if (t.epoch != null && t.epoch !== (p.version || 1)) return;
+      const names = String(t.owner || '').split(/[、,，\/+＋&]/).map(s => s.trim()).filter(Boolean);
+      if (!names.length) return;
+      const e = getEffectiveSchedule(t);
+      if (!e || !e.start || !e.end) return;
+      const s0 = new Date(e.start), e0 = new Date(e.end);
+      if (isNaN(s0) || isNaN(e0)) return;
+      const deptNm = t.dept ? (idToName[t.dept] || t.dept) : '';
+      for (let x = new Date(s0); x <= e0; x = D.addDays(x, 1)) {
+        const iso = D.fmt(x, 'iso');
+        if (!colSet.has(iso)) continue;
+        names.forEach(nm => {
+          const pd = (per[nm] = per[nm] || {}); pd[iso] = (pd[iso] || 0) + eff(t);
+          if (!personDept[nm]) personDept[nm] = deptNameSet.has(nm) ? nm + '部' : (deptNm || '未指派');
+        });
+      }
+    });
+  });
+  const people = Object.keys(per).map(nm => {
+    const row = cols.map(iso => per[nm][iso] || 0);
+    return { name: nm, dept: personDept[nm] || '未指派', row: row, peak: Math.max(0, ...row) };
+  }).filter(x => x.peak > 0).sort((a, b) => b.peak - a.peak);
+  return { cols: cols, people: people };
+};
+// §18.16 P3 v2：部門視角熱度＝把個人熱度按部門聚合，每格取該部門「當時段最忙一人」的峰值（>100＝該部門有人爆·點切個人看是誰）。
+Portfolio.deptHeat = function(days) {
+  const { cols, people } = this.dailyHeat(days);
+  const byDept = {};
+  people.forEach(pp => {
+    const g = byDept[pp.dept] || (byDept[pp.dept] = { name: pp.dept, row: cols.map(() => 0), peak: 0 });
+    pp.row.forEach((v, i) => { if (v > g.row[i]) g.row[i] = v; });
+  });
+  const depts = Object.values(byDept).map(g => { g.peak = Math.max(0, ...g.row); return g; }).filter(x => x.peak > 0).sort((a, b) => b.peak - a.peak);
+  return { cols: cols, people: depts };
+};
+Portfolio._heatHtml = function() {
+  const gran = this._heatGran || 'week';   // §18.15 預設週視角（日/週/雙週）
+  const scope = this._heatScope || 'person';   // §18.16 P3 v2 個人/部門切換（部門負載併入此·先看大盤再下鑽）
+  const chunk = gran === 'day' ? 1 : (gran === 'week' ? 5 : 10);
+  const spanDays = gran === 'day' ? 20 : (gran === 'week' ? 30 : 40);
+  const { cols, people } = (scope === 'dept') ? this.deptHeat(spanDays) : this.dailyHeat(spanDays);
+  const scopeSeg = '<span class="pf-pm-seg pf-pm-seg-sm pf-ht-seg"><b class="' + (scope === 'person' ? 'on' : '') + '" onclick="Portfolio.setHeatScope(\'person\')">個人</b><b class="' + (scope === 'dept' ? 'on' : '') + '" onclick="Portfolio.setHeatScope(\'dept\')">部門</b></span>';
+  const granSeg = [['day', '日'], ['week', '週'], ['biweek', '雙週']].map(g =>
+    '<b class="' + (gran === g[0] ? 'on' : '') + '" onclick="Portfolio.setHeatGran(\'' + g[0] + '\')">' + g[1] + '</b>').join('');
+  const seg = scopeSeg + '<span class="pf-pm-seg pf-pm-seg-sm pf-ht-seg2">' + granSeg + '</span>';
+  const spanLbl = (scope === 'dept' ? '部門大盤' : '個人') + ' · ' + (gran === 'day' ? ('未來 ' + spanDays + ' 個工作日') : ('未來 ' + Math.round(spanDays / 5) + ' 週 · 每格取峰值'));
+  const hint = App.buildHintBox({ key: 'portfolio-heat', icon: 'ti-help-circle', collapsed: true, title: '負荷熱度怎麼看', summary: '個人/部門切換·紅=產能死角',
+    bodyHtml: '<ul class="pf-pm-hint">' +
+      '<li><b>個人</b>視角每格＝該人那時段單日投入%的最高峰；<b>部門</b>視角每格＝該部門「當時段最忙一人」的峰值（&gt;100＝該部門有人爆，切「個人」看是誰）。</li>' +
+      '<li>顏色：<span style="color:var(--sage-700);font-weight:600">淺綠 <80%</span>、<span style="color:var(--amber-ink);font-weight:600">琥珀 80–100%</span>、<span style="color:var(--rose-ink);font-weight:600">紅 >100%（過載）</span>、空白＝無任務。</li>' +
+      '<li>動線：先看「部門」大盤找亮紅的部門 → 切「個人」看是誰爆 → 點人名看跨案明細＋轉移任務。名字後「N 週爆」＝有幾格過載。</li></ul>' });
+  if (!people.length) return '<div class="pf-card"><div class="pf-pl-top"><div class="pf-card-t">資源熱點矩陣<span class="pf-pl-subt"> · ' + spanLbl + '</span></div>' + seg + '</div>' + hint + '<div class="pf-mini-empty">此區間內無負荷</div></div>';
+  let hcols, hpeople;
+  if (gran === 'day') {
+    hcols = cols.map(iso => { const dt = new Date(iso); return { label: String(dt.getDate()), tip: iso, wk: dt.getDay() === 1 }; });
+    hpeople = people.map(pp => ({ name: pp.name, row: pp.row }));
+  } else {
+    const buckets = [];
+    for (let i = 0; i < cols.length; i += chunk) buckets.push({ s: i, e: Math.min(i + chunk, cols.length) });
+    hcols = buckets.map(b => ({ label: D.fmt(cols[b.s], 'md'), tip: cols[b.s] + ' ~ ' + cols[b.e - 1], wk: false }));
+    hpeople = people.map(pp => ({ name: pp.name, row: buckets.map(b => { let mx = 0; for (let j = b.s; j < b.e; j++) mx = Math.max(mx, pp.row[j] || 0); return mx; }) }));
+  }
+  const cellW = gran === 'day' ? 20 : (gran === 'week' ? 48 : 62);
+  const gridCols = '108px repeat(' + hcols.length + ', ' + cellW + 'px)';
+  const band = pct => pct <= 0 ? 'z' : (pct > 100 ? 'r' : (pct >= 80 ? 'a' : 'g'));
+  let cells = '<div class="pf-ht-cellh pf-ht-namehdr"></div>';
+  hcols.forEach(c => { cells += '<div class="pf-ht-cellh' + (c.wk ? ' wk' : '') + '" title="' + c.tip + '">' + c.label + '</div>'; });
+  hpeople.slice(0, 12).forEach(pp => {
+    const nmArg = pp.name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const redN = pp.row.filter(v => v > 100).length;
+    const redTag = (gran !== 'day' && redN) ? '<span class="pf-ht-redn">' + redN + (gran === 'week' ? ' 週爆' : ' 段爆') + '</span>' : '';
+    // 部門格點擊＝切個人視角下鑽；個人格點擊＝開明細
+    const click = (scope === 'dept') ? 'Portfolio.setHeatScope(\'person\')' : 'Portfolio.openPersonDetail(\'' + nmArg + '\')';
+    const tip = (scope === 'dept') ? '點切個人視角看是誰' : ('點看 ' + U.esc(pp.name) + ' 跨案明細');
+    cells += '<div class="pf-ht-namec" onclick="' + click + '" title="' + tip + '">' + U.esc(pp.name) + redTag + '</div>';
+    pp.row.forEach((pct, i) => { cells += '<div class="pf-ht-cell ' + band(pct) + (gran !== 'day' ? ' w' : '') + '" title="' + hcols[i].tip + '：峰值 ' + Math.round(pct) + '%">' + (gran !== 'day' && pct > 0 ? Math.round(pct) : '') + '</div>'; });
+  });
+  const legend = '<div class="pf-ht-legend"><span><i class="pf-ht-lg a"></i>80–100% 滿載</span><span><i class="pf-ht-lg r"></i>&gt;100% 過載</span><span><i class="pf-ht-lg g"></i>&lt;80% 正常</span></div>';
+  return '<div class="pf-card"><div class="pf-pl-top"><div class="pf-card-t">資源熱點矩陣<span class="pf-pl-subt"> · ' + spanLbl + ' · 按峰值排序</span></div>' + seg + '</div>' + hint + legend +
+    '<div class="pf-ht-scroll"><div class="pf-ht-grid" style="grid-template-columns:' + gridCols + '">' + cells + '</div></div></div>';
+};
+Portfolio.setHeatGran = function(g) { this._heatGran = g; this._heatRerender(); };
+Portfolio.setHeatScope = function(s) { this._heatScope = s; this._heatRerender(); };   // §18.16 個人/部門切換
+Portfolio._heatRerender = function() { const el = document.getElementById('pf-heatband'); if (el) el.innerHTML = this._heatHtml(); };
+
+// 總覽頁渲染（§18.8）：4 指標卡＋雙列進度矩陣＋部門負載＋當週待處理＋各區塊 HintBox
+Portfolio.renderOverview = function(mountId) {
+  const el = document.getElementById(mountId);
+  if (!el) return;
+  const projects = DATA.projects || [];
+  if (!projects.length) {
+    el.innerHTML = `<div class="pf-empty"><i class="ti ti-layout-dashboard"></i><div class="pf-empty-t">尚無專案</div><div class="pf-empty-s">建立專案後，這裡會顯示跨專案健康度、進度與部門負載。</div></div>`;
+    return;
+  }
+  const today = D.today();
+
+  // §18.15 4 KPI：總專案數／延遲異常(落差≤−5%)／整體健康度(加權平均達成率)／過載人員(稼動率>100%)——與 P1 差異表、P3 負荷同一把尺（規則15）。
+  const activeProjs = projects.filter(p => (p.status || 'active') === 'active');
+  const closedCnt = projects.length - activeProjs.length;
+  let behindCnt = 0, hAcc = 0, hW = 0;
+  activeProjs.forEach(p => {
+    const pr = this.projectProgress(p.id, today);
+    const gap = (pr.actual != null && pr.planned != null) ? pr.actual - pr.planned : null;
+    if (gap != null && gap <= -5) behindCnt++;   // 延遲異常＝P1 紅列同定義
+    if (pr.actual != null && pr.planned != null) {
+      const rate = pr.planned <= 0 ? 100 : Math.min(100, Math.round(pr.actual / pr.planned * 100));   // 達成率＝目前÷預期(封頂100·在軌=100)
+      const w = this._live().filter(t => t.project === p.id).reduce((s, t) => s + taskWorkload(t), 0) || 1;
+      hAcc += rate * w; hW += w;
+    }
+  });
+  const health = hW > 0 ? Math.round(hAcc / hW) : null;
+  this._plEnsure();
+  const overloadCnt = this._personWindowLoad(new Date(this._plStart), new Date(this._plEnd)).people.filter(x => x.over).length;
+
+  // 較上週趨勢（§18.12）：快照新 4 指標；色義看好壞不看箭頭。
+  const prevSnap = this._kpiSnap({ proj: projects.length, behind: behindCnt, health: health, overload: overloadCnt });
+  const tBehind = this._trendBadge(behindCnt, prevSnap ? prevSnap.behind : null, { betterWhenDown: true });
+  const tHealth = this._trendBadge(health, prevSnap ? prevSnap.health : null, { betterWhenDown: false, suffix: '%' });
+  const tOver = this._trendBadge(overloadCnt, prevSnap ? prevSnap.overload : null, { betterWhenDown: true });
+  const healthTone = health == null ? '' : (health >= 85 ? '' : (health >= 60 ? ' pf-num-amber' : ' pf-num-rose'));
+
+  const kpiHtml = `<div class="pf-kpi-row">
+    <div class="pf-kpi" style="border-top-color:var(--slate)">
+      <i class="ti ti-info-circle pf-kpi-i" data-tip="總專案數|系統內所有專案數（含進行中與已結案）"></i>
+      <div class="pf-kpi-lbl">總專案數</div>
+      <div class="pf-kpi-metric"><div class="pf-kpi-num">${projects.length}<span class="pf-kpi-unit"> 案</span></div></div>
+      <div class="pf-kpi-sub">進行中 ${activeProjs.length} · 結案 ${closedCnt}</div>
+    </div>
+    <div class="pf-kpi" style="border-top-color:var(--danger)">
+      <i class="ti ti-info-circle pf-kpi-i" data-tip="延遲異常|進行中專案裡「目前進度落後預期 5% 以上」的案數（＝下方差異表的紅燈列）|徽章＝較上週增減（綠=減少改善／紅=增加惡化／—無上週快照）"></i>
+      <div class="pf-kpi-lbl">延遲異常</div>
+      <div class="pf-kpi-metric"><div class="pf-kpi-num${behindCnt ? ' pf-num-rose' : ''}">${behindCnt}<span class="pf-kpi-unit"> 案</span></div>${tBehind}</div>
+      <div class="pf-kpi-sub">${behindCnt ? '落差 ≤ −5%，見下方紅燈列' : '目前無明顯落後'}</div>
+    </div>
+    <div class="pf-kpi" style="border-top-color:var(--slate)">
+      <i class="ti ti-info-circle pf-kpi-i" data-tip="整體健康度|各專案「目前÷預期」達成率的加權平均（工作量大的案影響大·封頂100%）；100%＝完全跟上進度|徽章＝較上週增減（綠=上升改善／紅=下降惡化／—無上週快照）"></i>
+      <div class="pf-kpi-lbl">整體健康度</div>
+      <div class="pf-kpi-metric"><div class="pf-kpi-num${healthTone}">${health === null ? '—' : health + '<span class="pf-kpi-unit">%</span>'}</div>${tHealth}</div>
+      <div class="pf-bar pf-bar-sm"><span class="pf-bar-act" style="width:${health || 0}%; background:var(--sage-600)"></span></div>
+      <div class="pf-kpi-sub">平均達成率（目前÷預期）</div>
+    </div>
+    <div class="pf-kpi" style="border-top-color:${overloadCnt ? 'var(--danger)' : 'var(--slate)'}">
+      <i class="ti ti-info-circle pf-kpi-i" data-tip="過載人員|負荷區間內稼動率 >100% 的人數（＝P3 全員負荷的過載人數·同一視窗）|徽章＝較上週增減（綠=減少改善／紅=增加惡化／—無上週快照）"></i>
+      <div class="pf-kpi-lbl">過載人員</div>
+      <div class="pf-kpi-metric"><div class="pf-kpi-num${overloadCnt ? ' pf-num-rose' : ''}">${overloadCnt}<span class="pf-kpi-unit"> 人</span></div>${tOver}</div>
+      <div class="pf-kpi-sub">稼動率 >100%（見 P3 負荷）</div>
+    </div>
+  </div>`;
+  const kpiHint = App.buildHintBox({ key: 'portfolio-kpi', icon: 'ti-help-circle', collapsed: true, title: '快速看懂數據指標', summary: '總案數／延遲異常／健康度／過載人員',
+    bodyHtml: `<ol class="pf-hint-list">
+      <li><b>總專案數</b>：系統內所有專案（含進行中與已結案）。</li>
+      <li><b>延遲異常</b>：進行中專案裡「目前進度落後預期 5% 以上」的案數，就是下方差異表的紅燈列——同一把尺、對得起來。</li>
+      <li><b>整體健康度</b>：各案「目前÷預期」達成率的加權平均（工作量大的案影響大、封頂 100%）；100%＝完全跟上進度。</li>
+      <li><b>過載人員</b>：負荷區間內稼動率超過 100% 的人數，與 P3「全員跨案負荷」的過載人數同一視窗、同一數字。</li>
+    </ol>` });
+
+  // §18.15 P1：舊「專案進度矩陣」由差異表 _p1Html() 取代（見下方 pan('1')）。
+  // §18.16 P3 v2：舊「部門負載」長條卡已併入資源熱點矩陣「部門」視角（_heatHtml scope=dept）。
+  // §18.15 P2：舊「當週待處理」由異常任務表 _p2Html() 取代（見下方 pan('2')）。
+
+  // §18.15 B1：三頁籤重構（KPI 卡＋提示常駐頂端·下方分 P1 戰情進度／P2 任務風險／P3 資源負載）。B1＝純重組不掉功能，P1/P2 內容增強留 B2/B3。
+  this._ovTab = this._ovTab || '1';
+  const subtab = (n, label) => `<button class="pf-subtab${this._ovTab === n ? ' on' : ''}" data-pf="${n}" onclick="Portfolio.setOvTab('${n}')"><span class="pf-subtab-p">P${n}</span>${label}</button>`;
+  const pan = (n, inner) => `<div class="pf-panel" data-pf="${n}"${this._ovTab === n ? '' : ' hidden'}>${inner}</div>`;
+  el.innerHTML = `${kpiHint}${kpiHtml}
+    <div class="pf-subtabs">${subtab('1', '戰情總覽與進度')}${subtab('2', '任務追蹤與風險')}${subtab('3', '資源分配與負載')}</div>
+    ${pan('1', this._p1Html())}
+    ${pan('2', this._p2Html())}
+    ${pan('3', `<div id="pf-alertband">${this._alertHtml()}</div>
+      <div id="pf-heatband">${this._heatHtml()}</div>`)}`;
+  // §18.16 P3 v2：PM 跨案負荷已移至「跨專案時程」頁、範本校準移至設定範本 tab；P3 僅留警報＋熱點矩陣
+};
+// §18.15 B1：總覽頁籤切換（純顯隱·不重繪·band 的 id 在 P3 DOM 內恆存·range 改仍作用）
+Portfolio.setOvTab = function(n) {
+  this._ovTab = String(n);
+  document.querySelectorAll('.pf-subtab').forEach(b => b.classList.toggle('on', b.dataset.pf === this._ovTab));
+  document.querySelectorAll('.pf-panel').forEach(p => { p.hidden = (p.dataset.pf !== this._ovTab); });
+};
+
+// ═══ §18.15 P1 戰情總覽與進度：專案差異表（落後優先·點列展開里程碑＋致命傷）═══
+Portfolio._p1Html = function() {
+  const projects = DATA.projects || [];
+  if (!projects.length) return '<div class="pf-card"><div class="pf-mini-empty">尚無專案</div></div>';
+  const today = D.today(), todayIso = D.fmt(today, 'iso');
+  const rows = projects.map(p => {
+    const closed = (p.status || 'active') !== 'active';
+    const pr = this.projectProgress(p.id, today);
+    const gap = (pr.actual != null && pr.planned != null) ? pr.actual - pr.planned : null;
+    let sev, lightTxt;
+    if (closed) { sev = 'closed'; lightTxt = '結案'; }
+    else if (gap == null) { sev = 'none'; lightTxt = '待排程'; }   // 完全沒排程日期→不當「正常」，攤開引導（規則16）
+    else if (gap <= -5) { sev = 'red'; lightTxt = '異常'; }
+    else if (gap < 0) { sev = 'yellow'; lightTxt = '偏緊'; }
+    else { sev = 'green'; lightTxt = '正常'; }
+    const sortKey = closed ? 1e9 : (gap == null ? 1e8 : gap);   // 落差由負至正·待排程與結案沉底
+    return { p, closed, pr, gap, sev, lightTxt, sortKey };
+  }).sort((a, b) => a.sortKey - b.sortKey);
+
+  const dot = { closed: '⚪', red: '🔴', yellow: '🟡', green: '🟢', none: '⚪' };
+  const body = rows.map(r => {
+    const p = r.p, pr = r.pr, behind = r.gap != null && r.gap < 0, exp = this._p1Exp === p.id;
+    const ms = this._projNextMilestone(p, todayIso);
+    const msTxt = r.sev === 'none' ? '<span class="pf-vt-todo">尚未排程 · 去設日期</span>' : (ms ? `${U.esc(ms.name)}${ms.end ? ' · 迄 ' + D.fmt(ms.end, 'md') : ''}` : '—');
+    const gapTxt = r.gap == null ? '—' : (r.gap > 0 ? '+' : '') + r.gap + '%';
+    return `<div class="pf-vt-row pf-vt-sev-${r.sev}${exp ? ' on' : ''}" onclick="Portfolio.toggleVarRow('${p.id}')">
+        <span class="pf-vt-sevbar"></span>
+        <span class="pf-vt-name">${U.esc(p.name)}</span>
+        <span class="pf-vt-prog"><span class="pf-vt-track"><span class="pf-vt-fill${behind ? ' behind' : ''}" style="width:${pr.actual || 0}%"></span>${pr.planned != null ? `<span class="pf-vt-planmark" style="left:${pr.planned}%"></span>` : ''}</span></span>
+        <span class="pf-vt-num">${pr.planned == null ? '—' : pr.planned + '%'}</span>
+        <span class="pf-vt-num pf-vt-cur">${pr.actual == null ? '—' : pr.actual + '%'}</span>
+        <span class="pf-vt-gap${behind ? ' neg' : (r.gap != null && r.gap > 0 ? ' pos' : '')}">${gapTxt}</span>
+        <span class="pf-vt-light" title="${r.lightTxt}">${dot[r.sev]}</span>
+        <span class="pf-vt-ms">${msTxt}</span>
+        <i class="ti ti-chevron-${exp ? 'down' : 'right'} pf-vt-caret"></i>
+      </div>${exp ? `<div class="pf-vt-detail">${this._p1DetailHtml(p, todayIso)}</div>` : ''}`;
+  }).join('');
+
+  const hint = App.buildHintBox({ key: 'portfolio-variance', icon: 'ti-help-circle', collapsed: true, title: '這張表怎麼看（落後排序）', summary: '預期 vs 目前、落差、點列展開',
+    bodyHtml: `<ol class="pf-hint-list">
+      <li><b>排序</b>：落差（目前−預期）最負的專案自動排最上面，左側色條紅→黃→綠標嚴重度，結案沉底。</li>
+      <li><b>預期進度</b>：依時程到今天「本該做到」的比例（按工作量加權）。<b>目前進度</b>：實際做完的比例。落後時進度條轉紅、預期位置以琥珀線標示。</li>
+      <li><b>點一列展開</b>：看這案接下來的關鍵階段時間點，與最要命的一個指標（設變案＝成本調降達成率／開發案＝離上市剩幾天）。</li>
+    </ol>` });
+
+  return `<div class="pf-card"><div class="pf-card-t">專案差異總覽（落後優先）</div>${hint}
+    <div class="pf-vt">
+      <div class="pf-vt-head"><span></span><span>專案</span><span>進度（目前條＋預期線）</span><span>預期</span><span>目前</span><span>落差</span><span>狀態</span><span>近期里程碑</span><span></span></div>
+      ${body}
+    </div></div>`;
+};
+// P1 展開明細：近期關鍵里程碑（階段起訖＋主責＋完成數）＋本案致命傷指標（自動值＋選填補述）
+Portfolio._p1DetailHtml = function(p, todayIso) {
+  const stages = this._projStages(p);
+  const msRows = stages.length ? stages.map(s => {
+    const passed = s.done >= s.total, upcoming = !passed && (!s.end || s.end >= todayIso);
+    return `<div class="pf-vd-ms${upcoming ? ' up' : ''}${passed ? ' done' : ''}">
+        <span class="pf-vd-ms-name">${U.esc(s.name)}</span>
+        <span class="pf-vd-ms-date">${s.start ? D.fmt(s.start, 'md') : '—'} ~ ${s.end ? D.fmt(s.end, 'md') : '—'}</span>
+        <span class="pf-vd-ms-dept">${s.dept ? U.esc(s.dept) : ''}</span>
+        <span class="pf-vd-ms-cnt">${s.done}/${s.total}</span>
+      </div>`;
+  }).join('') : '<div class="pf-mini-empty">尚無排定階段</div>';
+  const kr = this._projKeyRisk(p);
+  const note = kr.note
+    ? `<div class="pf-vd-note">「${U.esc(kr.note)}」<button class="pf-vd-note-edit" onclick="event.stopPropagation();Portfolio.editKeyRisk('${p.id}')">改</button></div>`
+    : `<button class="pf-vd-note-add" onclick="event.stopPropagation();Portfolio.editKeyRisk('${p.id}')"><i class="ti ti-plus"></i> 補一句風險註記</button>`;
+  return `<div class="pf-vd">
+      <div class="pf-vd-col">
+        <div class="pf-vd-h"><i class="ti ti-calendar-event"></i> 近期關鍵里程碑</div>${msRows}
+      </div>
+      <div class="pf-vd-col">
+        <div class="pf-vd-h"><i class="ti ti-target"></i> 本案致命傷指標</div>
+        <div class="pf-vd-kr pf-vd-kr-${kr.tone}"><span class="pf-vd-kr-lbl">${kr.label}<span class="pf-vd-kr-auto">自動</span></span><span class="pf-vd-kr-val">${kr.value}</span></div>
+        ${kr.sub ? `<div class="pf-vd-kr-sub">${kr.sub}</div>` : ''}${note}
+      </div>
+      <div class="pf-vd-foot"><button class="pf-vd-jump" onclick="event.stopPropagation();Portfolio.jumpToP2('${p.id}')">查看本案異常任務（P2）→</button></div>
+    </div>`;
+};
+// 點列展開/收合（就地重繪 P1 panel·不動其他頁籤）
+Portfolio.toggleVarRow = function(projId) {
+  this._p1Exp = (this._p1Exp === projId) ? null : projId;
+  const panel = document.querySelector('.pf-panel[data-pf="1"]');
+  if (panel) panel.innerHTML = this._p1Html();
+};
+// 編輯致命傷補述（keyRiskNote·選填·存專案隨雲端同步）
+Portfolio.editKeyRisk = function(projId) {
+  const p = App.getProj(projId); if (!p) return;
+  App.promptModal({ title: '風險註記（選填）', label: '補一句這案最要命的風險或現況（例：卡在等客戶承認）', value: p.keyRiskNote || '', okText: '儲存',
+    onSubmit: (val) => { p.keyRiskNote = (val || '').trim(); Store.projects.save(); const panel = document.querySelector('.pf-panel[data-pf="1"]'); if (panel) panel.innerHTML = this._p1Html(); } });
+};
+// P1→P2：點 P1 展開列的「查看異常任務」→ 過濾該案並切到 P2
+Portfolio.jumpToP2 = function(projId) { this._p2Filter = projId || ''; this._p2Exp = null; this._p2Rerender(); this.setOvTab('2'); };
+
+// ═══ §18.15 P2 任務追蹤與風險：異常任務表（延遲/卡關·權重%凸顯·點列展開救援行動）═══
+// 異常＝延遲(isTaskDelayed·排除 done/hold)或卡關(status=hold)。排序：P1 異常專案(落差≤−5%)優先→逾期天數多→高權重。
+Portfolio._p2Rows = function() {
+  const today = D.today(), todayIso = D.fmt(today, 'iso');
+  const projName = {}, projColor = {}, projRed = {};
+  (DATA.projects || []).forEach(p => {
+    projName[p.id] = p.name; projColor[p.id] = p.color || '';
+    const pr = this.projectProgress(p.id, today);
+    const gap = (pr.actual != null && pr.planned != null) ? pr.actual - pr.planned : null;
+    projRed[p.id] = (p.status || 'active') === 'active' && gap != null && gap <= -5;
+  });
+  const activeSet = new Set((DATA.projects || []).filter(p => (p.status || 'active') === 'active').map(p => p.id));
+  const rows = [];
+  this._live().forEach(t => {
+    if (!activeSet.has(t.project)) return;
+    const delayed = isTaskDelayed(t, today), held = t.status === 'hold';
+    if (!delayed && !held) return;
+    const e = getEffectiveSchedule(t);
+    const odDays = delayed ? Math.max(0, D.workdaysBetween(e.end, todayIso) - 1) : 0;
+    const eff = t.effortRatio != null ? t.effortRatio : Math.round(taskIntensity(t) * 100);
+    const block = held ? (t.holdReason || '（未填擱置原因）') : ('逾期 ' + odDays + ' 工作天');
+    rows.push({ t, pid: t.project, kind: held ? 'hold' : 'delay', odDays, eff, block, rescueN: (t.rescueActions || []).length, red: !!projRed[t.project] });
+  });
+  rows.sort((a, b) => ((b.red ? 1 : 0) - (a.red ? 1 : 0)) || (b.odDays - a.odDays) || (b.eff - a.eff));
+  return { rows, projName, projColor };
+};
+Portfolio._p2Html = function() {
+  const { rows, projName, projColor } = this._p2Rows();
+  const filt = this._p2Filter || '';
+  const shown = filt ? rows.filter(r => r.pid === filt) : rows;
+  const projOpts = ['<option value="">全部異常任務</option>'].concat(
+    [...new Set(rows.map(r => r.pid))].map(pid => `<option value="${pid}"${filt === pid ? ' selected' : ''}>${U.esc(projName[pid] || '')}</option>`)).join('');
+  const hint = App.buildHintBox({ key: 'portfolio-risk', icon: 'ti-help-circle', collapsed: true, title: '這張表怎麼看（異常驅動）', summary: '只列延遲/卡關·權重凸顯·救援行動',
+    bodyHtml: `<ol class="pf-hint-list">
+      <li><b>只列異常</b>：目前「已逾期」或「卡關擱置」的任務；正常進行中的不佔版面。落差大的專案（P1 紅燈）其任務自動排最上。</li>
+      <li><b>任務權重</b>：這件在專案裡的工作量佔比（工期×投入程度）。<b>≥40% 高權重</b>又出事＝紅字粗體，最該先救。</li>
+      <li><b>點一列展開救援行動</b>：記下對策、負責人、預計解鎖日、處理狀態，讓「問題」變「追蹤中的解法」。狀態燈 🔴未動／🟡處理中／🟢已解，點燈可切換。</li>
+    </ol>` });
+  const body = shown.length ? shown.map(r => {
+    const t = r.t, exp = this._p2Exp === t.id, hi = r.eff >= 40;
+    const stTxt = r.kind === 'hold' ? '卡關' : '逾期';
+    return `<div class="pf-rt-row${exp ? ' on' : ''}" onclick="Portfolio.toggleP2Row('${t.id}')">
+        <span class="pf-rt-proj">${U.esc(projName[r.pid] || '')}</span>
+        <span class="pf-rt-name">${U.esc(t.name)}</span>
+        <span class="pf-rt-owner">${U.esc(t.owner || '未指派')}</span>
+        <span class="pf-rt-wt"><span class="pf-rt-wbar"><span class="pf-rt-wfill${hi ? ' hi' : ''}" style="width:${Math.min(100, r.eff)}%"></span></span><span class="pf-rt-wn${hi ? ' hi' : ''}">${r.eff}%</span></span>
+        <span class="pf-rt-st pf-rt-st-${r.kind}">${stTxt}</span>
+        <span class="pf-rt-block">${U.esc(r.block)}</span>
+        <span class="pf-rt-rescue">${r.rescueN ? '<i class="ti ti-lifebuoy"></i>' + r.rescueN : ''}</span>
+        <i class="ti ti-chevron-${exp ? 'down' : 'right'} pf-rt-caret"></i>
+      </div>${exp ? `<div class="pf-rt-detail">${this._p2DetailHtml(t)}</div>` : ''}`;
+  }).join('') : `<div class="pf-mini-empty">${filt ? '此專案目前無異常任務' : '目前沒有延遲或卡關的任務 🎉'}</div>`;
+  const filterBar = rows.length ? `<div class="pf-rt-filter"><span class="pf-rt-fl">專案</span><select class="pf-rt-fsel" onchange="Portfolio.setP2Filter(this.value)">${projOpts}</select><span class="pf-rt-cnt">${shown.length} 筆異常</span></div>` : '';
+  return `<div class="pf-card"><div class="pf-card-t">異常任務追蹤（延遲／卡關）</div>${hint}${filterBar}
+    <div class="pf-rt">
+      <div class="pf-rt-head"><span>專案</span><span>任務·工作包</span><span>負責人</span><span>權重</span><span>狀態</span><span>阻礙說明</span><span></span><span></span></div>
+      ${body}
+    </div></div>`;
+};
+Portfolio._p2DetailHtml = function(t) {
+  const acts = t.rescueActions || [];
+  const stDot = { red: '🔴', yellow: '🟡', green: '🟢' };
+  const list = acts.length ? acts.map(a => `<div class="pf-ra-row">
+      <button class="pf-ra-st" title="點擊切換狀態：未動→處理中→已解" onclick="event.stopPropagation();Portfolio.cycleRescue('${t.id}','${a.id}')">${stDot[a.status] || '🔴'}</button>
+      <span class="pf-ra-action">${U.esc(a.action)}</span>
+      <span class="pf-ra-owner">${a.owner ? U.esc(a.owner) : '—'}</span>
+      <span class="pf-ra-date">${a.targetDate ? '解鎖 ' + D.fmt(a.targetDate, 'md') : '—'}</span>
+      <button class="pf-ra-del" title="刪除此行動" onclick="event.stopPropagation();Portfolio.delRescue('${t.id}','${a.id}')"><i class="ti ti-x"></i></button>
+    </div>`).join('') : '<div class="pf-ra-empty">尚無救援行動——在下方新增第一條對策。</div>';
+  return `<div class="pf-ra">
+      <div class="pf-ra-h"><i class="ti ti-lifebuoy"></i> 救援行動（對策追蹤）</div>${list}
+      <div class="pf-ra-add" onclick="event.stopPropagation()">
+        <input type="text" class="pf-ra-in-action" placeholder="對策／要做什麼">
+        <input type="text" class="pf-ra-in-owner" placeholder="負責人">
+        <input type="date" class="pf-ra-in-date" title="預計解鎖日">
+        <button class="pf-ra-addbtn" onclick="Portfolio.addRescue('${t.id}')"><i class="ti ti-plus"></i> 加入行動</button>
+      </div>
+    </div>`;
+};
+Portfolio.toggleP2Row = function(tid) { this._p2Exp = (this._p2Exp === tid) ? null : tid; this._p2Rerender(); };
+Portfolio.setP2Filter = function(pid) { this._p2Filter = pid || ''; this._p2Rerender(); };
+Portfolio._p2Rerender = function() { const el = document.querySelector('.pf-panel[data-pf="2"]'); if (el) el.innerHTML = this._p2Html(); };
+Portfolio._findTask = function(tid) { return (DATA.tasks || []).find(t => t.id === tid) || null; };
+Portfolio.addRescue = function(tid) {
+  const t = this._findTask(tid); if (!t) return;
+  const root = document.querySelector('.pf-rt-detail .pf-ra-add'); if (!root) return;
+  const action = (root.querySelector('.pf-ra-in-action').value || '').trim();
+  if (!action) { if (U.toast) U.toast('請先填對策'); return; }
+  const owner = (root.querySelector('.pf-ra-in-owner').value || '').trim();
+  const targetDate = (root.querySelector('.pf-ra-in-date').value || '').trim();
+  t.rescueActions = t.rescueActions || [];
+  t.rescueActions.push({ id: U.id(), action, owner, targetDate, status: 'red', createdAt: D.fmt(D.today(), 'iso') });
+  Store.tasks.save();
+  this._p2Rerender();
+};
+Portfolio.cycleRescue = function(tid, rid) {
+  const t = this._findTask(tid); if (!t) return;
+  const a = (t.rescueActions || []).find(x => x.id === rid); if (!a) return;
+  a.status = ({ red: 'yellow', yellow: 'green', green: 'red' })[a.status] || 'yellow';
+  Store.tasks.save();
+  this._p2Rerender();
+};
+Portfolio.delRescue = function(tid, rid) {
+  const t = this._findTask(tid); if (!t) return;
+  t.rescueActions = (t.rescueActions || []).filter(x => x.id !== rid);
+  Store.tasks.save();
+  this._p2Rerender();
+};
+

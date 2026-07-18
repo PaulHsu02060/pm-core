@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<!--
+  PM-Core — Copyright (c) 2026 Paul Hsu (PaulHsu02060). All Rights Reserved.
+  專有軟體·保留一切權利。非經著作權人書面同意，禁止複製、修改、逆向再構築、散布或商業利用。詳見 repo 根目錄 LICENSE。
+-->
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PM-Core</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+TC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&family=Caveat:wght@500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.44.0/dist/tabler-icons.min.css">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<link rel="stylesheet" href="styles/style.css?v=20260718-4">
+</head>
+<body>
+
+<!-- ─── LOGIN OVERLAY ─── -->
+<div class="login-overlay" id="loginOverlay">
+  <!-- §26 登入落地頁（方案 A）·登入前零真資料（§8f.6）·剪影全去資料化·純 Google 帳號登入（身分/權限由後端 Script Properties 判定·§8f.6） -->
+  <div class="lg-wrap">
+    <div class="lg-nav">
+      <div class="lg-brand"><span class="lg-logo">P</span><span class="js-brand-name">PM-Core</span></div>
+      <div class="lg-navtag">專案排程 · 工程設變 · 物料風控</div>
+    </div>
+    <div class="lg-hero">
+      <div class="lg-text">
+        <div class="lg-eyebrow">ENTERPRISE PROJECT MANAGEMENT</div>
+        <h1 class="lg-h1">從新品開發到工程設變，<br><em>一個指揮中心</em>全面掌控。</h1>
+        <p class="lg-sub">整合 WBS 排程、跨案資源負載與物料停產風控。PM-Core 自動精算「預計 vs 實際」進度落差，讓關鍵數據一目了然；支援一鍵資料注入、原格式無損匯出，徹底終結手動改到死的報告地獄。</p>
+        <div id="loginGoogleMode" class="lg-cta"><div id="gSignInBtn"></div></div>
+        <div class="lg-sec">🔒 四層權限控管 · 未經授權登入前不呈現任何專案資料</div>
+      </div>
+      <div class="lg-vis">
+        <div class="lg-shot">
+          <div class="sb"><i class="on"></i><i></i><i></i><i></i><i></i><i></i></div>
+          <div class="mn">
+            <div class="kp"><span></span><span></span><span></span><span></span></div>
+            <div class="gt"><div class="r"></div><div class="r"></div><div class="r"></div><div class="r"></div><div class="r"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── APP SHELL ─── -->
+<div class="app">
+
+  <aside class="sidebar">
+    <!-- 固定頂：品牌＋摺疊鈕＋使用者＋導覽＋建案 CTA -->
+    <div class="sb-top">
+      <div class="sb-brand">
+        <div class="sb-brand-row">
+          <div class="sb-txt">
+            <div class="sb-brand-mark js-brand-name">PM-Core</div>
+            <div class="sb-brand-sub">Personal Task Board</div>
+          </div>
+          <button class="sb-collapse" onclick="App.toggleSidebar()" title="收合／展開側欄" aria-label="收合側欄"></button>
+        </div>
+        <div class="sb-user-badge" title="使用者">
+          <div class="sb-user-avatar" id="userAvatar">P</div>
+          <div class="sb-txt">
+            <div id="userName">使用者</div>
+            <div class="sb-user-mode" id="userMode">EDITOR</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="sb-section">
+        <div class="sb-label sb-txt">導覽</div>
+        <div class="sb-nav">
+          <button class="sb-item active" data-page="home" onclick="App.showPage('home', this)" title="首頁">
+            <span class="ico"><i class="ti ti-home"></i></span><span class="sb-txt">首頁</span>
+          </button>
+          <button class="sb-item" data-page="workspace" onclick="App.showPage('workspace', this)" title="個人工作台">
+            <span class="ico"><i class="ti ti-layout-dashboard"></i></span><span class="sb-txt">個人工作台</span>
+          </button>
+          <button class="sb-item" data-page="portfolio" onclick="App.showPage('portfolio', this)" title="全專案總覽">
+            <span class="ico"><i class="ti ti-list-details"></i></span><span class="sb-txt">全專案總覽</span>
+          </button>
+        </div>
+      </div>
+
+      <button class="sb-add-proj sb-add-main" onclick="App._flowStep1()" title="建立新案">
+        <span class="sb-add-ico">＋</span><span class="sb-txt">建立新案</span>
+      </button>
+    </div>
+
+    <!-- 捲動中段：NPI／ECN 兩群清單（App.renderSidebar 動態生成，案子多時只捲這段） -->
+    <div class="sb-scroll">
+      <div class="sb-proj-list" id="projectList"></div>
+    </div>
+
+    <!-- 固定底：報告／設定／登出 -->
+    <div class="sb-bottom">
+      <div class="sb-section">
+        <div class="sb-nav">
+          <button class="sb-item" data-page="settings" onclick="App.showPage('settings', this)" title="設定">
+            <span class="ico"><i class="ti ti-settings"></i></span><span class="sb-txt">設定</span>
+          </button>
+          <button class="sb-item sb-logout" onclick="App.googleSignOut()" title="登出">
+            <span class="ico"><i class="ti ti-logout"></i></span><span class="sb-txt">登出</span>
+          </button>
+        </div>
+      </div>
+      <div class="sb-foot sb-txt">v1.0</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <button class="tb-home" id="tbHome" onclick="App.showPage('home')" title="回首頁" aria-label="回首頁"><i class="ti ti-home"></i></button>
+      <div>
+        <div class="tb-crumb"><span class="js-brand-name">PM-Core</span> / <b id="crumbPage">個人工作台</b></div>
+        <div class="tb-title" id="pageTitle">個人工作台</div>
+      </div>
+      <div class="tb-spacer"></div>
+      <div class="tb-meta-info">
+        <span id="weekInfo"></span>
+      </div>
+      <button class="tb-theme-toggle" id="wsThemeToggle" onclick="App.toggleWsTheme()" title="切換淺色模式" aria-label="切換工作台明暗模式" style="display:none;"><i class="ti ti-moon"></i></button>
+    </div>
+
+    <div class="content" id="content">
+      <div class="viewonly-banner">
+        👁 你目前是「僅檢視」模式。需要編輯請重新整理頁面後登入。
+      </div>
+
+      <!-- Pages are rendered dynamically -->
+      <div class="page active" id="page-home"></div>
+      <div class="page" id="page-workspace"></div>
+      <div class="page" id="page-portfolio"></div>
+      <div class="page" id="page-materials"></div>
+      <div class="page" id="page-project"></div>
+      <div class="page" id="page-gantt"></div>
+      <div class="page" id="page-month"></div>
+      <div class="page" id="page-reportgen"></div>
+      <div class="page" id="page-transcripts"></div>
+      <div class="page" id="page-settings"></div>
+      <div class="page" id="page-stage2"></div>
+      <div class="page" id="page-stage1"></div>
+      <div class="page" id="page-bs1"></div>
+      <div class="page" id="page-archive"></div>
+    </div>
+  </main>
+</div>
+
+<!-- ─── MODAL CONTAINER ─── -->
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal" id="modal"></div>
+</div>
+
+<!-- ─── CONFIRM OVERLAY（§6.5 塊三：第二層確認框，不覆寫 #modal 表單）─── -->
+<div id="confirmOverlay" class="confirm-overlay" style="display:none;"></div>
+
+<!-- ─── TOAST ─── -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ─── CONFIG + SEED 載入順序 ───────────────────────────────
+     鐵則：假值模板先載 → .local 真值後載覆蓋 → 最後才 app.js。
+     config.local.js / seed.local.js 不進 git；本機不存在時瀏覽器僅
+     在 console 印 404（非致命），APP_CONFIG / SEED_* 自動沿用假值 fallback。 -->
+<script src="config/config.js?v=20260711-3"></script>
+<script src="config.local.js?v=20260605-1"></script>
+<script src="config/seed.sample.js?v=20260605-1"></script>
+<script src="seed.local.js?v=20260605-1"></script>
+<script src="templates/product-dev-template.js?v=20260703-1"></script>
+<script src="templates/ecn-template.js?v=20260708-1"></script>
+<script src="src/app.js?v=20260718-1"></script>
+<script src="src/portfolio.js?v=20260716-1"></script>
+<script src="src/materials.js?v=20260717-1"></script>
+<script src="src/meeting.js?v=20260716-1"></script>
+<script src="src/settings.js?v=20260718-2"></script>
+<script src="src/schedule.js?v=20260709-1"></script>
+<script src="src/shared-render.js?v=20260716-1"></script>
+<script src="src/report-gen.js?v=20260718-1"></script>
+<script src="src/transcripts.js?v=20260718-5"></script>
+<script src="src/excel.js?v=20260716-1"></script>
+<script src="src/workspace.js?v=20260716-2"></script>
+<script src="src/project.js?v=20260716-2"></script>
+<script src="src/template.js?v=20260716-1"></script>
+<script src="src/dev-seed-data.js?v=20260713-1"></script>
+<script src="src/dev-seed.js?v=20260715-1"></script>
+</body>
+</html>

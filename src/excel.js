@@ -1,0 +1,1702 @@
+// excel.js — WBS Excel 匯出(exportProjectWbs/_gantt*/predToWbsFormat)+ 匯入(WBS_COLUMNS/GANTT_FILL/wbsDateStr/buildWbsPreview/performWbsImport/openWbsImport)。app.js 之後載入；getProjectStages/datalists 在 core。docs §18.7.2。
+// predToWbsFormat(predStr, idToWbsMap)：id#FS+2 → wbs 序號縮寫 12FS（§13.3 匯出反解）。
+// 複用 parsePredecessors 解析；dep(id)→wbs 查 idToWbsMap，查不到保留原 dep + warn；FS 全顯、lag 帶號；多筆逗號接。
+App.predToWbsFormat = function(predStr, idToWbsMap) {
+  const preds = parsePredecessors(predStr);
+  if (!preds.length) return '';
+  return preds.map(p => {
+    const wbs = idToWbsMap.get(p.dep);
+    const ref = (wbs != null) ? wbs : p.dep;   // 查不到保留原 dep
+    if (wbs == null) console.warn('[predToWbsFormat] dep 查無 wbs:', p.dep);
+    const lag = p.lag > 0 ? '+' + p.lag : (p.lag < 0 ? String(p.lag) : '');
+    return ref + p.type + lag;   // FS 全顯：12FS / 16SS+2 / 5SS-1
+  }).join(',');
+};
+
+// ─── §13.8 Excel 匯出「豪華標準格式」共用工具（單一真實來源，四支匯出器共用）───
+// 比照參考檔 J_vs_G2 配色：藍系標題帶＋彩色表頭＋全框線＋金額紅增綠減。
+// 色票 ARGB 逐一鏡像 style.css :root --xl-*（文件鏡像、非讀 CSS，同 GANTT_FILL 慣例）。
+// 回傳：色票常數＋字體角色（FT 分頁標題/FHD 欄位表頭/FZ 區塊標題/FM 機種帶/FD 資料/FDG 綠減/FDR 紅增/FSUB 小計/FMEMO 備註）
+//       ＋helper（fill 上底色、BOX 框線、box 整列框、AC/AL/AR 對齊、MONEY 千分位、signFont 依正負配色、titleRow 藍標題帶、hdrRow 彩色表頭）。
+App._xlHouse = function () {
+  const NAVY = 'FF305496', BLUE = 'FF4472C4', LTBLUE = 'FFD9E1F2', HDR = 'FF8FAADC',
+        CREAM = 'FFFFF2CC', GOLD = 'FFFFD966', WHITE = 'FFFFFFFF',
+        GREEN = 'FF006100', RED = 'FFC00000', GREY = 'FF595959';
+  const FT   = { name: '新細明體', size: 14, bold: true, color: { argb: WHITE } };  // 分頁標題（深藍底白字）
+  const FHD  = { name: '新細明體', size: 10, bold: true, color: { argb: WHITE } };  // 欄位表頭（藍底白字）
+  const FZ   = { name: '新細明體', size: 10, bold: true };                          // ▼ 區塊標題／【】節
+  const FM   = { name: '新細明體', size: 11, bold: true, color: { argb: WHITE } };  // ■ 機種帶（藍底白字）
+  const FD   = { name: '新細明體', size: 11 };                                      // 資料
+  const FDG  = { name: '新細明體', size: 11, color: { argb: GREEN } };              // 金額（省/減·綠）
+  const FDR  = { name: '新細明體', size: 11, color: { argb: RED } };                // 金額（增·紅）
+  const FSUB = { name: '新細明體', size: 10, bold: true };                          // 小計
+  const FMEMO = { name: '新細明體', size: 9, italic: true, color: { argb: GREY } }; // 備註
+  const fill = (c, argb) => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } }; };
+  const bd = { style: 'thin', color: { argb: 'FF808080' } };
+  const BOX = { top: bd, left: bd, right: bd, bottom: bd };
+  const box = (row, n) => { for (let i = 1; i <= n; i++) row.getCell(i).border = BOX; };
+  const AC = { horizontal: 'center', vertical: 'middle', wrapText: true },
+        AL = { horizontal: 'left', vertical: 'middle' },
+        AR = { horizontal: 'right', vertical: 'middle' };
+  const MONEY = '#,##0.00';
+  const signFont = v => (v < 0 ? FDG : (v > 0 ? FDR : FD));   // 省=綠、增=紅
+  const titleRow = (ws, txt, nc) => { const t = ws.addRow([txt]); ws.mergeCells(t.number, 1, t.number, nc); t.getCell(1).font = FT; fill(t.getCell(1), NAVY); t.getCell(1).alignment = AC; t.height = 27; return t; };
+  const hdrRow = (ws, heads, nc) => { const h = ws.addRow(heads); for (let i = 1; i <= nc; i++) { const c = h.getCell(i); c.font = FHD; fill(c, HDR); c.alignment = AC; c.border = BOX; } return h; };
+  return { NAVY, BLUE, LTBLUE, HDR, CREAM, GOLD, WHITE, GREEN, RED, GREY,
+    FT, FHD, FZ, FM, FD, FDG, FDR, FSUB, FMEMO,
+    fill, bd, BOX, box, AC, AL, AR, MONEY, signFont, titleRow, hdrRow };
+};
+
+// Excel 下載共用（四支匯出器共用 blob/anchor/toast）：workbook + 檔名 → 觸發下載。
+App._xlDownload = async function (workbook, filename) {
+  const buffer = await workbook.xlsx.writeBuffer();
+  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  U.toast('✓ 已下載 ' + filename);
+};
+
+// 甘特日期範圍（§13.5）：掃 tasks 四個日期欄（ISO 字串），字串比找最小/最大
+// （避時區坑，沿用 §4103 全系統「ISO 字串比＝時序」慣例）；空值跳過。
+// 末端只把贏家轉 Date。無任何有效日期回 null。
+App._ganttDateRange = function(tasks) {
+  let minIso = '', maxIso = '';
+  (tasks || []).forEach(t => {
+    [t.plannedStart, t.actualStart, t.plannedEnd, t.actualEnd].forEach(v => {
+      if (!v) return;                            // 空值跳過
+      if (!minIso || v < minIso) minIso = v;     // ISO YYYY-MM-DD 字串比＝時序
+      if (!maxIso || v > maxIso) maxIso = v;
+    });
+  });
+  if (!minIso) return null;                      // 全空
+  return { min: new Date(minIso), max: new Date(maxIso) };
+};
+
+// 甘特時間軸欄（§13.5 C1）：依 granularity 產欄陣列 [{start,end,label}]。
+// 時間軸走日曆日（含週末），非工作日。day:一天一欄(start===end)；week:週一為界、含週日；month:當月1號~月底。
+App._ganttColumns = function(min, max, granularity) {
+  const cols = [];
+  if (!min || !max) return cols;
+  if (granularity === 'month') {
+    let d = new Date(min.getFullYear(), min.getMonth(), 1);
+    while (d <= max) {
+      const end = new Date(d.getFullYear(), d.getMonth() + 1, 0);   // 月底
+      cols.push({ start: new Date(d), end, label: d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0') });
+      d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    }
+  } else if (granularity === 'week') {
+    let d = D.monday(min);
+    while (d <= max) {
+      const end = D.addDays(d, 6);
+      cols.push({ start: new Date(d), end, label: D.fmt(d, 'md') });   // 該週週一 M/D
+      d = D.addDays(d, 7);
+    }
+  } else {   // 'day'
+    let d = new Date(min);
+    while (d <= max) {
+      cols.push({ start: new Date(d), end: new Date(d), label: D.fmt(d, 'md') });
+      d = D.addDays(d, 1);
+    }
+  }
+  return cols;
+};
+
+App.exportProjectWbs = async function(projId, granularity, mode) {
+  if (typeof ExcelJS === 'undefined') {
+    U.toast('❌ ExcelJS 函式庫未載入，請檢查 index.html 的 CDN', 'error');
+    return;
+  }
+  const proj = DATA.projects.find(p => p.id === projId);
+  if (!proj) { U.toast('⚠ 找不到專案', 'warning'); return; }
+  const tasks = DATA.tasks.filter(t => t.project === projId && !t._deleted && !t.isPmCoord);   // §19.10 F.3：常駐列＝負荷屬性非可交付任務，不匯出（且 _seqOf 排序不會 NaN）
+  if (!tasks.length) { U.toast('⚠ 此專案無任務可匯出', 'warning'); return; }
+
+  // 甘特日期範圍 + 時間軸欄（供下方甘特分頁鋪表頭/任務/填色）
+  const range = App._ganttDateRange(tasks);
+  const cols = App._ganttColumns(range && range.min, range && range.max, granularity || 'week');
+
+  // 反查表：variant id→案別名、task id→wbs（id 全域唯一）
+  const variantIdToName = {};
+  (proj.variants || []).forEach(v => { variantIdToName[v.id] = v.name; });
+  const idToWbsMap = new Map();
+  tasks.forEach(t => { if (t.wbs != null && t.wbs !== '') idToWbsMap.set(t.id, t.wbs); });
+
+  // 逐欄反向格式（round-trip 對齊 parseWbsExcel 讀法）
+  const TYPE_LABEL = { milestone: '里程碑', group: '群組', task: '任務' };
+  const dateCell = (iso) => iso ? new Date(iso) : null;
+  const cellValue = (t, key) => {
+    switch (key) {
+      case 'wbs':         return t.wbs != null ? t.wbs : '';
+      case 'variant':     return variantIdToName[t.variant] || '';
+      case 'taskType':    return TYPE_LABEL[t.taskType] || '任務';
+      case 'predecessor': return App.predToWbsFormat(t.predecessor, idToWbsMap);
+      case 'progress':    return (typeof t.progress === 'number' ? t.progress : 0) / 100;
+      case 'status':      return STATUS_LABELS_ZH[t.status] || '';   // 中文標籤 round-trip（對上 mapStatus，§13.x）
+      case 'mustDeliver':
+      case 'requiredTask':
+      case 'mustIssue':   return t[key] ? '✓' : '';
+      case 'plannedStart':
+      case 'plannedEnd':
+      case 'actualStart':
+      case 'actualEnd':   return dateCell(t[key]);
+      default:            return t[key] != null ? t[key] : '';
+    }
+  };
+
+  // ── workbook（豪華標準格式 §13.8）──
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = DATA.settings.userName || CFG('APP_NAME', 'PM-Core');
+  workbook.created = new Date();
+  const H = App._xlHouse();
+  const { FD, FHD, FZ, FMEMO, fill, box, AC, AL, titleRow, hdrRow, HDR, LTBLUE } = H;
+
+  const nCols = WBS_COLUMNS.length;
+  const ws = workbook.addWorksheet(proj.name || 'WBS', { views: [{ state: 'frozen', ySplit: 3 }] });
+
+  // 列1 標題帶（藍系）＋列2 前置 memo（跨欄合併，§13.4）＋列3 彩色表頭
+  titleRow(ws, (proj.name || 'WBS') + ' — WBS 任務清單', nCols);
+  const memoText = '前置(N)欄：12FS=接#12完成後開始；SS同時開始／FF同時完成／SF開始才能完成；+N=延後 N 工作天';
+  const memoR = ws.addRow([memoText]);
+  ws.mergeCells(memoR.number, 1, memoR.number, nCols);
+  memoR.getCell(1).font = FMEMO;
+  memoR.getCell(1).alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+  hdrRow(ws, WBS_COLUMNS.map(c => c.header), nCols);
+
+  // 資料列（排序：_seqOf 全域序）＋全框線
+  const DATE_KEYS = ['plannedStart', 'plannedEnd', 'actualStart', 'actualEnd'];
+  const sorted = tasks.slice().sort((a, b) => App._seqOf(a.id) - App._seqOf(b.id));
+  sorted.forEach((t) => {
+    const row = ws.addRow(WBS_COLUMNS.map(c => cellValue(t, c.key)));
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      cell.font = FD;
+      cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+    });
+    box(row, nCols);
+    WBS_COLUMNS.forEach((c, i) => {
+      if (DATE_KEYS.indexOf(c.key) >= 0) {
+        const cell = row.getCell(i + 1);
+        if (cell.value instanceof Date) cell.numFmt = 'yyyy/mm/dd';
+      } else if (c.key === 'progress') {
+        row.getCell(i + 1).numFmt = '0%';   // 顯示 50% 非 0.5（round-trip 值仍 0~1）
+      }
+    });
+  });
+
+  // ── 專案資訊分頁（round-trip：專案名 + 部門表，對齊 parseWbsExcel buildDepts/buildMemberToDept 讀法）──
+  const wsInfo = workbook.addWorksheet('專案資訊');
+  titleRow(wsInfo, '專案資訊', 2);
+  const pnR = wsInfo.addRow(['專案名稱', proj.name || '']);
+  pnR.getCell(1).font = H.FSUB; fill(pnR.getCell(1), LTBLUE); pnR.getCell(1).alignment = AL;
+  pnR.getCell(2).font = FD; pnR.getCell(2).alignment = AL;
+  wsInfo.addRow([]);                              // 空列分隔
+  hdrRow(wsInfo, ['部門', '專案成員'], 2);        // 表頭（buildDepts/buildMemberToDept 掃這列）
+  (proj.depts || []).forEach(d => {
+    const r = wsInfo.addRow([d.name || '', (d.members || []).map(m => m.name).filter(Boolean).join('、')]);
+    box(r, 2); r.getCell(1).font = FD; r.getCell(1).alignment = AL; r.getCell(2).font = FD; r.getCell(2).alignment = AL;
+  });
+  wsInfo.columns = [{ width: 16 }, { width: 40 }];
+
+  // ── 甘特分頁(§13.5 ② 三層表頭 年/月/日 + 凍結;分段3 畫任務列、③段填色)──
+  const ganttG = granularity || 'week';
+  const isMonth = ganttG === 'month';
+  const headRows = isMonth ? 2 : 3;   // month:年/月 兩層;day/week:年/月/日 三層
+  const headTop = 3;                  // 表頭起始 row(圖例row1 + 空row2 + 表頭row3起)
+  const bodyTop = headRows + 3;       // 任務列起始 row(圖例1 + 空1 + 表頭headRows + 1)
+  const wsGantt = workbook.addWorksheet('甘特', { views: [{ state: 'frozen', xSplit: 5, ySplit: headRows + 2 }] });
+
+  const GANTT_LEFT = ['序', '任務名', '標籤', '計畫起', '計畫訖'];
+  const nLeft = 5;
+
+  // 圖例列(row 1) + 空列(row 2) + 表頭列(row 3..headRows+2,空殼後填)
+  const blank = cols.map(() => '');
+  const rows = [];
+  for (let r = 0; r < headRows + 2; r++) rows.push(wsGantt.addRow([...GANTT_LEFT.map(() => ''), ...blank]));
+
+  // 圖例(row 1):A1 標題「甘特圖顏色代表意思：」+ 5 組[色塊merge2 + 文字merge2],col3 起
+  const LEGEND = [
+    { argb: GANTT_FILL.plan, text: '計畫' },
+    { argb: GANTT_FILL.done, text: '完成' },
+    { argb: GANTT_FILL.wip, text: '進行中' },
+    { argb: GANTT_FILL.late, text: '逾期' },
+    { argb: GANTT_FILL.holiday, text: '假日' },
+  ];
+  // A1 標題 merge(col1-2)
+  wsGantt.mergeCells(1, 1, 1, 2);
+  const titleCell = wsGantt.getCell(1, 1);
+  titleCell.value = '甘特圖顏色代表意思：';
+  titleCell.font = FZ;
+  titleCell.alignment = { vertical: 'middle', horizontal: 'left' };
+  // 色塊文字從 col3 起,每組4欄(色塊merge2 + 文字merge2)
+  LEGEND.forEach((lg, gi) => {
+    const swatchCol = 3 + gi * 4;   // col 3/7/11/15/19
+    wsGantt.mergeCells(1, swatchCol, 1, swatchCol + 1);
+    wsGantt.getCell(1, swatchCol).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lg.argb } };
+    wsGantt.mergeCells(1, swatchCol + 2, 1, swatchCol + 3);
+    const tc = wsGantt.getCell(1, swatchCol + 2);
+    tc.value = lg.text;
+    tc.font = FZ;
+    tc.alignment = { vertical: 'middle', horizontal: 'left' };
+  });
+
+  // 左 5 欄:標題放表頭首列、跨表頭列 merge、置中(不含圖例 row 1)＋藍系表頭
+  GANTT_LEFT.forEach((title, idx) => {
+    const col = idx + 1;
+    wsGantt.mergeCells(headTop, col, headTop + headRows - 1, col);
+    const cell = wsGantt.getCell(headTop, col);
+    cell.value = title;
+    cell.font = FHD; fill(cell, HDR);
+    cell.alignment = { wrapText: true, vertical: 'middle', horizontal: 'center' };
+  });
+
+  // 分組 merge helper:依 keyFn 把連續同 key 的欄合併、寫 label
+  const groupRow = (rowIdx, keyFn, labelFn) => {
+    let s = 0;
+    for (let i = 1; i <= cols.length; i++) {
+      const end = (i === cols.length) || (keyFn(cols[i]) !== keyFn(cols[s]));
+      if (end) {
+        const colL = nLeft + 1 + s, colR = nLeft + i;
+        if (colR > colL) wsGantt.mergeCells(rowIdx, colL, rowIdx, colR);
+        const cell = wsGantt.getCell(rowIdx, colL);
+        cell.value = labelFn(cols[s]);
+        cell.font = FHD; fill(cell, HDR);
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        s = i;
+      }
+    }
+  };
+
+  // 列1 年:merge 同年
+  groupRow(headTop, c => c.start.getFullYear(), c => String(c.start.getFullYear()));
+  if (isMonth) {
+    // month 粒度:列2 月份(每欄一月,不 merge,直接寫 M)
+    cols.forEach((c, i) => {
+      const cell = wsGantt.getCell(headTop + 1, nLeft + 1 + i);
+      cell.value = (c.start.getMonth() + 1) + '月';
+      cell.font = FHD; fill(cell, HDR);
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+    });
+  } else {
+    // day/week:列2 月(merge 同年同月)、列3 日刻度
+    groupRow(headTop + 1, c => c.start.getFullYear() + '-' + c.start.getMonth(), c => (c.start.getMonth() + 1) + '月');
+    cols.forEach((c, i) => {
+      const cell = wsGantt.getCell(headTop + 2, nLeft + 1 + i);
+      if (ganttG === 'day') {
+        const wd = ['日','一','二','三','四','五','六'][c.start.getDay()];
+        cell.value = wd + '\n' + c.start.getDate();   // 星期\n日號
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        if (!D.isWorkday(c.start)) {                   // 假日格標粉紅（號誌功能色，不套藍表頭）
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GANTT_FILL.holiday } };
+          cell.font = FZ;
+        } else {
+          fill(cell, HDR); cell.font = FHD;
+        }
+      } else {
+        cell.value = c.label;
+        cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        fill(cell, HDR); cell.font = FHD;
+      }
+    });
+  }
+
+  // 欄寬
+  const ganttTimeW = ganttG === 'day' ? 4 : (isMonth ? 9 : 6);
+  wsGantt.columns = [
+    { width: 5 }, { width: 28 }, { width: 7 }, { width: 11 }, { width: 11 },
+    ...cols.map(() => ({ width: ganttTimeW })),
+  ];
+
+  // ── 甘特任務列(§13.5 ② 分段3:每任務兩列 plan/actual + merge;③段才填色)──
+  const ganttSorted = tasks.slice().sort((a, b) => App._seqOf(a.id) - App._seqOf(b.id));
+  const DATEFMT = 'yyyy/mm/dd';
+  const setDateCell = (cell, iso) => {
+    if (iso) { cell.value = new Date(iso); cell.numFmt = DATEFMT; }
+  };
+  ganttSorted.forEach((t, k) => {
+    const rTop = bodyTop + k * 2;   // plan 列
+    const rBot = rTop + 1;               // actual 列
+    const sch = getEffectiveSchedule(t);
+
+    // 序、任務名跨兩列 merge(顯示一次、置中)
+    wsGantt.mergeCells(rTop, 1, rBot, 1);  // 序
+    wsGantt.mergeCells(rTop, 2, rBot, 2);  // 任務名
+    const seqCell = wsGantt.getCell(rTop, 1);
+    seqCell.value = App._seqOf(t.id);
+    seqCell.alignment = { vertical: 'middle', horizontal: 'center' };
+    const nameCell = wsGantt.getCell(rTop, 2);
+    nameCell.value = t.name || '';
+    nameCell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+
+    // 標籤欄(第3):plan 列「計畫」、actual 列「實際」
+    wsGantt.getCell(rTop, 3).value = '計畫';
+    wsGantt.getCell(rBot, 3).value = '實際';
+    wsGantt.getCell(rTop, 3).alignment = { vertical: 'middle', horizontal: 'center' };
+    wsGantt.getCell(rBot, 3).alignment = { vertical: 'middle', horizontal: 'center' };
+
+    // 計畫起訖(第4/5):plan 列 = sch.plannedStart/End、actual 列 = t.actualStart/End
+    setDateCell(wsGantt.getCell(rTop, 4), sch.plannedStart);
+    setDateCell(wsGantt.getCell(rTop, 5), sch.plannedEnd);
+    setDateCell(wsGantt.getCell(rBot, 4), t.actualStart);
+    setDateCell(wsGantt.getCell(rBot, 5), t.actualEnd);
+  });
+
+  // ── 甘特填色(§13.5 ③:假日底先鋪、plan/actual bar 後蓋)──
+  const fillCell = (r, c, argb) => {
+    wsGantt.getCell(r, c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+  };
+  // cols 的 ISO 預算(字串比交集,免時區)
+  const colIso = cols.map(c => ({ s: D.fmt(c.start, 'iso'), e: D.fmt(c.end, 'iso') }));
+  const colRange = (sIso, eIso) => {
+    if (!sIso || !eIso || eIso < sIso) return null;
+    let first = -1, last = -1;
+    for (let i = 0; i < colIso.length; i++) {
+      if (sIso <= colIso[i].e && eIso >= colIso[i].s) { if (first < 0) first = i; last = i; }
+    }
+    return first < 0 ? null : [first, last];
+  };
+
+  // plan/actual bar 後蓋
+  const today = D.today();
+  ganttSorted.forEach((t, k) => {
+    const rTop = bodyTop + k * 2;
+    const rBot = rTop + 1;
+    const sch = getEffectiveSchedule(t);
+    // plan 列
+    const pr = colRange(sch.plannedStart, sch.plannedEnd);
+    if (pr) for (let i = pr[0]; i <= pr[1]; i++) fillCell(rTop, nLeft + 1 + i, GANTT_FILL.plan);
+    // actual 列:狀態色,逾期 late
+    const ar = colRange(t.actualStart, t.actualEnd);
+    if (ar) {
+      const st = t.status || 'pending';
+      const overdue = isTaskDelayed(t, today);   // 規則15：逾期走 isTaskDelayed 單一來源（有效迄日＋排除 done+hold）
+      const argb = overdue ? GANTT_FILL.late : (st === 'done' ? GANTT_FILL.done : GANTT_FILL.wip);
+      for (let i = ar[0]; i <= ar[1]; i++) fillCell(rBot, nLeft + 1 + i, argb);
+    }
+  });
+
+  // §13.9+ 分頁拆分（Paul 2026-07-05）：儀表板匯出＝Task＋專案資訊、甘特匯出＝甘特頁；無 mode＝全含（向後相容）
+  if (mode === 'data') workbook.removeWorksheet(wsGantt.id);
+  else if (mode === 'gantt') { workbook.removeWorksheet(ws.id); workbook.removeWorksheet(wsInfo.id); }
+  // ── 下載（§13.8 共用）──
+  const dateStr = D.fmt(new Date(), 'ymd').replace(/\//g, '');
+  const tag = mode === 'data' ? '_任務清單' : (mode === 'gantt' ? '_甘特' : '_WBS');
+  const filename = (proj.name || 'WBS') + tag + '_' + dateStr + '.xlsx';
+  await App._xlDownload(workbook, filename);
+};
+
+// ─── WBS 匯入：helper + 欄位常數 + 預覽/執行（原夾島4 + WBS 區）───
+// Date → 'YYYY-MM-DD'；空值/非 Date → ''
+function wbsDateStr(v) {
+  if (!v) return '';
+  // 日期型（cellDates:true 解析的本地午夜 Date）→ 用本地 getter，不走 UTC toISOString（避免 UTC+8 -1 天）
+  if (v instanceof Date && !isNaN(v)) return D.fmt(v, 'iso');
+  // 字串/其他：先正則直抽 YYYY-MM-DD（完全不經 Date，免疫時區）
+  const s = String(v).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  // 非標準格式才 round-trip（盡力而為；斜線日期 new Date 走本地，仍安全）
+  const d = new Date(s);
+  return isNaN(d) ? '' : D.fmt(d, 'iso');
+}
+
+// 讀專案資訊頁部門表（列12表頭，列13起對應），建「成員→部門」反查 map
+// B欄空(品保/採購/生管)→用A部門名當成員；部門名自己也當key(H欄可能直接填'PM')
+function buildMemberToDept(wsInfo) {
+  const map = {};
+  if (!wsInfo) return map;
+  const info = XLSX.utils.sheet_to_json(wsInfo, { header: 'A', range: 0 });
+  // 找表頭「部門」那列，往下到空白為止
+  let headerIdx = info.findIndex(r => String(r.A || '').trim() === '部門'
+                                   && String(r.B || '').trim() === '專案成員');
+  if (headerIdx < 0) return map;
+  for (let i = headerIdx + 1; i < info.length; i++) {
+    const dept = String(info[i].A || '').trim();
+    if (!dept) break;            // 遇空白列停止
+    map[dept] = dept;            // 部門名自己當 key（H欄可能直接填部門名）
+    const members = String(info[i].B || '').trim();
+    if (members) {
+      // 成員一格多人用頓號分隔
+      members.split(/[、,，]/).map(s => s.trim()).filter(Boolean)
+             .forEach(m => { map[m] = dept; });
+    }
+    // B欄空(品保/採購/生管)：上面 map[dept]=dept 已涵蓋，部門名自己就是成員
+  }
+  return map;
+}
+
+// H欄負責人→主責部門。split三種分隔符取第一個人名查map，查不到/髒值歸未指派
+function ownerToDept(ownerStr, memberToDept) {
+  const raw = String(ownerStr || '').trim();
+  // 髒值過濾：空、破折號、表頭殘留
+  if (!raw || raw === '—' || raw === '-' || raw === '負責人') return '未指派';
+  // 三種分隔符：、 / ＋(全形) +(半形)，取第一個
+  const first = raw.split(/[、,，\/／＋+]/)[0].trim();
+  if (!first) return '未指派';
+  return memberToDept[first] || '未指派';   // 查不到(如航嘉)歸未指派
+}
+
+// 讀專案資訊頁部門表，建 id 結構 [{id,name,members:[{id,name}]}]（D-2a：存進 project.depts，暫未被消費）
+function buildDepts(wsInfo) {
+  const depts = [];
+  if (!wsInfo) return depts;
+  const info = XLSX.utils.sheet_to_json(wsInfo, { header:'A', range:0 });
+  const h = info.findIndex(r => String(r.A||'').trim()==='部門' && String(r.B||'').trim()==='專案成員');
+  if (h<0) return depts;
+  for (let i=h+1; i<info.length; i++) {
+    const name = String(info[i].A||'').trim();
+    if (!name) break;
+    const members = String(info[i].B||'').trim()
+      ? String(info[i].B).split(/[、,，]/).map(s=>s.trim()).filter(Boolean).map(n=>({id:U.id(), name:n}))
+      : [];
+    depts.push({ id: U.id(), name, members });
+  }
+  return depts;
+}
+
+// ─── WBS_COLUMNS：Excel 欄位定義單一來源（§13.1）───
+// 匯出讀 header 寫表頭；未來匯入收斂 + 模糊辨識（aliases）三方共用此常數。
+// header 逐字對齊 parseWbsExcel 實際讀的名（含「預計結束」「實際完成」怪名，見 §13.2）。
+// aliases 本批先全空、預留模糊辨識（§13.7）。
+// 人工對齊依據（key ↔ header，對 parseWbsExcel 讀法 app.js:8591-8644）：見下方陣列逐欄。
+// 自檢：parseWbsExcel 目前 inline 讀、無常數名單可比對 → 真自檢待其收斂到常數後加（§13.1）；此陣列即人工對齊依據。
+const WBS_COLUMNS = [
+  { key: 'wbs', header: 'N', aliases: ['No', 'NO', '序', '序號', '#', 'Item'], tip: '任務編號（流水序號；前置任務用它指涉，如「接在 #12 後」）' },
+  { key: 'variant', header: '案別', aliases: ['機種', '案別名'], tip: '機種／子案名稱（如 2.9~7.3kW、2.2kW）；Excel 沒有這欄＝整批當同一案' },
+  { key: 'stage', header: 'PLM階段', aliases: ['階段', 'Stage', 'Phase'], tip: '任務屬於哪個開發階段（規劃／手工機／性試／商檢／量試／量產）' },
+  { key: 'subgroup', header: '子群組', aliases: ['群組', '子分類'], tip: '階段內的小分類（選填，如「試驗」「備料」）' },
+  { key: 'name', header: '任務名', aliases: ['任務名稱', '任務', '工作項目', 'Task', 'Task Name', 'Activity', 'Work Item'], tip: '這件工作叫什麼（任務標題）' },
+  { key: 'taskType', header: '類型', aliases: ['任務類型', 'Type', 'Task Type'], tip: '任務＝要排程的工作；里程碑＝時間點標記（工期0）；群組＝純分類母項' },
+  { key: 'predecessor', header: '前置(N)', aliases: ['前置', '前置任務', 'Predecessor', 'Depends On', 'Dependency'], tip: '要接在哪個編號的任務後面（如 12＝接在 #12 完成後；12FS+3＝再隔 3 個工作天）' },
+  { key: 'durationDays', header: '工期', aliases: ['工期(天)', '工作天', '天數', 'Duration', 'Days'], tip: '這件事要做幾個工作天（跳過週末假日）' },
+  { key: 'effortRatio', header: '投入%', aliases: ['投入', '投入比例', '投入比例%', 'Effort', 'Effort%', 'Load%'], tip: '這件事吃掉負責人一天的幾成（0/10/25/50/75/100）；一般任務空白＝100%；PM 任務一律吃階段標準%（此欄對 PM 不採計，PM% 以畫面設定為準）' },
+  { key: 'owner', header: '負責人', aliases: ['擔當', '責任者', 'Owner', 'Assignee', 'Responsible', 'PIC'], tip: '誰來做這件事（擔當人名；負荷計算依此歸戶）' },
+  { key: 'plannedStart', header: '預計開始', aliases: ['預計開始日', '計畫開始', '開始日期', 'Start', 'Start Date', 'Plan Start', 'Planned Start'], tip: '計畫開工日（排程起點）' },
+  { key: 'plannedEnd', header: '預計結束', aliases: ['預計完成', '預計結束日', '計畫結束', '結束日期', 'End', 'Finish', 'End Date', 'Due Date', 'Plan End', 'Planned End', 'Deadline'], tip: '計畫完成日（逾期判定看它）' },
+  { key: 'actualStart', header: '實際開始', aliases: ['實際開始日', 'Actual Start'], tip: '真的開工那天（進度回報用；有填＝進行中）' },
+  { key: 'actualEnd', header: '實際完成', aliases: ['實際結束', '實際完成日', 'Actual End', 'Actual Finish'], tip: '真的做完那天（有填＝已完成，狀態自動變完成）' },
+  { key: 'progress', header: '進度%', aliases: ['進度', 'Progress', '% Complete', '完成率'], tip: '完成百分比（0~100）' },
+  { key: 'status', header: '狀態', aliases: ['Status', '狀態別'], tip: '未開始／進行中／擱置／完成' },
+  { key: 'mustDeliver', header: '必須繳付', aliases: ['需交付', '必須交付'], tip: '這任務要不要交東西（✓＝要）' },
+  { key: 'deliverable', header: '繳付物說明', aliases: ['交付物', '交付物說明'], tip: '要交什麼（如「性能試驗報告」）' },
+  { key: 'riskIssue', header: '風險議題', aliases: ['風險', '風險內容'], tip: '這件事的風險備註（選填）' },
+  { key: 'note', header: '備註', aliases: ['Note', 'Remark', '注記'], tip: '其他說明（選填）' },
+  { key: 'delivered', header: '已交付', aliases: [], tip: '已經交付的內容紀錄（選填）' },
+  { key: 'deliverableLink', header: '繳付連結', aliases: ['交付物連結', '連結'], tip: '交付物的雲端連結（Drive 等，選填）' },
+  { key: 'deliverableType', header: '繳付件類型', aliases: ['交付件類型'], tip: '交付物的類型分類（選填）' },
+  { key: 'requiredTask', header: '必要任務', aliases: [], tip: '是否為必要任務（空白＝必要；✗＝非必要）' },
+  { key: 'mustIssue', header: '繳付物必須發行', aliases: [], tip: '交付物是否須走正式發行程序（✓＝要）' },
+];
+// WBS 必要欄（欄位對應面板/REQUIRED 檢查共用；header ↔ key 對照 parseWbsExcel REQUIRED）
+const WBS_REQUIRED_KEYS = ['wbs', 'stage', 'name', 'taskType', 'predecessor', 'durationDays', 'owner', 'plannedStart'];
+
+// ─── 模糊欄位匯入核心（§13.7，WBS＋BOM 共用的標準匯入器）───
+// 四輪匹配（嚴→鬆，一欄只綁一個 key、先中先贏）：①表頭/別名逐字 ②正規化相等（去空白/全形/括號註記、lowercase）
+// ③唯一子字串（雙向 includes、長度≥2、且只有一個 spec 搶這格才綁——防「開始」同時吃到預計/實際）。
+// spec 形狀 { key, header, aliases[], multi? }；multi=收集所有命中欄（BOM 多單價欄情境③用）。
+// 簡體→繁體 顯示轉換（全站禁簡體：Excel 表頭/分頁名等使用者資料「顯示」一律轉繁；底層比對/資料保留原文）。
+// 常見 ERP/BOM 用字表，不足再補。
+const S2T_MAP = { '编': '編', '号': '號', '单': '單', '价': '價', '规': '規', '说': '說', '类': '類', '别': '別', '数': '數', '层': '層', '阶': '階', '标': '標', '准': '準', '术': '術', '显': '顯', '项': '項', '义': '義', '币': '幣', '种': '種', '购': '購', '会': '會', '计': '計', '关': '關', '联': '聯', '发': '發', '记': '記', '录': '錄', '货': '貨', '仓': '倉', '库': '庫', '级': '級', '员': '員', '产': '產', '品': '品', '订': '訂', '设': '設', '变': '變', '统': '統', '预': '預', '实': '實', '际': '際', '进': '進', '费': '費', '装': '裝', '线': '線', '铁': '鐵', '钢': '鋼', '铜': '銅', '铝': '鋁', '塑': '塑', '胶': '膠', '电': '電', '机': '機', '压': '壓', '风': '風', '热': '熱', '冷': '冷', '万': '萬', '与': '與', '为': '為', '于': '於', '这': '這', '个': '個', '们': '們', '时': '時', '间': '間', '开': '開', '关': '關', '总': '總', '组': '組', '织': '織', '维': '維', '护': '護', '检': '檢', '验': '驗', '测': '測', '试': '試', '报': '報', '废': '廢', '损': '損', '耗': '耗', '余': '餘', '额': '額', '税': '稅', '厂': '廠', '商': '商', '采': '採', '销': '銷', '让': '讓', '认': '認', '证': '證', '书': '書', '图': '圖', '纸': '紙', '张': '張', '钮': '鈕', '扣': '扣', '丝': '絲', '缆': '纜', '轴': '軸', '轮': '輪', '盘': '盤', '罩': '罩', '壳': '殼', '盖': '蓋', '门': '門', '窗': '窗', '条': '條', '块': '塊', '颗': '顆', '只': '只', '台': '台', '两': '兩', '双': '雙', '对': '對', '长': '長', '宽': '寬', '高': '高', '厚': '厚', '径': '徑', '毫': '毫', '结': '結', '构': '構', '铸': '鑄', '锻': '鍛', '焊': '焊', '涂': '塗', '镀': '鍍', '铬': '鉻', '锌': '鋅', '氧': '氧', '处': '處', '质': '質', '码': '碼', '态': '態', '务': '務', '应': '應', '储': '儲', '连': '連', '属': '屬', '异': '異', '导': '導', '铅': '鉛', '镍': '鎳', '锁': '鎖', '阀': '閥', '陈': '陳', '归': '歸', '径': '徑', '弹': '彈', '簧': '簧', '垫': '墊', '龙': '龍', '头': '頭', '脚': '腳', '轨': '軌', '架': '架', '网': '網', '滤': '濾', '织': '織' };
+function toTrad(s) {
+  return String(s == null ? '' : s).replace(/[一-鿿]/g, ch => S2T_MAP[ch] || ch);
+}
+function impNorm(s) {
+  return String(s == null ? '' : s).trim().toLowerCase()
+    .replace(/[！-～]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))   // 全形→半形
+    .replace(/[\s　]/g, '')
+    .replace(/[（(][^（()）]*[)）]/g, '');   // 去括號註記（如「單價(未稅)」→「單價」）
+}
+function fuzzyResolveColumns(headerCells, specs, learned) {
+  const cells = (headerCells || []).map(c => String(c == null ? '' : c).trim());
+  const byKey = {}, multiHits = {}, claimed = new Set();
+  const namesOf = sp => [sp.header].concat(sp.aliases || []);
+  // 輪⓪ 學習字典（欄位對應面板「記住」的表頭→key，importAliasMap；使用者親手指定＝最優先。
+  // 只存「本來認不得」的表頭，不會跟逐字/別名衝突）
+  if (learned) {
+    cells.forEach((c, i) => {
+      if (!c || claimed.has(i)) return;
+      const k = learned[impNorm(c)];
+      if (!k) return;
+      const sp = specs.find(s => s.key === k);
+      if (!sp) return;
+      if (sp.multi) { (multiHits[k] = multiHits[k] || []).push({ header: c, idx: i }); claimed.add(i); }
+      else if (byKey[k] == null) { byKey[k] = i; claimed.add(i); }
+    });
+  }
+  // 輪①逐字＋輪②正規化相等（同迴圈兩層，逐字優先）
+  [0, 1].forEach(round => {
+    specs.forEach(sp => {
+      cells.forEach((c, i) => {
+        if (!c || claimed.has(i)) return;
+        const hit = round === 0
+          ? namesOf(sp).some(n => n === c)
+          : namesOf(sp).some(n => impNorm(n) === impNorm(c));
+        if (!hit) return;
+        if (sp.multi) { (multiHits[sp.key] = multiHits[sp.key] || []).push({ header: c, idx: i }); claimed.add(i); return; }
+        if (byKey[sp.key] == null) { byKey[sp.key] = i; claimed.add(i); }
+      });
+    });
+  });
+  // 輪③唯一子字串：對每個未認領欄，找出「還沒綁到欄的 spec」中雙向 includes 命中者；恰一個才綁
+  cells.forEach((c, i) => {
+    if (!c || claimed.has(i)) return;
+    const nc = impNorm(c);
+    if (nc.length < 2) return;
+    const cands = specs.filter(sp => !sp.multi && byKey[sp.key] == null &&
+      namesOf(sp).some(n => { const nn = impNorm(n); return nn.length >= 2 && (nc.includes(nn) || nn.includes(nc)); }));
+    if (cands.length === 1) { byKey[cands[0].key] = i; claimed.add(i); }
+  });
+  return { byKey, multiHits };
+}
+// 掃前 N 列找表頭列：命中 spec 數最多者（至少 minHits 欄）
+function fuzzyFindHeaderRow(aoa, specs, minHits, learned) {
+  let best = -1, bestHits = 0;
+  const lim = Math.min(aoa.length, 12);
+  for (let i = 0; i < lim; i++) {
+    const { byKey, multiHits } = fuzzyResolveColumns(aoa[i] || [], specs, learned);
+    const hits = Object.keys(byKey).length + Object.keys(multiHits).length;
+    if (hits > bestHits) { bestHits = hits; best = i; }
+  }
+  return bestHits >= (minHits || 2) ? best : -1;
+}
+// 學習字典讀取（domain: 'wbs' | 'bom'）——node oracle 無 DATA 時回 null
+function importLearnedMap(domain) {
+  return (typeof DATA !== 'undefined' && DATA.settings && DATA.settings.importAliasMap) ? (DATA.settings.importAliasMap[domain] || null) : null;
+}
+
+// ─── GANTT_FILL：甘特填色 ARGB 常數（§13.5；ExcelJS cell.fill 用，非 CSS）───
+// 8碼 ARGB（FF=不透明前綴）+ hex 去井號；值逐一對齊 style.css :root 的 --xl-gantt-* 對照表。
+const GANTT_FILL = {
+  plan:    'FFD9D2C5',   // --xl-gantt-plan    計畫淺米灰
+  wip:     'FF4A6B85',   // --xl-gantt-wip     進行中（navy）
+  done:    'FF3B6B4A',   // --xl-gantt-done    完成（深綠）
+  late:    'FFC4633E',   // --xl-gantt-late    逾期（terracotta）
+  holiday: 'FFF7DDE4',   // --xl-gantt-holiday 假日粉紅（僅標表頭）
+  weekday: 'FFF2F3F5',   // --gantt-weekday    平日欄底（保留，未用於填色）
+};
+
+// 讀 WBS Excel，解析 WBS 主分頁的有效列（sheet 名比對見下，相容他人格式保留）
+// 回傳 { ok, rows, projectName, errors }，不灌日期、不碰 DOM、不存 Storage
+async function parseWbsExcel(file, opts) {
+  opts = opts || {};   // opts.mapping = 欄位對應面板回填 {fieldKey: colIdx}（最高優先）
+  try {
+    const buffer = await file.arrayBuffer();   // house style：標準 arrayBuffer 讀檔
+    const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+
+    // §13.7：優先按名直取；否則挑「內容有 WBS 任務表頭」的分頁（不挑分頁名·容納拆頁後甘特/其他分頁排前面·匯出改動不連帶壞匯入）。
+    // 曾踩：匯出「任務清單/甘特」拆頁（§13.9+）後，若只按「第一個非專案資訊分頁」挑，甘特頁在前就會挑錯→吃不下。故改看內容挑表頭頁。
+    let wsMain = wb.Sheets['J系列整合WBS'];
+    if (!wsMain) {
+      const cand = wb.SheetNames.filter(n => n !== '專案資訊');
+      const learnedPick = importLearnedMap('wbs');
+      const hasWbsHeader = ws => {
+        const a = XLSX.utils.sheet_to_json(ws, { header: 1, range: 0, defval: null });
+        return a.some(r => { const c = (r || []).map(x => String(x == null ? '' : x).trim()); return c.includes('N') && c.includes('任務名'); })
+          || fuzzyFindHeaderRow(a, WBS_COLUMNS, 3, learnedPick) >= 0;
+      };
+      const picked = cand.find(n => wb.Sheets[n] && hasWbsHeader(wb.Sheets[n]));
+      wsMain = wb.Sheets[picked || cand[0]] || null;
+    }
+    if (!wsMain) {
+      return { ok: false, rows: [], projectName: '', errors: ['找不到任何資料分頁'] };
+    }
+
+    // 專案名：專案資訊頁是 key-value 直式，掃 A 欄＝「專案名稱」那列取 B（不寫死列號）
+    let projectName = '';
+    const wsInfo = wb.Sheets['專案資訊'];
+    if (wsInfo) {
+      const infoRows = XLSX.utils.sheet_to_json(wsInfo, { header: 'A', range: 0 });
+      const hit = infoRows.find(r => String(r.A || '').trim() === '專案名稱');
+      projectName = hit ? String(hit.B || '').trim() : '';
+    }
+    if (!projectName) projectName = '未命名專案';
+
+    // 部門翻譯：建「成員→部門」反查 map（重用上面已取的 wsInfo，免重複 lookup）
+    const memberToDept = buildMemberToDept(wsInfo);
+
+    const aoa = XLSX.utils.sheet_to_json(wsMain, { header: 1, range: 0, defval: null });
+    const rows = [];
+    const errors = [];
+
+    // 改靠表頭名讀（不再固定欄序，因新 Excel 在 B 欄插入「案別」整體右移）：
+    // 第 1 列為表頭，建「表頭字面→欄 index」映射（String().trim() 防呆，萬一手動編輯帶到空白）
+    let headerIdx = aoa.findIndex(r => {
+      const cells = (r || []).map(c => String(c == null ? '' : c).trim());
+      return cells.includes('N') && cells.includes('任務名');
+    });
+    const learnedWbs = importLearnedMap('wbs');
+    if (headerIdx < 0) headerIdx = fuzzyFindHeaderRow(aoa, WBS_COLUMNS, 3, learnedWbs);   // §13.7：標準檔找不到表頭→模糊掃前 12 列
+    const headerRow = (headerIdx >= 0 ? aoa[headerIdx] : aoa[0]) || [];
+    const colMap = {};
+    headerRow.forEach((h, i) => { const key = String(h == null ? '' : h).trim(); if (key) colMap[key] = i; });
+    // §13.7 模糊補缺：逐字沒對上的欄，用共用核心（學習字典/別名/正規化/唯一子字串）補進 canonical 表頭名——
+    // 精確匹配永遠優先（既有標準檔零行為變更），只有「缺欄」才吃模糊結果，容納他人格式的怪表頭。
+    {
+      const fz = fuzzyResolveColumns(headerRow, WBS_COLUMNS, learnedWbs).byKey;
+      WBS_COLUMNS.forEach(sp => { if (colMap[sp.header] == null && fz[sp.key] != null) colMap[sp.header] = fz[sp.key]; });
+    }
+    // 欄位對應面板回填（使用者手動指定）＝最高優先覆蓋
+    if (opts.mapping) WBS_COLUMNS.forEach(sp => { const ix = opts.mapping[sp.key]; if (ix != null && ix >= 0) colMap[sp.header] = ix; });
+    const cell = (row, headerName) => { const i = colMap[headerName]; return (i == null) ? null : row[i]; };
+
+    // 必要欄檢查：缺任一→回 needMapping 讓呼叫端開欄位對應面板（使用者指定後帶 opts.mapping 重解析；仍缺＝真失敗）
+    const REQUIRED = ['N', 'PLM階段', '任務名', '類型', '前置(N)', '工期', '負責人', '預計開始'];
+    const missing = REQUIRED.filter(h => colMap[h] == null);
+    if (missing.length) {
+      if (!opts.mapping) {
+        const resolved = {};
+        WBS_COLUMNS.forEach(sp => { if (colMap[sp.header] != null) resolved[sp.key] = colMap[sp.header]; });
+        return { ok: false, needMapping: true, rows: [], projectName,
+          headerCells: headerRow.map(h => String(h == null ? '' : h).trim()), resolved,
+          errors: ['缺少必要欄：' + missing.join('、')] };
+      }
+      return { ok: false, rows: [], projectName, errors: ['缺少必要欄：' + missing.join('、')] };
+    }
+
+    aoa.slice((headerIdx >= 0 ? headerIdx : 0) + 1).forEach((r) => {
+      // 任務名空 → skip
+      const nameRaw = cell(r, '任務名');
+      const name = nameRaw != null && String(nameRaw).trim() !== '' ? String(nameRaw).trim() : '';
+      if (!name) return;
+
+      const typeRaw = cell(r, '類型');
+      const ownerRaw = cell(r, '負責人');
+      const durRaw = cell(r, '工期');
+      const progRaw = cell(r, '進度%');
+      const mustRaw = cell(r, '必須繳付');
+      const wbsRaw = cell(r, 'N');
+      const variantRaw = cell(r, '案別');
+      const stageRaw = cell(r, 'PLM階段');
+      const subgroupRaw = cell(r, '子群組');
+      const predRaw = cell(r, '前置(N)');
+      const statusRaw = cell(r, '狀態');
+      const deliverableRaw = cell(r, '繳付物說明');
+      const riskRaw = cell(r, '風險議題');
+      const noteRaw = cell(r, '備註');
+      const deliveredRaw = cell(r, '已交付');
+      const linkRaw = cell(r, '繳付連結');
+      const dtypeRaw = cell(r, '繳付件類型');      // §7.1 deliverableType
+      const reqRaw = cell(r, '必要任務');           // §7.1 requiredTask（預設全必要）
+      const issueRaw = cell(r, '繳付物必須發行');   // §7.1 mustIssue
+
+      rows.push({
+        wbs: wbsRaw != null ? String(wbsRaw).trim() : '',
+        variant: variantRaw != null ? String(variantRaw).trim() : '',
+        stage: stageRaw != null ? String(stageRaw).trim() : '',
+        subgroup: subgroupRaw != null ? String(subgroupRaw).trim() : '',
+        name: name,
+        category: String(typeRaw || '').includes('里程碑') ? 'meeting' : 'deep',
+        taskType: mapTaskType(typeRaw),
+        predecessor: predRaw != null ? String(predRaw).trim() : '',
+        durationDays: typeof durRaw === 'number' ? durRaw : (parseFloat(durRaw) || 0),
+        effortRatio: (function(){ const raw = cell(r, '投入%'); if (raw == null || String(raw).trim() === '') return null; const e = parseInt(raw, 10); return isNaN(e) ? null : e; })(),   // 空值→null（交 buildWbsPreview 依 PM/非PM 帶預設，§19.4）
+        owner: ownerRaw != null ? String(ownerRaw).trim() : '',
+        dept: ownerToDept(ownerRaw, memberToDept),
+        plannedStart: wbsDateStr(cell(r, '預計開始')),
+        plannedEnd: wbsDateStr(cell(r, '預計結束')),
+        actualStart: wbsDateStr(cell(r, '實際開始')),
+        actualEnd: wbsDateStr(cell(r, '實際完成')),
+        progress: typeof progRaw === 'number' ? Math.round(progRaw * 100) : 0,
+        status: statusRaw != null ? String(statusRaw).trim() : '',
+        mustDeliver: mustRaw === '✓' || mustRaw === true || String(mustRaw).trim() === '✓',
+        deliverableType: dtypeRaw != null ? String(dtypeRaw).trim() : '',
+        // 必要任務預設 true：空白/未填＝必要；明確非✓（如✗）＝非必要
+        requiredTask: reqRaw == null || String(reqRaw).trim() === ''
+          ? true
+          : (reqRaw === '✓' || reqRaw === true || String(reqRaw).trim() === '✓'),
+        mustIssue: issueRaw === '✓' || issueRaw === true || String(issueRaw).trim() === '✓',
+        deliverable: deliverableRaw != null ? String(deliverableRaw).trim() : '',
+        riskIssue: riskRaw != null ? String(riskRaw).trim() : '',
+        note: noteRaw != null ? String(noteRaw).trim() : '',
+        delivered: deliveredRaw != null ? String(deliveredRaw).trim() : '',
+        deliverableLink: linkRaw != null ? String(linkRaw).trim() : '',
+      });
+    });
+
+    return { ok: true, rows, projectName, errors, depts: buildDepts(wsInfo) };
+  } catch (err) {
+    return { ok: false, rows: [], projectName: '', errors: ['解析失敗：' + err.message] };
+  }
+}
+
+// ─── §19.6 波2：BOM Excel 解析（吃各種爛 Excel，走模糊欄位核心）＋差異比對引擎 ───
+// partNo 必要；qty 缺→1；price 缺→無單價模式（只核對物料/用量，不算價差不報錯）；
+// price 標 multi（多命中→情境③使用者選欄）；幣別從「幣別欄值」或「單價表頭括號」偵測（情境②軟擋）。
+const BOM_COLUMNS = [
+  { key: 'partNo', header: '品號', aliases: ['料號', 'PartNo', 'Part No', 'Part Number', 'P/N', 'PN', '物料編號', '料件編號', '料件编号', '编号', '品目', 'Material', 'Item No', 'Item Code', 'Component'], tip: '料件的料號／品號——新舊版比對就是拿它當身分對照，一定要指' },
+  { key: 'partName', header: '品名', aliases: ['名稱', '品名規格', '描述', 'Description', '規格', 'Part Name', 'Item Name', '材料名稱'], tip: '料件名稱（顯示用，選填）' },
+  { key: 'qty', header: '用量', aliases: ['數量', '組成用量', '標準用量', 'Qty', "Q'ty", 'Quantity', 'Usage', 'QPA', 'Per Unit'], tip: '每台用幾個（沒有這欄＝一律當 1）' },
+  { key: 'price', header: '單價', aliases: ['单价', 'Price', 'Unit Price', 'Unit Cost', 'Cost', 'Std Cost', '未稅單價', '含稅單價', '採購單價', '會計單價', '成本單價', '新單價'], multi: true, tip: '一顆多少錢（多個價格欄會請你選用哪欄；沒有也能比對——只核對物料／用量）' },
+  { key: 'currency', header: '幣別', aliases: ['Currency', '幣種', 'Curr'], tip: '這份報價的幣別（USD／NTD…；系統會對照頁面設定提醒換算）' },
+];
+const BOM_REQUIRED_KEYS = ['partNo'];
+// §19.6.1 整機葉節點加總：階次／材料類別欄偵測（獨立於差異比對 BOM_COLUMNS，不影響 diff 管線）。
+// 保守 exact-match（impNorm 後＝小寫去空白去括號）避免誤配一般「類別/type」欄；判不出→UI 精靈手動指定。
+const BOM_LEVEL_HEADS = ['階次', '階層', '層次', 'bom階次', 'bomlevel', 'level', 'lvl', 'lv', 'indentlevel'];
+const BOM_MATCAT_HEADS = ['材料類別', '料件類別', '物料類別', '料號類別', 'materialtype', 'itemtype', 'm/a', 'ma', 'makebuy', '採購自製', '自製採購', '製購別'];
+function bomDetectStructCols(headerRow) {
+  const cells = (headerRow || []).map(c => impNorm(c));
+  const find = heads => { for (let i = 0; i < cells.length; i++) { if (cells[i] && heads.indexOf(cells[i]) >= 0) return i; } return null; };
+  return { levelIdx: find(BOM_LEVEL_HEADS), matCatIdx: find(BOM_MATCAT_HEADS) };
+}
+function bomDetectCurrency(text) {
+  const s = String(text || '');
+  if (/usd|us\$|美金|美元/i.test(s)) return 'USD';
+  if (/eur|€|歐元/i.test(s)) return 'EUR';
+  if (/jpy|日圓|日幣|日元/i.test(s)) return 'JPY';
+  if (/rmb|cny|人民幣/i.test(s)) return 'RMB';
+  if (/ntd|nt\$|新台幣|台幣/i.test(s)) return 'NTD';
+  return '';
+}
+// 讀檔→候選分頁清單（表頭命中的全收；一案多機種 Excel 常見 15 分頁，>1 個候選→UI 讓使用者選分頁）
+async function parseBomAoa(file) {
+  try {
+    const buffer = await file.arrayBuffer();
+    const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+    const learnedBom = importLearnedMap('bom');
+    const candidates = [];
+    for (const nm of wb.SheetNames) {
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[nm], { header: 1, range: 0, defval: null });
+      if (fuzzyFindHeaderRow(aoa, BOM_COLUMNS, 2, learnedBom) >= 0) candidates.push({ sheetName: nm, aoa });
+    }
+    if (!candidates.length) return { ok: false, candidates: [], errors: ['找不到含「品號/料號＋用量」表頭的分頁'] };
+    return { ok: true, candidates, errors: [] };
+  } catch (err) { return { ok: false, candidates: [], errors: ['解析失敗：' + err.message] }; }
+}
+// aoa→rows；opts.priceIdx=情境③使用者選定的單價欄 index
+function extractBomRows(aoa, opts) {
+  opts = opts || {};   // opts.priceIdx=情境③選欄；opts.mapping=欄位對應面板回填 {key: colIdx}
+  const learnedBom = importLearnedMap('bom');
+  const headerIdx = fuzzyFindHeaderRow(aoa, BOM_COLUMNS, 2, learnedBom);
+  if (headerIdx < 0) return { ok: false, rows: [], errors: ['找不到表頭列'] };
+  const headerRow = aoa[headerIdx] || [];
+  const { byKey, multiHits } = fuzzyResolveColumns(headerRow, BOM_COLUMNS, learnedBom);
+  if (opts.mapping) BOM_COLUMNS.forEach(sp => { const ix = opts.mapping[sp.key]; if (ix != null && ix >= 0 && sp.key !== 'price') byKey[sp.key] = ix; });
+  if (byKey.partNo == null) {
+    if (!opts.mapping) {
+      const resolved = Object.assign({}, byKey);
+      const ph = multiHits.price || [];
+      if (ph.length === 1) resolved.price = ph[0].idx;
+      return { ok: false, needMapping: true, rows: [],
+        headerCells: headerRow.map(h => String(h == null ? '' : h).trim()), resolved,
+        errors: ['缺少必要欄：品號/料號'] };
+    }
+    return { ok: false, rows: [], errors: ['缺少必要欄：品號/料號'] };
+  }
+  const priceHeaders = multiHits.price || [];
+  const mapPrice = opts.mapping && opts.mapping.price != null && opts.mapping.price >= 0 ? opts.mapping.price : null;
+  let priceIdx = (opts.priceIdx != null) ? opts.priceIdx
+    : (mapPrice != null ? mapPrice : (priceHeaders.length === 1 ? priceHeaders[0].idx : null));
+  const needPriceChoice = priceHeaders.length > 1 && priceIdx == null;
+  const noPrice = priceHeaders.length === 0 && priceIdx == null;   // 無單價模式（§19.6：只核對物料/用量）；手動指了單價欄就不算無單價
+  // 幣別偵測：①幣別欄第一個非空值 ②選定單價欄表頭文字（如「單價(USD)」）
+  let currencyDetected = '';
+  const rows = [];
+  aoa.slice(headerIdx + 1).forEach(r => {
+    if (!r) return;
+    const pn = r[byKey.partNo] != null ? String(r[byKey.partNo]).trim() : '';
+    if (!pn) return;
+    const qtyRaw = byKey.qty != null ? r[byKey.qty] : null;
+    const qty = (qtyRaw == null || qtyRaw === '') ? 1 : (parseFloat(qtyRaw) || 0);
+    let price = null;
+    if (!noPrice && priceIdx != null) { const pv = r[priceIdx]; price = (pv == null || pv === '') ? null : (parseFloat(pv) || 0); }
+    if (!currencyDetected && byKey.currency != null) currencyDetected = bomDetectCurrency(r[byKey.currency]);
+    rows.push({ partNo: pn, partName: byKey.partName != null && r[byKey.partName] != null ? String(r[byKey.partName]).trim() : '', qty, price });
+  });
+  if (!currencyDetected && priceIdx != null) currencyDetected = bomDetectCurrency(headerRow[priceIdx]);
+  const struct = bomDetectStructCols(headerRow);
+  return { ok: true, rows, errors: [], priceHeaders, needPriceChoice, noPrice, currencyDetected, count: rows.length,
+    headerIdx, partNoIdx: byKey.partNo, priceIdxUsed: priceIdx,
+    qtyIdx: byKey.qty != null ? byKey.qty : null, levelIdx: struct.levelIdx, matCatIdx: struct.matCatIdx };   // 波3 持久化＋§19.6.1 整機葉節點加總欄索引
+}
+// ─── 欄位對應面板（§13.7 補完，Paul 2026-07-04 定）：模糊配不到必要欄→列出全部系統欄位、
+// 每欄下拉選 Excel 表頭（自動配到的預填、可覆蓋誤配）；選填欄可 N/A（不匯入，之後批量編輯補）。
+// 「記住這個對應」→ 存 DATA.settings.importAliasMap[domain]（教一次，下次同表頭自動配、不再跳）。
+// 雙模式：containerId=嵌入面板（WBS 兩處都在 modal 內，不能疊 modal）；無 containerId=開 modal（BOM 在 dashboard 頁）。
+// §精簡精靈（Paul 2026-07-08 定）：兩區——①「需要你確認」（系統對不準/必要欄缺·主畫面凸顯）
+// ②「系統已自動對應」（resolved 有值·反灰收折·每欄仍藏 select 供 _impMapConfirm 讀·「改」展開覆蓋）。
+// 契約不變（cfg{specs,headerCells,resolved,requiredKeys,domain,title,containerId?,onConfirm}·confirm 讀 #imap-<key>）。
+App.renderImportMapping = function(cfg) {
+  App._impMapCfg = cfg;
+  const req = new Set(cfg.requiredKeys || []);
+  const resolved = cfg.resolved || {};
+  const selHtml = (sp, missClass) => '<select id="imap-' + sp.key + '" class="imap-sel' + (missClass ? ' imap-miss' : '') + '" onchange="this.classList.remove(\'imap-miss\')">' +
+    '<option value="-1"' + (resolved[sp.key] == null ? ' selected' : '') + '>— N/A 不匯入 —</option>' +
+    cfg.headerCells.map((h, i) => h ? '<option value="' + i + '"' + (resolved[sp.key] === i ? ' selected' : '') + '>' + U.esc(toTrad(String(h))) + '</option>' : '').join('') +
+    '</select>';
+  const headerText = i => (i != null && cfg.headerCells[i] != null) ? toTrad(String(cfg.headerCells[i])) : '';
+  const matched = cfg.specs.filter(sp => resolved[sp.key] != null);
+  const need = cfg.specs.filter(sp => resolved[sp.key] == null)
+    .sort((a, b) => (req.has(b.key) ? 1 : 0) - (req.has(a.key) ? 1 : 0));   // 必要欄排前
+  const needCard = sp => {
+    const isReq = req.has(sp.key);
+    const why = isReq ? '找不到對應欄位——請指定你 Excel 裡代表「' + U.esc(sp.header) + '」的欄。'
+      : (sp.tip ? U.esc(sp.tip) : '系統沒自動配到；可指定，或留 N/A 走系統預設。');
+    return '<div class="imap-card' + (isReq ? ' req' : '') + '">' +
+      '<div class="imap-card-field">' + U.esc(sp.header) + (isReq ? '<span class="imap-badge req">必要</span>' : '<span class="imap-badge opt">選填</span>') + '</div>' +
+      '<div class="imap-card-sel">' + selHtml(sp, isReq) + '</div>' +
+      '<div class="imap-card-why">' + why + '</div></div>';
+  };
+  const autoRow = sp => '<div class="imap-arow"><span class="imap-asys">' + U.esc(sp.header) + '</span><span class="imap-aarr">←</span><span class="imap-asrc">' + U.esc(headerText(resolved[sp.key])) + '</span><span class="imap-aok">✓</span>' +
+    '<a class="imap-aedit" onclick="App._impMapReveal(this)">改</a>' +
+    '<span class="imap-ahide" style="display:none">' + selHtml(sp) + '</span></div>';
+  const needSect = need.length
+    ? '<div class="imap-eyebrow"><span class="imap-eb-n">!</span><span class="imap-eb-t">需要你確認</span><span class="imap-eb-c">' + need.length + '</span><span class="imap-eb-h">系統對不準，請指定對應欄位</span></div>' +
+      '<div class="imap-need">' + need.map(needCard).join('') + '</div>'
+    : '<div class="imap-allgood">✓ 欄位系統已全部自動對應，確認即可匯入</div>';
+  const autoSect = matched.length
+    ? '<div class="imap-auto"><div class="imap-auto-head" onclick="App._impMapToggleAuto(this)"><span class="imap-chev">▶</span><span class="imap-auto-lead">系統已自動對應</span><span class="imap-auto-sub">通常不用動，需要時展開改</span><span class="imap-auto-pill">已配 ' + matched.length + ' 欄</span></div>' +
+      '<div class="imap-auto-body" style="display:none">' + matched.map(autoRow).join('') + '</div></div>'
+    : '';
+  const html = '<div class="imap-panel">' +
+    '<div class="imap-top"><div class="imap-top-t">上傳的 Excel 欄位對應——只有系統對不準的需要你選，其餘已配好收在下方。</div>' +
+    '<button class="imap-sample" onclick="App._impMapSample()">⬇ 下載匯入範例</button></div>' +
+    needSect + autoSect +
+    '<div class="imap-foot"><label class="imap-rem"><input type="checkbox" id="imap-remember" checked> 記住這個對應（下次同表頭自動配）</label>' +
+    '<button class="tb-action" onclick="App._impMapConfirm()">確認對應並匯入</button></div></div>';
+  if (cfg.containerId) {
+    const el = document.getElementById(cfg.containerId);
+    if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  } else {
+    App.openModal({ title: '欄位對應 — ' + (cfg.title || '匯入'), body: html,
+      footer: '<button class="tb-action ghost" onclick="App.closeModal()">取消匯入</button>' });
+  }
+};
+App._impMapReveal = function(a) { const row = a.closest('.imap-arow'); if (!row) return; const h = row.querySelector('.imap-ahide'); if (h) h.style.display = ''; a.style.display = 'none'; const ok = row.querySelector('.imap-aok'); if (ok) ok.style.display = 'none'; row.classList.add('imap-arow-open'); };
+App._impMapToggleAuto = function(head) { const body = head.parentNode.querySelector('.imap-auto-body'); if (!body) return; const open = body.style.display === 'none'; body.style.display = open ? '' : 'none'; head.classList.toggle('open', open); };
+App._impMapSample = function() { const cfg = App._impMapCfg; if (!cfg) return; App.exportImportSample(cfg.specs, cfg.requiredKeys, cfg.title || '匯入'); };
+App._impMapConfirm = function() {
+  const cfg = App._impMapCfg; if (!cfg) return;
+  const req = cfg.requiredKeys || [];
+  const mapping = {}, used = {};
+  let dupe = null, missReq = null;
+  cfg.specs.forEach(sp => {
+    const el = document.getElementById('imap-' + sp.key); if (!el) return;
+    const v = parseInt(el.value, 10);
+    if (v >= 0) {
+      if (used[v] != null) dupe = cfg.headerCells[v];
+      used[v] = sp.key;
+      mapping[sp.key] = v;
+    } else if (req.includes(sp.key)) missReq = sp.header;
+  });
+  if (missReq) { U.toast('⚠ 必要欄位「' + missReq + '」必須指定 Excel 欄位，不可 N/A', 'warning'); return; }
+  if (dupe) { U.toast('⚠ Excel 欄位「' + dupe + '」被指到多個系統欄位，請調整', 'warning'); return; }
+  // 記住＝只教「本來認不得」的表頭進字典（逐字/別名本來就會中的不存，字典不肥大）
+  const rem = document.getElementById('imap-remember');
+  if (rem && rem.checked && typeof DATA !== 'undefined') {
+    DATA.settings.importAliasMap = DATA.settings.importAliasMap || {};
+    const m = (DATA.settings.importAliasMap[cfg.domain] = DATA.settings.importAliasMap[cfg.domain] || {});
+    cfg.specs.forEach(sp => {
+      const idx = mapping[sp.key];
+      if (idx == null) return;
+      const hdr = cfg.headerCells[idx];
+      const known = [sp.header].concat(sp.aliases || []).some(n => impNorm(n) === impNorm(hdr));
+      if (!known && impNorm(hdr)) m[impNorm(hdr)] = sp.key;
+    });
+    Store.settings.save();
+  }
+  if (cfg.containerId) { const el = document.getElementById(cfg.containerId); if (el) { el.innerHTML = ''; el.style.display = 'none'; } }
+  else App.closeModal();
+  App._impMapCfg = null;
+  cfg.onConfirm(mapping);
+};
+// §精簡精靈：共用「下載匯入範例」——吃 specs 產 表頭列（必要欄加 *）＋一列示意 ＋「欄位說明」頁（必要/說明/可接受別名）。
+// 四個匯入器（WBS/BOM/工作日曆/範本）共用；各自傳自己的 *_COLUMNS/REQUIRED_KEYS/標題。
+App.exportImportSample = async function(specs, requiredKeys, title) {
+  if (typeof ExcelJS === 'undefined') { U.toast('❌ ExcelJS 函式庫未載入，請重新整理頁面', 'error'); return; }
+  const req = new Set(requiredKeys || []);
+  const H = App._xlHouse();
+  const { FD, FSUB, FMEMO, AL, box, fill, CREAM, hdrRow } = H;
+  const wb = new ExcelJS.Workbook();
+  wb.creator = DATA.settings.userName || CFG('APP_NAME', 'PM-Core'); wb.created = new Date();
+  const ws = wb.addWorksheet('匯入範例', { views: [{ state: 'frozen', ySplit: 1 }] });
+  hdrRow(ws, specs.map(sp => sp.header + (req.has(sp.key) ? ' *' : '')), specs.length);
+  const exRow = ws.addRow(specs.map(sp => sp.sample != null ? sp.sample : '')); box(exRow, specs.length);
+  exRow.eachCell(c => { c.font = FD; c.alignment = AL; });
+  const note = ws.addRow(['↑ 第一列為表頭（* ＝必要欄，不可空）；第二列起填資料。欄位順序不限，表頭名稱可用「欄位說明」頁的任一別名。']);
+  ws.mergeCells(note.number, 1, note.number, Math.max(1, specs.length)); note.getCell(1).font = FMEMO; note.getCell(1).alignment = AL;
+  specs.forEach((sp, i) => { ws.getColumn(i + 1).width = Math.max(12, (String(sp.header || '').length) * 2 + 6); });
+  const ws2 = wb.addWorksheet('欄位說明');
+  hdrRow(ws2, ['系統欄位', '必要', '說明', '可接受的表頭名稱（別名）'], 4);
+  specs.forEach(sp => {
+    const r = ws2.addRow([sp.header, req.has(sp.key) ? '必要' : '選填', sp.tip || '', [sp.header].concat(sp.aliases || []).join('、')]);
+    box(r, 4); r.getCell(1).font = FSUB; [2, 3, 4].forEach(i => { r.getCell(i).font = FD; r.getCell(i).alignment = AL; });
+    if (req.has(sp.key)) fill(r.getCell(2), CREAM);
+  });
+  [16, 8, 44, 40].forEach((w, i) => { ws2.getColumn(i + 1).width = w; });   // 用 getColumn 設寬（ws.columns=[] 在 addRow 後會清列資料）
+  await App._xlDownload(wb, String(title || '匯入').replace(/[\\\/:\*\?"<>\|]/g, '') + '_範例_' + D.fmt(new Date(), 'ymd').replace(/\//g, '') + '.xlsx');
+};
+// 各匯入器「下載範例」捷徑（inline onclick 取不到 module-scope *_COLUMNS，包一層 App 方法；閉包捕捉常數·順序無關）
+App.downloadWbsSample = function() { App.exportImportSample(WBS_COLUMNS, WBS_REQUIRED_KEYS, 'WBS任務清單'); };
+
+// 差異比對：舊/新 rows（key=品號）→ bomRows（§19.2 schema）。factor＝報價幣→基準幣換算倍率。
+// 分類：只在新=add／只在舊=del／同料 量或價變=rev（改量）／同料同量只價變=priceOnly。
+// 換料 A→B 無法自動判定（吃 del+add），可於進版區手動建替代行合併。無單價模式 price 一律 0、不會落 priceOnly。
+function bomDiffRows(oldRows, newRows, factor) {
+  const f = factor || 1;
+  const norm = s => String(s || '').trim().toUpperCase();
+  const map = rows => { const m = {}; rows.forEach(r => { const k = norm(r.partNo); if (!m[k]) m[k] = r; }); return m; };
+  const O = map(oldRows), N = map(newRows);
+  const px = v => v == null ? 0 : Math.round(v * f * 10000) / 10000;
+  const out = [];
+  const mk = (kind, o, n) => ({ id: U.id(), changeKind: kind, partNoA: (o || n).partNo, replacePartNoB: '',
+    partName: ((o || n).partName || ''),   // 保留品名供豪華多機種匯出明細顯示（Wave3）
+    oldPrice: o ? px(o.price) : 0, oldQty: o ? o.qty : 0, newPrice: n ? px(n.price) : 0, newQty: n ? n.qty : 0,
+    switchMode: 'running', stockQty: 0, includeInTarget: true, approveStatus: '' });
+  Object.keys(N).forEach(k => { if (!O[k]) out.push(mk('add', null, N[k])); });
+  Object.keys(O).forEach(k => { if (!N[k]) out.push(mk('del', O[k], null)); });
+  Object.keys(O).forEach(k => {
+    const o = O[k], n = N[k]; if (!n) return;
+    const qtyDiff = Math.abs((o.qty || 0) - (n.qty || 0)) > 1e-9;
+    const pKnown = o.price != null && n.price != null;
+    const priceDiff = pKnown && Math.abs(o.price - n.price) > 1e-9;
+    if (qtyDiff) out.push(mk('rev', o, n));
+    else if (priceDiff) out.push(mk('priceOnly', o, n));
+  });
+  return { rows: out, oldCount: oldRows.length, newCount: newRows.length };
+}
+
+// ─── §19.6 波3：BOM·ROI 匯出（雙 sheet＋錨點插列＋欄位子集＋公式）───
+// 填色 ARGB 對照 style.css :root --xl-bom-*（同 GANTT_FILL 慣例，hex 集中管理）
+const BOM_XL_FILL = {
+  old: 'FFE0DCD0',   // --xl-bom-old 舊料列(灰)
+  new: 'FFF6E8B8',   // --xl-bom-new 新料列(黃)
+};
+// 0-based 欄 index → Excel 欄字母（0→A、26→AA）
+function xlCol(i) { let s = ''; i = i + 1; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = (i - m - 1) / 26; } return s; }
+// 對照模式（模式A）輸出計畫：以舊版全表為底——rev 舊列灰+新列黃插下方、del 灰、
+// add 錨點＝新版中該料上方最近一個「舊版也有」的料號（=同階既有料之後，照新版 BOM 原序·不擅自搬位置，Paul 2026-07-04）；無錨→表尾「新增(未定位)」。
+// 階次欄（lvlOld/lvlNew）不改位置、只帶 level 供匯出時料號欄縮排顯示層級（Paul：按階層顯示但不脫離原位置）。
+// 回傳 [{src, row, fill, tag, level}]（row=grid 資料列 index 1 起·grid[0]=表頭；level=該列階次值供縮排，null=無階次欄）
+function bomPlanCompare(oldG, newG, pIdxOld, pIdxNew, diffByPart, lvlOld, lvlNew) {
+  const norm = v => String(v == null ? '' : v).trim().toUpperCase();
+  const lvOf = (g, i, li) => { if (li == null) return null; const n = parseFloat((g[i] || [])[li]); return isNaN(n) ? null : n; };
+  const newRowByPart = {};
+  for (let i = 1; i < newG.length; i++) { const k = norm((newG[i] || [])[pIdxNew]); if (k && newRowByPart[k] == null) newRowByPart[k] = i; }
+  const oldParts = new Set();
+  for (let i = 1; i < oldG.length; i++) { const k = norm((oldG[i] || [])[pIdxOld]); if (k) oldParts.add(k); }
+  // 掃新版：每個 add 料錨到上方最近共同料號（=保留新版原序、同階既有料之後）
+  const addsByAnchor = {}, addsOrphan = [], seenAdd = new Set();
+  let lastCommon = null;
+  for (let i = 1; i < newG.length; i++) {
+    const k = norm((newG[i] || [])[pIdxNew]); if (!k) continue;
+    if (oldParts.has(k)) { lastCommon = k; continue; }
+    const d = diffByPart[k];
+    if (d && d.changeKind === 'add' && !seenAdd.has(k)) {
+      seenAdd.add(k);
+      if (lastCommon) (addsByAnchor[lastCommon] = addsByAnchor[lastCommon] || []).push(i);
+      else addsOrphan.push(i);
+    }
+  }
+  const plan = [];
+  const usedAnchor = new Set();
+  const push = (src, row, fill, tag) => plan.push({ src, row, fill, tag, level: src === 'old' ? lvOf(oldG, row, lvlOld) : lvOf(newG, row, lvlNew) });
+  for (let i = 1; i < oldG.length; i++) {
+    const k = norm((oldG[i] || [])[pIdxOld]);
+    const d = k ? diffByPart[k] : null;
+    if (d && d.changeKind === 'del') push('old', i, 'old', '刪除');
+    else if (d && d.changeKind === 'rev') {
+      push('old', i, 'old', '改量/換料·舊');
+      const nk = norm(d.replacePartNoB || d.partNoA);
+      const nr = newRowByPart[nk];
+      if (nr != null) push('new', nr, 'new', '改量/換料·新');
+    } else if (d && d.changeKind === 'priceOnly') push('old', i, null, '採購價差');
+    else push('old', i, null, '');
+    if (k && addsByAnchor[k] && !usedAnchor.has(k)) {   // 錨點料號重複出現時只插第一次，避免重複插列
+      usedAnchor.add(k);
+      addsByAnchor[k].forEach(nr => push('new', nr, 'new', '新增'));
+    }
+  }
+  addsOrphan.forEach(nr => push('new', nr, 'new', '新增(未定位)'));
+  return plan;
+}
+// 替換模式（模式B）：以新版全表為底，add/rev 新列黃、priceOnly 註記、舊料不顯示（新表本身即樹狀·帶 level 供縮排）
+function bomPlanReplace(newG, pIdxNew, diffByPart, lvlNew) {
+  const norm = v => String(v == null ? '' : v).trim().toUpperCase();
+  const lvOf = (i) => { if (lvlNew == null) return null; const n = parseFloat((newG[i] || [])[lvlNew]); return isNaN(n) ? null : n; };
+  const revNewParts = {};
+  Object.keys(diffByPart).forEach(k => { const d = diffByPart[k]; if (d.changeKind === 'rev') revNewParts[norm(d.replacePartNoB || d.partNoA)] = true; });
+  const plan = [];
+  const push = (fill, i, tag) => plan.push({ src: 'new', row: i, fill, tag, level: lvOf(i) });
+  for (let i = 1; i < newG.length; i++) {
+    const k = norm((newG[i] || [])[pIdxNew]);
+    const d = k ? diffByPart[k] : null;
+    if (d && d.changeKind === 'add') push('new', i, '新增');
+    else if (revNewParts[k]) push('new', i, '改量/換料');
+    else if (d && d.changeKind === 'priceOnly') push(null, i, '採購價差');
+    else push(null, i, '');
+  }
+  return plan;
+}
+// 匯出主體：Sheet「BOM」（完整表·標色·欄位子集）＋Sheet「ROI」（四類彙整·公式全串·改數字自動重算）
+async function exportBomRoi(proj, opts) {
+  if (typeof ExcelJS === 'undefined') { U.toast('❌ ExcelJS 函式庫未載入，請重新整理頁面', 'error'); return; }
+  const bs = proj.bomSheets;
+  if (!bs || !bs.new || !bs.old) { U.toast('⚠ 尚無完整 BOM 資料——先匯入舊/新版並差異比對', 'warning'); return; }
+  const mode = opts.mode || 'compare';
+  const colIdx = (opts.colIdx && opts.colIdx.length) ? opts.colIdx : bs.new.grid[0].map((_, i) => i);
+  const norm = v => String(v == null ? '' : v).trim().toUpperCase();
+  const diffByPart = {};
+  (proj.bomRows || []).forEach(r => { const k = norm(r.partNoA); if (k && !diffByPart[k]) diffByPart[k] = r; });
+  // 字體/色＝共用豪華標準格式（§13.8）；FONT/FONT_BOLD/FONT_MEMO 沿用舊名對應標準字角色，減少churn
+  const H = App._xlHouse();
+  const { fill, box, AC, AL, AR, FHD, HDR, LTBLUE, CREAM, GOLD, titleRow, hdrRow } = H;
+  const FONT = H.FD, FONT_BOLD = H.FSUB, FONT_MEMO = H.FMEMO;
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = DATA.settings.userName || CFG('APP_NAME', 'PM-Core');
+  workbook.created = new Date();
+
+  // ── 共用欄位解析（三頁共用）：舊/新兩檔欄位配置可能不同——舊來源列「按表頭文字」轉譯到舊表 index、料號欄用 partNoIdx 釘住 ──
+  const base = proj.bomBaseCurrency || 'NTD';
+  const C = App._bomCalc(proj);
+  const WT = App._bomWholeTotals(proj);   // 整機葉節點加總（供 Sheet 1/3 金額加總；needWizard 時退每台差額）
+  const headSrc = bs.new.grid[0];
+  const headOld = bs.old.grid[0] || [];
+  const oldIdxByHead = {};
+  headOld.forEach((h, i) => { const k = norm(h); if (k && oldIdxByHead[k] == null) oldIdxByHead[k] = i; });
+  const colIdxOld = colIdx.map(i => i === bs.new.partNoIdx ? bs.old.partNoIdx
+    : (norm(headSrc[i]) && oldIdxByHead[norm(headSrc[i])] != null ? oldIdxByHead[norm(headSrc[i])] : -1));
+  const pickCells = (srcRow, fromOld) => (fromOld ? colIdxOld : colIdx).map(i => (i != null && i >= 0 && srcRow[i] != null) ? srcRow[i] : '');
+
+  // ── 三頁架構（由大到小：結論 → 差異 → 完整清單，Paul 2026-07-04）──
+  // 先建前兩頁（總覽頁公式跨頁引用明細頁小計，故明細頁先填、總覽頁後填）
+  const ws1 = workbook.addWorksheet('總覽與效益評估', { views: [{ state: 'frozen', ySplit: 1 }] });
+  const ws2 = workbook.addWorksheet('成本差異明細', { views: [{ state: 'frozen', ySplit: 1 }] });
+
+  // ── Sheet 2：成本差異明細（四類彙整＋公式，給 RD／採購核對）──
+  // 版面（Paul 2026-07-04）：'curated'＝系統建議，剔除來源重複數字欄（單價/用量/金額等），改用引擎算的成對欄（舊/新用量·舊/新單價並排），較好閱讀；
+  //                       'raw'＝維持原欄位、後方附加 ROI 欄（舊行為）。opts.diffLayout 預設 curated。
+  const diffLayout = opts.diffLayout === 'raw' ? 'raw' : 'curated';
+  // curated 剔除：偵測到的計價/用量欄（priceIdx/qtyIdx）＋表頭字面命中的重複數字欄（成對欄會取代它們，避免同名重複難讀）
+  const DROP_HEADS = new Set(['單價', '新單價', '舊單價', '材料金額', '金額', '成本', '小計', '標準用量', '用量', '舊用量', '新用量', '數量', '舊量', '新量', '價差',
+    'qty', 'price', 'unitprice', 'newprice', 'oldprice', 'cost', 'amount', 'subtotal'].map(impNorm));
+  const isDupNumCol = i => i === bs.new.priceIdx || i === bs.new.qtyIdx || DROP_HEADS.has(impNorm(headSrc[i]));
+  const idColsRaw = diffLayout === 'curated' ? colIdx.filter(i => !isDupNumCol(i)) : colIdx;
+  const idCols = idColsRaw.length ? idColsRaw : [bs.new.partNoIdx];   // 全剔除的保底：至少留料號欄
+  const idColsOld = idCols.map(i => i === bs.new.partNoIdx ? bs.old.partNoIdx
+    : (norm(headSrc[i]) && oldIdxByHead[norm(headSrc[i])] != null ? oldIdxByHead[norm(headSrc[i])] : -1));
+  const pickId = (srcRow, fromOld) => (fromOld ? idColsOld : idCols).map(i => (i != null && i >= 0 && srcRow[i] != null) ? srcRow[i] : '');
+  const LAYOUT = diffLayout === 'curated'
+    ? { heads: ['舊用量', '新用量', '舊單價', '新單價', '價差', '切換', '庫存', '呆滯', '納入'],
+        cells: r => [Number(r.oldQty) || 0, Number(r.newQty) || 0, Number(r.oldPrice) || 0, Number(r.newPrice) || 0, null, r.switchMode === 'immediately' ? '即刻' : '漸進', Number(r.stockQty) || 0, null, r.includeInTarget !== false ? '✓' : ''],
+        pos: { oldQ: 0, newQ: 1, oldP: 2, newP: 3, diff: 4, sw: 5, stk: 6, dead: 7, inc: 8 } }
+    : { heads: ['舊單價', '舊量', '新單價', '新量', '價差', '切換', '庫存', '呆滯', '納入'],
+        cells: r => [Number(r.oldPrice) || 0, Number(r.oldQty) || 0, Number(r.newPrice) || 0, Number(r.newQty) || 0, null, r.switchMode === 'immediately' ? '即刻' : '漸進', Number(r.stockQty) || 0, null, r.includeInTarget !== false ? '✓' : ''],
+        pos: { oldP: 0, oldQ: 1, newP: 2, newQ: 3, diff: 4, sw: 5, stk: 6, dead: 7, inc: 8 } };
+  const ORIG = idCols.length;                      // 識別欄數（ROI 成對區從第 ORIG+1 欄起）
+  const PS = LAYOUT.pos;
+  const colL = k => xlCol(ORIG + PS[k]);           // ROI 區某欄的 Excel 欄字母（xlCol 收 0-based）
+  const cInc = colL('inc');
+  const NC2 = ORIG + LAYOUT.heads.length;
+  titleRow(ws2, (proj.name || 'BOM') + ' — 成本差異明細（幣別 ' + base + '）', NC2);
+  const mrR = ws2.addRow(['成本差異明細（幣別 ' + base + '）：只列「有變動」的料，分四類彙整；' + (diffLayout === 'curated' ? '舊/新用量與單價成對並排，' : '') + '價差/呆滯/小計皆為公式，改黃色輸入格會自動重算。']);
+  ws2.mergeCells(mrR.number, 1, mrR.number, NC2);
+  const mr = mrR.getCell(1); mr.font = FONT_MEMO; mr.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+  const newRowByPart = {}, oldRowByPart = {};
+  for (let i = 1; i < bs.new.grid.length; i++) { const k = norm((bs.new.grid[i] || [])[bs.new.partNoIdx]); if (k && newRowByPart[k] == null) newRowByPart[k] = i; }
+  for (let i = 1; i < bs.old.grid.length; i++) { const k = norm((bs.old.grid[i] || [])[bs.old.partNoIdx]); if (k && oldRowByPart[k] == null) oldRowByPart[k] = i; }
+  const SECTIONS = [
+    { kind: 'add', name: '新增' }, { kind: 'del', name: '刪除' },
+    { kind: 'rev', name: '進版 · 改量/換料' }, { kind: 'priceOnly', name: '同料號價差 · 採購降價' },
+  ];
+  const subCells = {};        // kind → 小計 cell ref（供總覽頁跨頁引用）
+  const deadRanges = [];      // 呆滯欄各區範圍
+  SECTIONS.forEach(sec => {
+    const rows = (proj.bomRows || []).filter(r => r.changeKind === sec.kind);
+    if (!rows.length) return;
+    const tRow = ws2.addRow([sec.name + '（' + rows.length + ' 項）']);
+    ws2.mergeCells(tRow.number, 1, tRow.number, NC2);
+    tRow.getCell(1).font = FONT_BOLD; fill(tRow.getCell(1), LTBLUE);
+    const h = ws2.addRow(idCols.map(i => headSrc[i] != null ? toTrad(headSrc[i]) : '').concat(LAYOUT.heads));
+    h.eachCell(c => { c.font = FHD; fill(c, HDR); c.border = H.BOX; c.alignment = { wrapText: true, vertical: 'middle', horizontal: 'center' }; });
+    const first = h.number + 1;
+    rows.forEach(r => {
+      const kNew = norm(r.replacePartNoB || r.partNoA);
+      const gi = sec.kind === 'del' ? oldRowByPart[norm(r.partNoA)] : newRowByPart[kNew];
+      const g = sec.kind === 'del' ? bs.old.grid : bs.new.grid;
+      const srcRow = (gi != null ? g[gi] : null) || [];
+      const n = ws2.addRow(pickId(srcRow, sec.kind === 'del').concat(LAYOUT.cells(r)));
+      const rn = n.number;
+      n.getCell(ORIG + PS.diff + 1).value = { formula: colL('newP') + rn + '*' + colL('newQ') + rn + '-' + colL('oldP') + rn + '*' + colL('oldQ') + rn, result: App._bomDiff(r) };
+      n.getCell(ORIG + PS.dead + 1).value = { formula: 'IF(' + colL('sw') + rn + '="即刻",' + colL('stk') + rn + '*' + colL('oldP') + rn + ',0)', result: App._bomDead(r) };
+      n.eachCell({ includeEmpty: true }, c => { c.font = FONT; });
+      box(n, NC2);
+      [ORIG + PS.sw + 1, ORIG + PS.stk + 1].forEach(ci => fill(n.getCell(ci), BOM_XL_FILL.new));   // 切換/庫存＝可改的輸入格（黃）
+    });
+    const last = first + rows.length - 1;
+    const s = ws2.addRow([]);
+    s.getCell(ORIG + PS.diff).value = '小計（勾選納入）';
+    s.getCell(ORIG + PS.diff + 1).value = { formula: 'SUMIF(' + cInc + first + ':' + cInc + last + ',"✓",' + colL('diff') + first + ':' + colL('diff') + last + ')',
+      result: rows.filter(r => r.includeInTarget !== false).reduce((a, r) => a + App._bomDiff(r), 0) };
+    box(s, NC2); s.eachCell({ includeEmpty: true }, c => { c.font = FONT_BOLD; fill(c, CREAM); });
+    subCells[sec.kind] = colL('diff') + s.number;
+    deadRanges.push(colL('dead') + first + ':' + colL('dead') + last);
+    ws2.addRow([]);
+  });
+  // 全表最後金額加總＝每台目標成本差額（Σ 各區小計）＋幣別單位
+  const gt2 = ws2.addRow([]);
+  gt2.getCell(1).value = '總計 · 每台目標成本差額';
+  const subRefs = SECTIONS.map(s => subCells[s.kind]).filter(Boolean);
+  gt2.getCell(ORIG + PS.diff + 1).value = { formula: subRefs.length ? subRefs.join('+') : '0', result: C.target };
+  gt2.getCell(ORIG + PS.diff + 2).value = base + ' / 台';
+  box(gt2, NC2); gt2.eachCell({ includeEmpty: true }, c => { c.font = FONT_BOLD; fill(c, GOLD); });
+  gt2.getCell(ORIG + PS.diff + 2).font = FONT_MEMO;
+  ws2.columns = idCols.map(() => ({ width: 14 })).concat(LAYOUT.heads.map(() => ({ width: 11 })));
+
+  // ── Sheet 1：總覽與效益評估（結論頁，給主管/PM；數字跨頁引用明細頁小計公式）──
+  const S2 = "'成本差異明細'!";
+  titleRow(ws1, (proj.name || 'BOM') + ' — 總覽與效益評估（幣別 ' + base + '）', 3);
+  const m1R = ws1.addRow(['總覽與效益評估（幣別 ' + base + '）：本次設變的核心結論——每台成本差額與效益（ROI）。數字皆連動「成本差異明細」頁公式，改明細即自動更新。']);
+  ws1.mergeCells(m1R.number, 1, m1R.number, 3);
+  const m1 = m1R.getCell(1); m1.font = FONT_MEMO; m1.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+  ws1.addRow([]);
+  const sum = (label, value, bold, unit) => { const r = ws1.addRow([label]); r.getCell(2).value = value;
+    if (unit) { r.getCell(3).value = unit; r.getCell(3).font = FONT_MEMO; }
+    r.getCell(1).font = bold ? FONT_BOLD : FONT; r.getCell(2).font = bold ? FONT_BOLD : FONT;
+    if (bold) { fill(r.getCell(1), LTBLUE); fill(r.getCell(2), LTBLUE); }   // 粗體＝小結/總計列，淺藍帶區隔
+    return r.number; };
+  const perU = base + ' / 台';
+  const zoneRef = k => subCells[k] ? (S2 + subCells[k]) : '0';   // 跨頁引用明細小計，無該區＝0
+  const rChg = sum('設變成本差額', { formula: [zoneRef('add'), zoneRef('del'), zoneRef('rev')].join('+'), result: C.chg }, false, perU);
+  const rBuy = sum('採購降價', { formula: zoneRef('priceOnly'), result: C.buy }, false, perU);
+  const rTarget = sum('每台目標成本差額', { formula: 'B' + rChg + '+B' + rBuy, result: C.target }, true, perU);
+  ws1.addRow([]);
+  const rVol = sum('年產台數（可改）', proj.annualVolume || 0, false, '台');
+  const rYrs = sum('評估年限（可改）', proj.evalYears || 0, false, '年');
+  const rMold = sum('一次性 · 模具（可改）', (proj.oneTimeCost || {}).mold || 0, false, base);
+  const rCert = sum('一次性 · 認證（可改）', (proj.oneTimeCost || {}).cert || 0, false, base);
+  const rDead = sum('一次性 · 呆滯（自動）', deadRanges.length ? { formula: 'SUM(' + deadRanges.map(x => S2 + x).join(',') + ')', result: C.dead } : 0, false, base);
+  const rOne = sum('一次性合計', { formula: 'B' + rMold + '+B' + rCert + '+B' + rDead, result: C.oneTime }, true, base);
+  [rVol, rYrs, rMold, rCert].forEach(rn => fill(ws1.getCell(rn, 2), BOM_XL_FILL.new));   // 可改輸入格標黃
+  ws1.addRow([]);
+  if (proj.roiType === 'forced') {
+    sum('合規/變更總代價（' + (proj.evalYears || 0) + ' 年）', { formula: 'B' + rTarget + '*B' + rVol + '*B' + rYrs + '+B' + rOne, result: C.forcedCost }, true, base);
+  } else {
+    const rBen = sum('年效益', { formula: '-B' + rTarget + '*B' + rVol, result: C.annual }, true, base + ' / 年');
+    sum('回本期（月）', { formula: 'IF(B' + rBen + '>0,B' + rOne + '/(B' + rBen + '/12),"—")', result: C.payback != null ? Math.round(C.payback * 100) / 100 : '—' }, false, '月');
+    sum(String(proj.evalYears || 0) + ' 年淨效益', { formula: 'B' + rBen + '*B' + rYrs + '-B' + rOne, result: C.netN }, true, base);
+  }
+  ws1.addRow([]);
+  if (WT && WT.ok) {   // 整機總額對照（完整 BOM 葉節點加總）＋幣別
+    sum('舊版整機總額（葉節點加總）', Math.round(WT.oldTotal), false, base);
+    sum('新版整機總額（葉節點加總）', Math.round(WT.newTotal), false, base);
+    sum('整機價差（新版−舊版）', Math.round(WT.delta), true, base);
+  }
+  ws1.getColumn(1).width = 30; ws1.getColumn(2).width = 18; ws1.getColumn(3).width = 10;
+
+  // ── Sheet 3：設變對照 BOM（完整清單，給工廠/ERP 建檔）──
+  const wsB = workbook.addWorksheet('設變對照 BOM', { views: [{ state: 'frozen', ySplit: 3 }] });
+  const nColsB = colIdx.length + 1;
+  const hasLvlB = (bs.new.levelIdx != null) || (bs.old.levelIdx != null);
+  titleRow(wsB, (proj.name || 'BOM') + ' — 設變對照 BOM（' + (mode === 'compare' ? '對照' : '替換') + '模式）', nColsB);
+  const memoB = mode === 'compare'
+    ? '對照模式：灰底＝舊料（將刪除/被替換）、黃底＝新料（新增/替換後）' + (hasLvlB ? '，料號欄依「階次」欄縮排顯示層級（位置照新版 BOM 原序·排在同階既有料之後，不擅自搬位置）' : '，新料緊貼其所屬位置插入') + '，請自行比對；未變更列原樣保留。'
+    : '替換模式：以設變後 BOM 為準，黃底＝本次新增/替換的料，舊料不顯示' + (hasLvlB ? '·料號欄依階次縮排' : '') + '。';
+  const mcR = wsB.addRow([memoB]);
+  wsB.mergeCells(mcR.number, 1, mcR.number, nColsB);
+  const mc = mcR.getCell(1); mc.font = FONT_MEMO; mc.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+  const headRowB = wsB.addRow(['註記'].concat(colIdx.map(i => headSrc[i] != null ? toTrad(headSrc[i]) : '')));   // 表頭轉繁（資料格保留原文）
+  headRowB.eachCell(c => { c.font = FHD; fill(c, HDR); c.border = H.BOX; c.alignment = { wrapText: true, vertical: 'middle', horizontal: 'center' }; });
+  const plan = mode === 'compare'
+    ? bomPlanCompare(bs.old.grid, bs.new.grid, bs.old.partNoIdx, bs.new.partNoIdx, diffByPart, bs.old.levelIdx, bs.new.levelIdx)
+    : bomPlanReplace(bs.new.grid, bs.new.partNoIdx, diffByPart, bs.new.levelIdx);
+  const pnOutCol = colIdx.indexOf(bs.new.partNoIdx);   // 料號欄在輸出中的位置（-1＝沒勾）；輸出欄＝1(註記)+colIdx 序
+  plan.forEach(p => {
+    const g = p.src === 'old' ? bs.old.grid : bs.new.grid;
+    const srcRow = g[p.row] || [];
+    const row = wsB.addRow([p.tag].concat(pickCells(srcRow, p.src === 'old')));
+    row.eachCell({ includeEmpty: true }, c => { c.font = FONT; if (p.fill) fill(c, BOM_XL_FILL[p.fill]); });
+    box(row, nColsB);
+    if (p.level != null && p.level > 0 && pnOutCol >= 0) {   // 依階次縮排料號欄→樹狀視覺
+      const cell = row.getCell(pnOutCol + 2);
+      cell.alignment = Object.assign({}, cell.alignment, { indent: Math.min(Math.round(p.level), 8) });
+    }
+  });
+  // 全表最後金額加總＝整機總額（完整 BOM 葉節點加總）＋幣別單位；判不出葉節點基準時退每台目標成本差額
+  wsB.addRow([]);
+  const wtFoot = (label, val, bold) => { const r = wsB.addRow([label]); r.getCell(2).value = Math.round(val); r.getCell(3).value = base;
+    r.getCell(1).font = bold ? FONT_BOLD : FONT; r.getCell(2).font = bold ? FONT_BOLD : FONT; r.getCell(3).font = FONT_MEMO; };
+  if (WT && WT.ok) {
+    wtFoot('舊版整機總額（葉節點加總）', WT.oldTotal);
+    wtFoot('新版整機總額（葉節點加總）', WT.newTotal);
+    wtFoot('整機價差（新版−舊版）', WT.delta, true);
+  } else {
+    wtFoot('每台目標成本差額（整機葉節點基準未設定，見 BOM 頁「調整計算基準」）', C.target, true);
+  }
+  wsB.columns = [{ width: 14 }].concat(colIdx.map(() => ({ width: 14 })));
+
+  const dateStr = D.fmt(new Date(), 'ymd').replace(/\//g, '');
+  const filename = (proj.name || 'BOM') + '_BOM-ROI_' + dateStr + '.xlsx';
+  await App._xlDownload(workbook, filename);
+}
+App.exportBomRoi = exportBomRoi;
+
+// ─── §19.6 泛化 NPI · Wave3：豪華多機種比較匯出（比照參考檔）───
+// 三頁：①型號比較總表（整機成本對比＋料件變動彙整）②各機種差異明細（刪除/新增/價格異動三區＋小計＋淨變動）③換料對照（刪除↔新增）
+async function exportBomModels(proj) {
+  if (typeof ExcelJS === 'undefined') { U.toast('❌ ExcelJS 函式庫未載入，請重新整理頁面', 'error'); return; }
+  const models = proj.bomModels || [];
+  if (!models.length) { U.toast('⚠ 尚無多機種資料——先「全機種自動比對」', 'warning'); return; }
+  const base = proj.bomBaseCurrency || 'NTD';
+  const wb = new ExcelJS.Workbook();
+  wb.creator = DATA.settings.userName || CFG('APP_NAME', 'PM-Core'); wb.created = new Date();
+  // 配色/字體＝共用豪華標準格式（§13.8 App._xlHouse）；diffOf/cat 為本支專屬
+  const H = App._xlHouse();
+  const { NAVY, BLUE, LTBLUE, HDR, CREAM, GOLD, WHITE, GREEN, RED, GREY,
+    FT, FHD, FZ, FM, FD, FDG, FDR, FSUB, FMEMO,
+    fill, BOX, box, AC, AL, AR, MONEY, signFont, titleRow, hdrRow } = H;
+  const diffOf = r => (Number(r.newPrice) || 0) * (Number(r.newQty) || 0) - (Number(r.oldPrice) || 0) * (Number(r.oldQty) || 0);
+  const cat = m => { const rows = m.bomRows || []; return { del: rows.filter(r => r.changeKind === 'del'), add: rows.filter(r => r.changeKind === 'add'), chg: rows.filter(r => r.changeKind === 'rev' || r.changeKind === 'priceOnly') }; };
+
+  // ═══ Sheet 1：型號比較總表 ═══
+  const NC1 = 6, ws1 = wb.addWorksheet('型號比較總表', { views: [{ state: 'frozen', ySplit: 1 }] });
+  titleRow(ws1, (proj.name || 'BOM') + ' — 型號成本比較總表（幣別 ' + base + '）', NC1);
+  ws1.addRow([]);
+  const s1a = ws1.addRow(['【一】整機成本對比']); s1a.getCell(1).font = FZ; ws1.mergeCells(s1a.number, 1, s1a.number, NC1);
+  hdrRow(ws1, ['機種', '舊整機總額', '新整機總額', '整機價差', '降幅', '差異料筆數'], NC1);
+  const sumRow1 = (label, vals, fillArgb) => {   // vals=[old,new,delta,drop,cnt]
+    const r = ws1.addRow([label, vals[0], vals[1], vals[2], vals[3], vals[4]]); box(r, NC1);
+    r.getCell(1).font = fillArgb ? FSUB : FSUB; fill(r.getCell(1), fillArgb || LTBLUE); r.getCell(1).alignment = AC;
+    [2, 3, 4].forEach(i => { r.getCell(i).numFmt = MONEY; r.getCell(i).font = fillArgb ? FSUB : FD; r.getCell(i).alignment = AR; if (fillArgb) fill(r.getCell(i), fillArgb); });
+    r.getCell(5).numFmt = '0.0%'; r.getCell(5).font = fillArgb ? FSUB : FD; r.getCell(5).alignment = AR; if (fillArgb) fill(r.getCell(5), fillArgb);
+    r.getCell(6).font = fillArgb ? FSUB : FD; r.getCell(6).alignment = AC; if (fillArgb) fill(r.getCell(6), fillArgb);
+  };
+  let to = 0, tn = 0;
+  models.forEach(m => { const delta = (m.oldTotal != null && m.newTotal != null) ? (m.newTotal - m.oldTotal) : null; to += (m.oldTotal || 0); tn += (m.newTotal || 0);
+    sumRow1(m.name, [m.oldTotal, m.newTotal, delta, (m.oldTotal && delta != null) ? (-delta / m.oldTotal) : null, (m.bomRows || []).length]); });
+  sumRow1('合計', [to, tn, tn - to, to ? (-(tn - to) / to) : null, ''], GOLD);
+  ws1.addRow([]);
+  const s1b = ws1.addRow(['【二】料件變動明細彙整（各機種 刪除／新增／價格異動 小計）']); s1b.getCell(1).font = FZ; ws1.mergeCells(s1b.number, 1, s1b.number, NC1);
+  hdrRow(ws1, ['機種', '刪除項目(舊料成本)', '新增項目(新料成本)', '價格異動(淨)', '料件淨變動', '整機價差'], NC1);
+  models.forEach(m => {
+    const g = cat(m);
+    const delSum = g.del.reduce((a, r) => a + (Number(r.oldPrice) || 0) * (Number(r.oldQty) || 0), 0);
+    const addSum = g.add.reduce((a, r) => a + (Number(r.newPrice) || 0) * (Number(r.newQty) || 0), 0);
+    const chgSum = g.chg.reduce((a, r) => a + diffOf(r), 0);
+    const net = (m.bomRows || []).reduce((a, r) => a + diffOf(r), 0);
+    const mDelta = (m.oldTotal != null && m.newTotal != null) ? (m.newTotal - m.oldTotal) : null;
+    const r = ws1.addRow([m.name, -delSum, addSum, chgSum, net, mDelta]); box(r, NC1);
+    r.getCell(1).font = FSUB; fill(r.getCell(1), LTBLUE); r.getCell(1).alignment = AC;
+    [2, 3, 4, 5, 6].forEach(i => { r.getCell(i).numFmt = MONEY; r.getCell(i).font = FD; r.getCell(i).alignment = AR; });
+  });
+  ws1.columns = [{ width: 14 }, { width: 16 }, { width: 16 }, { width: 14 }, { width: 10 }, { width: 12 }];
+
+  // ═══ Sheet 2：各機種差異明細 ═══
+  const NC2 = 7, ws2 = wb.addWorksheet('各機種差異明細', { views: [{ state: 'frozen', ySplit: 1 }] });
+  titleRow(ws2, (proj.name || 'BOM') + ' — 各機種料件差異明細（幣別 ' + base + '）·刪除／新增／價格異動', NC2);
+  // 一區三態通用：data 列上框線＋#置中/文字左/數字右；金額字色 amtFont（null=依號誌）
+  const detailRows = (list, heads, cell) => {
+    hdrRow(ws2, heads, NC2);
+    let sub = 0;
+    list.forEach((r, i) => { const v = cell(r); sub += v.subAdd;
+      const rr = ws2.addRow(v.cells); box(rr, NC2);
+      rr.getCell(1).value = i + 1; rr.getCell(1).font = FD; rr.getCell(1).alignment = AC;
+      rr.getCell(2).font = FD; rr.getCell(2).alignment = AL; rr.getCell(3).font = FD; rr.getCell(3).alignment = AL;
+      v.numCols.forEach(nc => { rr.getCell(nc.i).numFmt = MONEY; rr.getCell(nc.i).font = nc.font || FD; rr.getCell(nc.i).alignment = AR; });
+      v.qtyCol && (rr.getCell(v.qtyCol).font = FD, rr.getCell(v.qtyCol).alignment = AR);
+    });
+    return sub;
+  };
+  models.forEach(m => {
+    ws2.addRow([]);
+    const mh = ws2.addRow(['■ ' + m.name + (m.matched ? '' : '（未配對）')]); mh.getCell(1).font = FM; fill(mh.getCell(1), BLUE); mh.getCell(1).alignment = AL; ws2.mergeCells(mh.number, 1, mh.number, NC2);
+    const g = cat(m);
+    const subLine = (col, val) => { const st = ws2.addRow([]); box(st, NC2); st.getCell(2).value = '小計'; st.getCell(2).font = FSUB; st.getCell(2).alignment = AR; st.getCell(col).value = val; st.getCell(col).font = FSUB; st.getCell(col).numFmt = MONEY; st.getCell(col).alignment = AR; for (let i = 1; i <= NC2; i++) fill(st.getCell(i), CREAM); };
+    // ▼ 刪除
+    (function () { const z = ws2.addRow(['▼ 刪除項目（舊版有、新版拿掉）']); z.getCell(1).font = FZ; fill(z.getCell(1), LTBLUE); ws2.mergeCells(z.number, 1, z.number, NC2);
+      const s = detailRows(g.del, ['#', '品號', '品名', '舊單價', '用量', '金額', '備註'], r => { const amt = (Number(r.oldPrice) || 0) * (Number(r.oldQty) || 0); return { cells: [null, r.partNoA, r.partName || '', Number(r.oldPrice) || 0, Number(r.oldQty) || 0, amt, ''], numCols: [{ i: 4 }, { i: 6, font: FDG }], qtyCol: 5, subAdd: amt }; });
+      subLine(6, s); })();
+    // ▼ 新增
+    (function () { const z = ws2.addRow(['▼ 新增項目（新版有、舊版沒有）']); z.getCell(1).font = FZ; fill(z.getCell(1), LTBLUE); ws2.mergeCells(z.number, 1, z.number, NC2);
+      const s = detailRows(g.add, ['#', '品號', '品名', '新單價', '用量', '金額', '備註'], r => { const amt = (Number(r.newPrice) || 0) * (Number(r.newQty) || 0); return { cells: [null, r.partNoA, r.partName || '', Number(r.newPrice) || 0, Number(r.newQty) || 0, amt, ''], numCols: [{ i: 4 }, { i: 6, font: FDR }], qtyCol: 5, subAdd: amt }; });
+      subLine(6, s); })();
+    // ▼ 價格異動
+    (function () { const z = ws2.addRow(['▼ 價格異動（兩版都有·單價或用量不同）']); z.getCell(1).font = FZ; fill(z.getCell(1), LTBLUE); ws2.mergeCells(z.number, 1, z.number, NC2);
+      const s = detailRows(g.chg, ['#', '品號', '品名', '舊單價', '新單價', '用量', '價差'], r => { const d = diffOf(r); return { cells: [null, r.partNoA, r.partName || '', Number(r.oldPrice) || 0, Number(r.newPrice) || 0, Number(r.newQty) || 0, d], numCols: [{ i: 4 }, { i: 5 }, { i: 7, font: signFont(d) }], qtyCol: 6, subAdd: d }; });
+      subLine(7, s); })();
+    const net = (m.bomRows || []).reduce((a, r) => a + diffOf(r), 0);
+    const nt = ws2.addRow(['【' + m.name + ' 料件淨變動 = 新−舊】']); box(nt, NC2); nt.getCell(1).font = FSUB; nt.getCell(7).value = net; nt.getCell(7).numFmt = MONEY; nt.getCell(7).font = FSUB; nt.getCell(7).alignment = AR; for (let i = 1; i <= NC2; i++) fill(nt.getCell(i), LTBLUE); ws2.mergeCells(nt.number, 1, nt.number, 6);
+  });
+  ws2.columns = [{ width: 5 }, { width: 18 }, { width: 34 }, { width: 12 }, { width: 12 }, { width: 10 }, { width: 12 }];
+
+  // ═══ Sheet 3：換料對照 ═══
+  const NC3 = 6, ws3 = wb.addWorksheet('換料對照', { views: [{ state: 'frozen', ySplit: 1 }] });
+  titleRow(ws3, (proj.name || 'BOM') + ' — 換料對照（各機種 刪除料 ↔ 新增料·抵銷差額）', NC3);
+  const note3 = ws3.addRow(['※ 刪除／新增依比對自動列出，左右按序對照（非語意 1:1 配對，換料語意請人工核對）']); note3.getCell(1).font = FMEMO; ws3.mergeCells(note3.number, 1, note3.number, NC3);
+  models.forEach(m => {
+    const g = cat(m); if (!g.del.length && !g.add.length) return;
+    ws3.addRow([]);
+    const mh = ws3.addRow(['■ ' + m.name]); mh.getCell(1).font = FM; fill(mh.getCell(1), BLUE); mh.getCell(1).alignment = AL; ws3.mergeCells(mh.number, 1, mh.number, NC3);
+    hdrRow(ws3, ['舊版刪除料', '舊金額', '→', '新版新增料', '新金額', ''], NC3);
+    const n = Math.max(g.del.length, g.add.length); let ds = 0, as = 0;
+    for (let i = 0; i < n; i++) {
+      const d = g.del[i], a = g.add[i];
+      const da = d ? (Number(d.oldPrice) || 0) * (Number(d.oldQty) || 0) : null, aa = a ? (Number(a.newPrice) || 0) * (Number(a.newQty) || 0) : null;
+      if (da) ds += da; if (aa) as += aa;
+      const rr = ws3.addRow([d ? (d.partNoA + ' ' + (d.partName || '')) : '', da, '→', a ? (a.partNoA + ' ' + (a.partName || '')) : '', aa, '']); box(rr, NC3);
+      rr.getCell(1).font = FD; rr.getCell(1).alignment = AL; rr.getCell(2).numFmt = MONEY; rr.getCell(2).font = FDG; rr.getCell(2).alignment = AR;
+      rr.getCell(3).alignment = AC; rr.getCell(4).font = FD; rr.getCell(4).alignment = AL; rr.getCell(5).numFmt = MONEY; rr.getCell(5).font = FDR; rr.getCell(5).alignment = AR;
+    }
+    const st = ws3.addRow(['小計（抵銷後差額 = 新增−刪除）', ds, '→', '', as, as - ds]); box(st, NC3); for (let i = 1; i <= NC3; i++) { const c = st.getCell(i); c.font = FSUB; fill(c, CREAM); }
+    [2, 5].forEach(i => { st.getCell(i).numFmt = MONEY; st.getCell(i).alignment = AR; }); st.getCell(6).numFmt = MONEY; st.getCell(6).alignment = AR; st.getCell(6).font = { name: '新細明體', size: 10, bold: true, color: { argb: (as - ds) < 0 ? GREEN : RED } };
+  });
+  ws3.columns = [{ width: 32 }, { width: 12 }, { width: 5 }, { width: 32 }, { width: 12 }, { width: 12 }];
+
+  const dateStr = D.fmt(new Date(), 'ymd').replace(/\//g, '');
+  const filename = (proj.name || 'BOM') + '_多機種比較_' + dateStr + '.xlsx';
+  await App._xlDownload(wb, filename);
+}
+App.exportBomModels = exportBomModels;
+
+// ═══ 檔2：各機種完整 BOM（Paul 2026-07-08 定·ECN/NPI 共用）═══
+// 每機種一張分頁＝設變後完整 BOM：保留原始全欄位(繁化)·以舊料階層為底套新資料·
+// 變更(升版/改量/改價/換料)原位標黃·全新料無舊階層可循→置底標橘(待人工定位)·刪除料不顯示。
+// 金額欄只掛「葉節點」列公式(用量×單價)→ SUM=整機成本(不重複計階層·共用 _bomWholeMachine outLeaf)；
+// 末尾三列：新版總額(SUM 公式)·舊版總額(數字)·總價差(新−舊 公式)。檔1 三頁分析匯出不動。
+async function exportBomModelsFullBom(proj) {
+  if (typeof ExcelJS === 'undefined') { U.toast('❌ ExcelJS 函式庫未載入，請重新整理頁面', 'error'); return; }
+  const models = (proj.bomModels || []).filter(m => m.bomSheets && m.bomSheets.new && m.bomSheets.new.grid && m.bomSheets.new.grid.length > 1);
+  if (!models.length) { U.toast('⚠ 尚無可匯出的完整 BOM——請先「全機種自動比對」；大檔請於比對後當場匯出（重整後需重匯）', 'warning'); return; }
+  const H = App._xlHouse();
+  const { NAVY, CREAM, FT, FD, FSUB, FMEMO, fill, box, BOX, AL, AR, MONEY, titleRow, hdrRow } = H;
+  const CHG = BOM_XL_FILL.new, ADD = 'FFF6C99A';   // 變更黃／全新橘
+  const curr = proj.bomQuoteCurrency || proj.bomBaseCurrency || 'NTD';
+  const method = proj.bomWholeMethod || null, wcols = proj.bomWholeCols || null;
+  const norm = v => String(v == null ? '' : v).trim().toUpperCase();
+  const num = v => { const x = parseFloat(v); return isNaN(x) ? 0 : x; };
+  const wb = new ExcelJS.Workbook();
+  wb.creator = DATA.settings.userName || CFG('APP_NAME', 'PM-Core'); wb.created = new Date();
+  const usedNames = {};
+  const sheetName = nm => { let s = String(nm || 'BOM').replace(/[\[\]\:\*\?\/\\]/g, '·').slice(0, 28) || 'BOM'; let k = s, i = 2; while (usedNames[k]) k = s.slice(0, 25) + '(' + (i++) + ')'; usedNames[k] = 1; return k; };
+
+  models.forEach(m => {
+    const bs = m.bomSheets, ng = bs.new.grid, og = (bs.old && bs.old.grid) || null;
+    const header = ng[0] || [];
+    const pIdx = bs.new.partNoIdx, qIdx = bs.new.qtyIdx, prIdx = bs.new.priceIdx;
+    const oPidx = og ? bs.old.partNoIdx : null;
+    const nCol = header.length, amtCol = nCol + 1, noteCol = nCol + 2, NC = nCol + 2;
+    const amtL = xlCol(amtCol - 1);   // 金額欄字母（xlCol 0-based）
+    // 葉節點（金額只掛葉節點·SUM=整機成本）；無階層可判→退全部有料號列
+    const leafArr = []; App._bomWholeMachine(bs.new, method, wcols, leafArr);
+    const leafSet = new Set(leafArr);
+    if (!leafArr.length) for (let i = 1; i < ng.length; i++) { if (ng[i] && String(ng[i][pIdx] == null ? '' : ng[i][pIdx]).trim()) leafSet.add(i); }
+    const diffByPart = {}; (m.bomRows || []).forEach(r => { const k = norm(r.partNoA); if (k && !diffByPart[k]) diffByPart[k] = r; });
+    const newRowByPart = {}; for (let i = 1; i < ng.length; i++) { const k = norm(ng[i][pIdx]); if (k && newRowByPart[k] == null) newRowByPart[k] = i; }
+
+    const ws = wb.addWorksheet(sheetName(m.name), { views: [{ state: 'frozen', ySplit: 4 }] });
+    titleRow(ws, m.name + '　設變後完整 BOM（幣別 ' + curr + '）', NC);
+    // 顏色圖例兩列（實色小方塊·寬度無關）
+    const legend = (argb, txt) => { const r = ws.addRow([]); r.height = 17; fill(r.getCell(1), argb); r.getCell(1).border = BOX; ws.mergeCells(r.number, 2, r.number, NC); const c = r.getCell(2); c.value = txt; c.font = { name: '新細明體', size: 9, color: { argb: 'FF6A5200' } }; c.alignment = AL; };
+    legend(CHG, '＝本次變更（升版／改量／改價／換料，舊值見備註）');
+    legend(ADD, '＝全新物料（系統無法判階層·預設置底·請自行定位）');
+    hdrRow(ws, header.map(h => toTrad(String(h == null ? '' : h))).concat(['金額', '備註']), NC);
+
+    const firstBody = ws.rowCount + 1;
+    let newLeafSum = 0;
+    const emitRow = (gi, fillArgb, note) => {
+      const src = ng[gi] || [];
+      const cells = [];
+      for (let c = 0; c < nCol; c++) { let v = src[c]; cells.push(typeof v === 'string' ? toTrad(v) : (v == null ? null : v)); }
+      cells.push(null, note || '');
+      const row = ws.addRow(cells); box(row, NC);
+      const n = row.number;
+      for (let i = 1; i <= nCol; i++) row.getCell(i).font = FD;
+      if (leafSet.has(gi) && prIdx != null) {
+        const pL = xlCol(prIdx), pv = num(src[prIdx]);
+        const qv = (qIdx != null) ? (src[qIdx] == null || src[qIdx] === '' ? 1 : num(src[qIdx])) : 1;
+        row.getCell(amtCol).value = { formula: (qIdx != null ? xlCol(qIdx) + n + '*' : '') + pL + n, result: Math.round(qv * pv * 100) / 100 };
+        row.getCell(amtCol).numFmt = MONEY; newLeafSum += qv * pv;
+      }
+      row.getCell(amtCol).alignment = AR;
+      row.getCell(noteCol).font = FMEMO; row.getCell(noteCol).alignment = AL;
+      if (fillArgb) for (let i = 1; i <= NC; i++) fill(row.getCell(i), fillArgb);
+    };
+
+    const emitted = new Set();
+    if (og) {
+      for (let i = 1; i < og.length; i++) {
+        const k = norm(og[i][oPidx]); if (!k) continue;
+        const d = diffByPart[k];
+        if (d && d.changeKind === 'del' && !d.replacePartNoB) continue;   // 刪除料不顯示
+        const newKey = (d && d.changeKind === 'rev' && d.replacePartNoB) ? norm(d.replacePartNoB) : k;
+        const nr = newRowByPart[newKey];
+        if (nr == null || emitted.has(newKey)) continue;
+        emitted.add(newKey);
+        let note = '', fl = null;
+        if (d && d.changeKind === 'rev' && d.replacePartNoB) { note = '升版·換料（舊料號 ' + d.partNoA + '）'; fl = CHG; }
+        else if (d && d.changeKind === 'rev') { note = '升版·改量（舊用量 ' + (d.oldQty != null ? d.oldQty : '?') + '）'; fl = CHG; }
+        else if (d && d.changeKind === 'priceOnly') { note = '升版·改價（舊單價 ' + (d.oldPrice != null ? d.oldPrice : '?') + '）'; fl = CHG; }
+        emitRow(nr, fl, note);
+      }
+    } else {   // 無舊版分頁（此機種全新）：整份新表照原序、不標色
+      for (let i = 1; i < ng.length; i++) { const k = norm(ng[i][pIdx]); if (!k) continue; emitted.add(k); emitRow(i, null, ''); }
+    }
+    // 全新料殿後（橘）
+    const orphans = [];
+    for (let i = 1; i < ng.length; i++) { const k = norm(ng[i][pIdx]); if (k && !emitted.has(k)) { emitted.add(k); orphans.push(i); } }
+    if (orphans.length) {
+      const sep = ws.addRow([]); ws.mergeCells(sep.number, 1, sep.number, NC);
+      sep.getCell(1).value = '↓↓ 全新物料（無對應舊料·系統無法判階層·預設置底·請自行定位）';
+      sep.getCell(1).font = { name: '新細明體', size: 10, italic: true, color: { argb: 'FF9A5A00' } };
+      orphans.forEach(i => emitRow(i, ADD, '全新料·請確認擺放位置'));
+    }
+    const lastBody = ws.rowCount;
+
+    // 合計三列：新版 SUM 公式／舊版數字／總價差公式
+    let oldTot = null;
+    if (og) { const or = App._bomWholeMachine(bs.old, method, wcols); if (or.ok) oldTot = Math.round(or.total * 100) / 100; }
+    ws.addRow([]);
+    const mkTot = (label, valCell) => { const r = ws.addRow([]); ws.mergeCells(r.number, 1, r.number, amtCol - 1); r.getCell(1).value = label; r.getCell(1).font = FSUB; r.getCell(1).alignment = AL; valCell(r.getCell(amtCol)); r.getCell(amtCol).font = FSUB; r.getCell(amtCol).numFmt = MONEY; r.getCell(amtCol).alignment = AR; box(r, NC); for (let i = 1; i <= NC; i++) fill(r.getCell(i), CREAM); return r; };
+    const rNew = mkTot('物料總金額（新版·葉節點加總）', c => { c.value = { formula: 'SUM(' + amtL + firstBody + ':' + amtL + lastBody + ')', result: Math.round(newLeafSum * 100) / 100 }; });
+    const rOld = mkTot('物料總金額（舊版）', c => { c.value = (oldTot != null ? oldTot : ''); });
+    mkTot('總價差（新版 − 舊版）', c => { c.value = (oldTot != null) ? { formula: amtL + rNew.number + '-' + amtL + rOld.number, result: Math.round((newLeafSum - oldTot) * 100) / 100 } : ''; });
+
+    // 欄寬
+    for (let i = 1; i <= nCol; i++) ws.getColumn(i).width = 13;
+    ws.getColumn(amtCol).width = 13; ws.getColumn(noteCol).width = 26;
+  });
+
+  const dateStr = D.fmt(new Date(), 'ymd').replace(/\//g, '');
+  await App._xlDownload(wb, (proj.name || 'BOM') + '_各機種完整BOM_' + dateStr + '.xlsx');
+}
+App.exportBomModelsFullBom = exportBomModelsFullBom;
+
+// buildWbsPreview：純算 WBS preview（candidate project + tasks，不 push DATA）
+function buildWbsPreview(parsed) {
+  const { rows, projectName } = parsed;
+  // candidate project（fresh id；commit 時若重灌既有則重指）
+  const project = { id: U.id(), name: projectName, color: CFG('WBS_PROJECT_COLOR', '#4A7C5C'), note: '', synced: false, createdAt: new Date().toISOString() };
+  const projId = project.id;
+  const depts = parsed.depts || [];
+  project.depts = depts;
+  // 案別清單（id 制）
+  const variantNames = [...new Set(rows.map(r => r.variant).filter(v => v && v.trim()))];
+  // variant 形狀對齊 applyTemplate（含 schedule/stages）：Excel 無「目標上市窗」→ schedule 留空（餘裕回 null 不顯燈號）。
+  // 缺 schedule 會讓 Stage 2 餘裕計算 _s2VariantSlack 直接讀 v.schedule.startDate 爆 TypeError（Excel 新建一進 Stage 2 必炸）。
+  const variants = variantNames.map(name => ({ id: U.id(), name, schedule: { startDate: '', endDate: '', direction: 'forward' }, stages: [] }));
+  project.variants = variants;
+  // 反查表
+  const nameToId = {};
+  depts.forEach(d => { nameToId[d.name] = d.id; });
+  const variantNameToId = {};
+  variants.forEach(v => { variantNameToId[v.name] = v.id; });
+  // 組 task 進 local 陣列（不 push DATA）
+  const tasks = [];
+  rows.forEach(row => {
+    let status;
+    if (row.actualEnd) status = 'done';
+    else if (row.actualStart) status = 'wip';
+    else status = mapStatus(row.status, row.progress);
+    tasks.push({
+      id: U.id(),
+      project: projId,
+      wbs: row.wbs,
+      parentWbsId: '',
+      name: row.name,
+      desc: row.stage ? `${row.stage} / ${row.subgroup || ''}` : (row.subgroup || ''),
+      category: row.category,
+      taskType: row.taskType,
+      predecessor: row.predecessor,
+      durationDays: row.durationDays,
+      effortRatio: (row.dept === 'PM')
+        ? defaultEffort(row.stage, true)                                                   // PM：Excel 無真正各階段 PM% 欄（HTML 才有），一律吃範本階段標準%、不採計 Excel 值（§18.10c 統一口徑，Paul 2026-07-05）
+        : (row.effortRatio != null ? row.effortRatio : defaultEffort(row.stage, false)),   // 非PM：Excel 值優先、空值帶 100
+      owner: row.owner,
+      dept: nameToId[row.dept] || row.dept,
+      variant: variantNameToId[row.variant] || null,
+      start: '',
+      end: '',
+      plannedStart: row.plannedStart,
+      plannedEnd: row.plannedEnd,
+      actualStart: row.actualStart,
+      actualEnd: row.actualEnd,
+      progress: row.progress,
+      status: status,
+      urgency: 'med',
+      estHours: parseFloat(row.durationDays || 0) * (DATA.settings.dailyHours || 6) || 4,
+      method: '',
+      canSplit: false,
+      completedAt: status === 'done' ? new Date().toISOString() : null,
+      createdAt: new Date().toISOString(),
+      scheduledStart: '',
+      scheduledEnd: '',
+      synced: false,
+      stage: row.stage,
+      subgroup: row.subgroup,
+      mustDeliver: row.mustDeliver,
+      deliverableType: row.deliverableType,
+      requiredTask: row.requiredTask,
+      mustIssue: row.mustIssue,
+      deliverable: row.deliverable,
+      riskIssue: row.riskIssue,
+      delivered: row.delivered,
+      deliverableLink: row.deliverableLink,
+      note: row.note,
+    });
+  });
+  // 前置 id 化（對 local tasks 陣列，等價於原本對 importedBatch）
+  const wbsToIdMap = buildWbsToIdMap(tasks);
+  tasks.forEach(t => { t.predecessor = translatePredToId(t.predecessor, wbsToIdMap); });
+  return { project, variants, depts, tasks, warnings: [] };
+}
+
+function performWbsImport(parsed, projId) {
+  const res = buildWbsPreview(parsed);
+  // 重灌語意：① projId 傳入（專案頁覆蓋匯入）→ 鎖當前專案、跳過同名比對；② 不傳（向後相容）→ 找同名既有→重用 id；無則用 candidate
+  let proj = projId
+    ? DATA.projects.find(p => p.id === projId)
+    : DATA.projects.find(p => p.name === res.project.name);
+  if (projId && !proj) { U.toast('⚠ 找不到目標專案，覆蓋取消', 'error'); return { imported: 0, projectId: null }; }
+  if (proj) {
+    // 重用既有 id：把 res 的 project/task/相關 id 全重指成既有 projId
+    const oldId = res.project.id, newId = proj.id;
+    proj.depts = res.depts;
+    proj.variants = res.variants;
+    proj.importedAt = D.fmt(new Date(), 'iso');   // §15 覆蓋＝重匯，刷新匯入日期
+    if (proj.version == null) proj.version = 1;    // 舊專案首次補 version 欄；覆蓋不遞增（仍同一專案）
+    res.tasks.forEach(t => { if (t.project === oldId) t.project = newId; });
+    DATA.tasks = DATA.tasks.filter(t => t.project !== newId);   // 清該專案舊 task
+    res.tasks.forEach(t => DATA.tasks.push(t));
+  } else {
+    DATA.projects.push(res.project);
+    res.tasks.forEach(t => DATA.tasks.push(t));
+  }
+  const outProjId = proj ? proj.id : res.project.id;
+  Store.projects.save();   // 覆蓋既有專案欄位 或 push 新專案
+  Store.tasks.save();      // 匯入/覆蓋該案任務
+  App.refreshAll();
+  return { imported: res.tasks.length, projectId: outProjId };
+}
+
+App.openWbsImport = function(projId) {
+  const projName = (this.getProj(projId) || {}).name || '';
+  this.openModal({
+    title: '📥 覆蓋匯入 — ' + U.esc(projName),
+    body: `
+      <div style="font-size:12.5px; line-height:1.6; color:var(--ink2); margin-bottom:14px;">
+        匯入 WBS Excel，<b style="color:var(--sage-700);">整批重灌</b>：
+        <br>• <b>清空該專案既有任務</b>，以 Excel 為唯一真值重新建立
+        <br>• 匯入後任務為<b>可編輯</b>（非唯讀、非 synced），資料主權歸 ${CFG('APP_NAME', 'PM-Core')}
+        <br>• 階段時程（性試/量試/量產）由資訊條即時計算，匯入器不灌日期
+      </div>
+
+      <div id="wbsImportZone" style="border:2px dashed var(--rule); border-radius:10px; padding:32px; text-align:center; cursor:pointer; background:var(--surface2); transition:all .15s;">
+        <div style="font-size:32px; margin-bottom:8px;">📥</div>
+        <div style="font-size:13px; font-weight:500;">點擊或拖曳 WBS Excel 檔</div>
+        <div style="font-size:11px; color:var(--ink3); margin-top:4px;">讀 WBS 分頁，任務名非空者匯入</div>
+        <input type="file" id="wbsImportFile" accept=".xlsx,.xls" style="display:none;">
+      </div>
+
+      <div id="wbsImportPreview" style="display:none; margin-top:14px;">
+        <div id="wbsImportStats" style="padding:10px 14px; background:var(--sage-50); border-radius:8px; font-size:12px; margin-bottom:10px;"></div>
+        <div style="max-height:280px; overflow-y:auto; border:1px solid var(--rule); border-radius:8px;">
+          <table id="wbsImportTable" class="data-table" style="font-size:11.5px;"></table>
+        </div>
+      </div>
+
+      <div id="wbsImportLog" style="display:none; margin-top:14px; padding:10px 14px; background:var(--surface2); color:var(--ink2); border:1px solid var(--rule); border-radius:8px; font-family:var(--mono); font-size:11px; max-height:160px; overflow-y:auto;"></div>
+      <div id="wbsImportMap" style="display:none; margin-top:14px;"></div>
+    `,
+    footer: `
+      <button class="tb-action ghost" onclick="App.downloadWbsSample()">⬇ 下載匯入範例</button>
+      <button class="tb-action ghost" onclick="App.closeModal()">取消</button>
+      <button class="tb-action" id="wbsImportBtn" disabled style="opacity:.5;">確定匯入（清舊重灌）</button>
+    `,
+  });
+
+  // 綁事件 + parsed 閉包（confirm 鈕 onclick 字串傳不了物件，故用 addEventListener）
+  setTimeout(() => {
+    const zone = document.getElementById('wbsImportZone');
+    const fileInput = document.getElementById('wbsImportFile');
+    const btn = document.getElementById('wbsImportBtn');
+    if (!zone || !fileInput) return;
+    let parsed = null;
+
+    const handleFile = async (file, mapping) => {
+      const log = document.getElementById('wbsImportLog');
+      parsed = await parseWbsExcel(file, mapping ? { mapping } : undefined);
+      if (parsed && parsed.needMapping) {   // §13.7：欄位對不上→嵌入對應面板，指定後重解析
+        if (log) { log.style.display = 'block'; log.textContent = '⚠ 部分欄位對不上，請在下方指定對應'; }
+        btn.disabled = true; btn.style.opacity = '.5';
+        App.renderImportMapping({
+          containerId: 'wbsImportMap', specs: WBS_COLUMNS, headerCells: parsed.headerCells,
+          resolved: parsed.resolved, requiredKeys: WBS_REQUIRED_KEYS, domain: 'wbs',
+          onConfirm: m => handleFile(file, m),
+        });
+        return;
+      }
+      if (!parsed || !parsed.ok) {
+        if (log) {
+          log.style.display = 'block';
+          log.textContent = '⚠ ' + ((parsed && parsed.errors && parsed.errors.join('；')) || '解析失敗');
+        }
+        btn.disabled = true; btn.style.opacity = '.5';
+        return;
+      }
+      // 同名守衛：覆蓋只能蓋回同名專案（防拿錯 Excel）。異名／空名／fallback 預設名 → 擋死、不啟用確定鈕
+      if (!parsed.projectName || parsed.projectName === '未命名專案' || parsed.projectName !== projName) {
+        const sg = document.getElementById('wbsImportStats');
+        if (sg) sg.innerHTML = `<b style="color:var(--rose-ink);">⚠ 此 Excel 的專案名稱『${U.esc(parsed.projectName || '（無專案名）')}』與目前專案『${U.esc(projName)}』不符，無法覆蓋。請改用『${U.esc(projName)}』匯出的 WBS 檔。</b>`;
+        document.getElementById('wbsImportPreview').style.display = 'block';
+        btn.disabled = true; btn.style.opacity = '.5';
+        return;
+      }
+      // 統計 + 前 8 筆預覽
+      const stats = document.getElementById('wbsImportStats');
+      const table = document.getElementById('wbsImportTable');
+      const done = parsed.rows.filter(r => r.progress === 100).length;
+      const wip = parsed.rows.filter(r => r.progress > 0 && r.progress < 100).length;
+      if (stats) {
+        stats.innerHTML = `專案：<b>${U.esc(parsed.projectName)}</b>　|　共 <b style="color:var(--sage-700);">${parsed.rows.length}</b> 筆有效` +
+          `　|　完成 <b>${done}</b>　進行中 <b>${wip}</b>　|　<b style="color:var(--ink3);">確定後將清空既有任務重灌</b>`;
+      }
+      if (table) {
+        const head =
+          `<thead><tr>` +
+          `<th class="col-num">N</th>` +
+          `<th class="col-flex">任務名</th>` +
+          `<th class="col-mid">前置</th>` +
+          `<th class="col-num">進度</th>` +
+          `<th class="col-num">狀態</th></tr></thead>`;
+        const body = parsed.rows.slice(0, 8).map(r =>
+          `<tr><td class="col-num" style="font-family:var(--mono);">${U.esc(r.wbs)}</td>` +
+          `<td class="col-flex" title="${U.esc(r.name)}">${U.esc(r.name)}</td>` +
+          `<td class="col-mid" style="font-family:var(--mono);" title="${U.esc(r.predecessor)}">${U.esc(r.predecessor)}</td>` +
+          `<td class="col-num">${r.progress}%</td>` +
+          `<td class="col-num">${U.esc(r.status)}</td></tr>`).join('');
+        const more = parsed.rows.length > 8 ? `<tr><td colspan="5" style="color:var(--ink3);">…還有 ${parsed.rows.length - 8} 筆</td></tr>` : '';
+        table.innerHTML = head + '<tbody>' + body + more + '</tbody>';
+      }
+      document.getElementById('wbsImportPreview').style.display = 'block';
+      btn.disabled = false; btn.style.opacity = '1';
+    };
+
+    zone.addEventListener('click', () => fileInput.click());
+    zone.addEventListener('dragover', e => { e.preventDefault(); zone.style.background = 'var(--sage-50)'; zone.style.borderColor = 'var(--sage-500)'; });
+    zone.addEventListener('dragleave', () => { zone.style.background = 'var(--surface2)'; zone.style.borderColor = 'var(--rule)'; });
+    zone.addEventListener('drop', e => {
+      e.preventDefault();
+      zone.style.background = 'var(--surface2)';
+      zone.style.borderColor = 'var(--rule)';
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', e => {
+      if (e.target.files.length) handleFile(e.target.files[0]);
+    });
+
+    btn.addEventListener('click', () => {
+      if (!parsed || !parsed.ok) return;
+      App.confirmModal({
+        icon: 'ti-alert-triangle', iconBg: '--rose-l', iconColor: '--rose-ink',
+        title: `用此 Excel 覆蓋「${projName}」？`, msg: '現有任務會清空重灌，確定？', okText: '覆蓋匯入', cancelText: '取消', okClass: 'danger',
+        onConfirm: () => {
+          const res = performWbsImport(parsed, projId);
+          U.toast(`✅ 已匯入 ${res.imported} 筆任務到「${projName}」`, 'success', { duration: 10000, closable: true });
+          App.closeModal();
+        },
+      });
+    });
+  }, 50);
+};
+

@@ -1,0 +1,1735 @@
+// report-gen.js — §24 報表產出模組。app.js 之後載入。
+//   引擎 App.RT（scanWorkbook 掃結構／fillWorkbook 外科填格·JSZip byte 零破壞·POC-1/2 定海神針）
+//   ＋ 頁面 App.renderReportGen（範本清單／匯入精靈／更新產出下載）。
+//   Phase 1＝單格對應（一格↔單一系統值）；Phase 2＝重複表格（欄級批次綁定·逐列撈資料·動態長列·POC-2 機制）。
+//   domain＝DATA.reportTemplates（陣列·每筆 {id,name,srcName,b64,mapping,table,updatedAt}）。
+//   儲存＝範本原檔 base64（Phase 1/2 Excel 檔小·走既有 Store＋雲端 pack）；大 blob（Phase 4 PPT）改 IndexedDB／雲端 blob（§24.3）。
+//   前端 XLSX（已載）＋JSZip（CDN）。設計/POC 見 docs §24。
+(function () {
+  'use strict';
+
+  const RT = App.RT = {};
+  const colToNum = c => c.replace(/\$/g, '').split('').reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0);
+  const numToCol = n => { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; } return s; };
+  const escXml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // ══ 掃描 ══
+  RT.scanWorkbook = function (ab) {
+    const wb = XLSX.read(ab, { type: 'array' });
+    const sheets = wb.SheetNames.map(name => {
+      const ws = wb.Sheets[name];
+      if (!ws['!ref']) return { name, empty: true, aoa: [], start: { r: 0, c: 0 }, headerRow: 0, merges: [] };
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: true, defval: null });
+      let headerRow = 0, best = -1;
+      for (let r = 0; r < Math.min(aoa.length, 8); r++) {
+        const cells = (aoa[r] || []).filter(v => v !== null && v !== '');
+        const strCount = (aoa[r] || []).filter(v => typeof v === 'string').length;
+        const score = cells.length + strCount;
+        if (cells.length >= 2 && score > best) { best = score; headerRow = r; }
+      }
+      const merges = (ws['!merges'] || []).map(m => XLSX.utils.encode_range(m));
+      return { name, ref: ws['!ref'], headerRow, aoa, merges, start: { r: range.s.r, c: range.s.c } };
+    });
+    return { sheets };
+  };
+  RT.cellRef = (sheet, r, c) => numToCol(sheet.start.c + c + 1) + (sheet.start.r + r + 1);
+
+  // 偵測重複表格（表頭列下方連續資料列·遇 合計/空列 止）。回 1-based 供引擎＋0-based 供 grid。
+  RT.detectTable = function (sheet) {
+    if (!sheet || sheet.empty || !sheet.aoa.length) return null;
+    const aoa = sheet.aoa, hr = sheet.headerRow, off = sheet.start.r;
+    const nonEmpty = row => (row || []).filter(v => v != null && v !== '').length;
+    const isFooter = row => { const f = (row || [])[0]; return f != null && /合計|總計|小計|total/i.test(String(f)); };
+    const ds = hr + 1; let de = ds - 1;
+    for (let r = ds; r < aoa.length; r++) { if (isFooter(aoa[r]) || nonEmpty(aoa[r]) < 2) break; de = r; }
+    if (de < ds) return null;
+    let fl = de; for (let r = aoa.length - 1; r > de; r--) { if (nonEmpty(aoa[r]) > 0) { fl = r; break; } }
+    return { sheetName: sheet.name, headerRow: hr + 1 + off, dataStartRow: ds + 1 + off, curCount: de - ds + 1,
+      footerLastRow: fl + 1 + off, headerRow0: hr, dataStart0: ds, dataEnd0: de };
+  };
+
+  // ══ 外科填格引擎（cell + table）══
+  function writeCell(xml, ref, value, type) {
+    const m = ref.match(/^([A-Z]+)(\d+)$/); if (!m) return xml;
+    const col = m[1], rowN = +m[2];
+    const isStr = type === 'inlineStr' || (type !== 'n' && typeof value !== 'number');
+    const tAttr = isStr ? ' t="inlineStr"' : '';
+    const body = isStr ? '><is><t>' + escXml(value) + '</t></is></c>' : '><v>' + value + '</v></c>';
+    const cellRe = new RegExp('<c r="' + ref + '"([^>]*?)(?:/>|>[\\s\\S]*?</c>)');
+    if (cellRe.test(xml)) return xml.replace(cellRe, (mm, attrs) => '<c r="' + ref + '"' + (attrs.match(/ s="\d+"/) || [''])[0] + tAttr + body);
+    const newCell = '<c r="' + ref + '"' + tAttr + body;
+    const rowRe = new RegExp('(<row r="' + rowN + '"[^>]*>)([\\s\\S]*?)(</row>)');
+    if (rowRe.test(xml)) return xml.replace(rowRe, (mm, open, inner, close) => {
+      const cells = inner.match(/<c [^>]*?(?:\/>|>[\s\S]*?<\/c>)/g) || [];
+      const t = colToNum(col); let i = cells.findIndex(cc => colToNum((cc.match(/r="([A-Z]+)\d+"/) || [])[1] || 'A') > t);
+      if (i < 0) i = cells.length; cells.splice(i, 0, newCell); return open + cells.join('') + close;
+    });
+    return xml.replace(/<\/sheetData>/, '<row r="' + rowN + '">' + newCell + '</row></sheetData>');
+  }
+  function shiftRowsBelow(xml, fromRow, delta) {
+    return xml.replace(/<row r="(\d+)"([^>]*)>([\s\S]*?)<\/row>/g, (m, rn, attrs, body) => {
+      const n = +rn; if (n < fromRow) return m;
+      const nb = body.replace(/(<c r="[A-Z]+)(\d+)"/g, (mm, pre, cr) => pre + (+cr + delta) + '"');
+      return '<row r="' + (n + delta) + '"' + attrs + '>' + nb + '</row>';
+    });
+  }
+  function insertRowsCloning(xml, afterRow, count, templateRow) {
+    const tm = xml.match(new RegExp('<row r="' + templateRow + '"([^>]*)>([\\s\\S]*?)</row>'));
+    if (!tm) throw new Error('找不到樣板列 ' + templateRow);
+    let ins = '';
+    for (let k = 1; k <= count; k++) {
+      const rn = afterRow + k;
+      const nb = tm[2].replace(/<c r="([A-Z]+)\d+"([^>]*?)(?:\/>|>[\s\S]*?<\/c>)/g,
+        (m, col, rest) => '<c r="' + col + rn + '"' + (rest.match(/ s="\d+"/) || [''])[0] + '/>');
+      ins += '<row r="' + rn + '"' + tm[1] + '>' + nb + '</row>';
+    }
+    return xml.replace(new RegExp('(<row r="' + afterRow + '"[^>]*>[\\s\\S]*?</row>)'), '$1' + ins);
+  }
+  function removeRows(xml, fromRow, count) {
+    for (let r = fromRow; r < fromRow + count; r++) xml = xml.replace(new RegExp('<row r="' + r + '"[^>]*>[\\s\\S]*?</row>'), '');
+    return xml;
+  }
+  function shiftMerges(xml, oldEnd, delta) {
+    if (!delta) return xml;
+    return xml.replace(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"\/>/g, (m, c1, r1, c2, r2) => {
+      const nr1 = +r1 > oldEnd ? +r1 + delta : +r1, nr2 = +r2 > oldEnd ? +r2 + delta : +r2;
+      return '<mergeCell ref="' + c1 + nr1 + ':' + c2 + nr2 + '"/>';
+    });
+  }
+  function extendFooterFormulas(xml, oldEnd, newEnd) {
+    if (oldEnd === newEnd) return xml;
+    return xml.replace(/<f>([\s\S]*?)<\/f>/g, (m, f) =>
+      '<f>' + f.replace(new RegExp('(:\\$?[A-Z]+\\$?)' + oldEnd + '(?=[),:]|$)', 'g'), '$1' + newEnd) + '</f>');
+  }
+  function updateDimension(xml, newLastRow) { return xml.replace(/(<dimension ref="[A-Z]+1:[A-Z]+)\d+("\/>)/, '$1' + newLastRow + '$2'); }
+  // §24.7：偵測「資料列下方的公式·其範圍結尾正好是舊末列 oldEnd」＝插列後不會涵蓋新列 → 回受影響公式清單
+  function needFormulaExtend(xml, dataStartRow, curCount, newCount) {
+    if (newCount === curCount) return [];
+    const oldEnd = dataStartRow + curCount - 1, hits = [];
+    const re = /<c r="([A-Z]+)(\d+)"[^>]*>\s*<f>([^<]*)<\/f>/g; let m;
+    const endRe = new RegExp('(:\\$?[A-Z]+\\$?)' + oldEnd + '(?=[),:]|$)');
+    while ((m = re.exec(xml))) { if (+m[2] <= oldEnd) continue; if (endRe.test(m[3])) hits.push({ ref: m[1] + m[2], formula: m[3] }); }
+    return hits;
+  }
+
+  // 重複表格填入：調整列數（插/刪·clone 樣式）＋逐列填欄＋footer 公式擴張＋合併位移＋dimension
+  function fillTable(xml, spec) {
+    const { dataStartRow, curCount, cols, records, footerLastRow } = spec;
+    const target = records.length;
+    const oldEnd = dataStartRow + curCount - 1, newEnd = dataStartRow + target - 1, delta = target - curCount;
+    if (delta > 0) { xml = shiftRowsBelow(xml, oldEnd + 1, delta); xml = insertRowsCloning(xml, oldEnd, delta, oldEnd); }
+    else if (delta < 0) { xml = removeRows(xml, dataStartRow + target, -delta); xml = shiftRowsBelow(xml, oldEnd + 1, delta); }
+    for (let i = 0; i < target; i++) {
+      const rn = dataStartRow + i;
+      for (const c of cols) { const v = c.get(records[i], i); if (v === undefined) continue; xml = writeCell(xml, c.col + rn, v, c.type || (typeof v === 'number' ? 'n' : 'inlineStr')); }
+    }
+    xml = shiftMerges(xml, oldEnd, delta);
+    if (spec.extendFormulas !== false) xml = extendFooterFormulas(xml, oldEnd, newEnd);   // §24.7：維持原樣＝User 選 false·不改公式
+    if (footerLastRow != null) xml = updateDimension(xml, footerLastRow + delta);
+    return xml;
+  }
+
+  // 匯出：spec={cells:[{sheetName,ref,value,type}], tables:[{sheetName,dataStartRow,curCount,footerLastRow,cols,records}]}
+  RT.fillWorkbook = async function (ab, spec) {
+    const zip = await JSZip.loadAsync(ab);
+    const paths = await mapSheetPaths(zip);
+    const bySheet = {};
+    (spec.cells || []).forEach(c => (bySheet[c.sheetName] = bySheet[c.sheetName] || { cells: [] }).cells.push(c));
+    (spec.tables || []).forEach(t => { (bySheet[t.sheetName] = bySheet[t.sheetName] || { cells: [] }).table = t; });
+    for (const [sheetName, ops] of Object.entries(bySheet)) {
+      const path = paths[sheetName]; if (!path) throw new Error('找不到分頁：' + sheetName);
+      let xml = await zip.file(path).async('string');
+      if (ops.table) xml = fillTable(xml, ops.table);   // 先動列（位移），再填表格外單格
+      for (const c of ops.cells) xml = writeCell(xml, c.ref, c.value, c.type);
+      zip.file(path, xml);
+    }
+    let wbx = await zip.file('xl/workbook.xml').async('string');
+    wbx = /<calcPr\b/.test(wbx)
+      ? (/fullCalcOnLoad=/.test(wbx) ? wbx.replace(/fullCalcOnLoad="[^"]*"/, 'fullCalcOnLoad="1"') : wbx.replace(/<calcPr\b/, '<calcPr fullCalcOnLoad="1"'))
+      : wbx.replace(/<\/sheets>/, '</sheets><calcPr fullCalcOnLoad="1"/>');
+    zip.file('xl/workbook.xml', wbx);
+    return zip.generateAsync({ type: 'uint8array' });
+  };
+  // §24.7 產出前偵測：載入範本、讀 table 分頁 XML、回受影響公式（供彈窗詢問延伸/維持）
+  RT.peekFormulaAnomaly = async function (ab, table, newCount) {
+    const zip = await JSZip.loadAsync(ab); const paths = await mapSheetPaths(zip);
+    const path = paths[table.sheetName]; if (!path) return { hits: [], delta: 0 };
+    const xml = await zip.file(path).async('string');
+    const hits = needFormulaExtend(xml, table.dataStartRow, table.curCount, newCount);
+    return { hits, delta: newCount - table.curCount, oldEnd: table.dataStartRow + table.curCount - 1 };
+  };
+  async function mapSheetPaths(zip) {
+    const wbx = await zip.file('xl/workbook.xml').async('string');
+    const rels = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    const relMap = {}; rels.replace(/<Relationship Id="([^"]+)"[^>]*Target="([^"]+)"/g, (m, id, t) => { relMap[id] = t; return m; });
+    const out = {};
+    wbx.replace(/<sheet [^>]*name="([^"]+)"[^>]*r:id="([^"]+)"/g, (m, name, rid) => {
+      out[name] = 'xl/' + (relMap[rid] || '').replace(/^\/?xl\//, '').replace(/^\//, ''); return m;
+    });
+    return out;
+  }
+
+  // ══ 系統資料來源 ══
+  App._rgIsDone = p => p && (p.status === 'done' || p.status === 'closed' || p.status === 'archived');
+  // 逾期判定單一把尺（§24.15.11 批2 收斂·規則15：_rgOverdueCount／ROW_SOURCES.overdueTasks／per-專案逾期共用）
+  const _todayIso = () => new Date().toISOString().slice(0, 10);
+  const _overdueBy = (t, d) => t.status !== 'done' && t.status !== 'hold' && (t.deadline || t.plannedEnd) && (t.deadline || t.plannedEnd) < d;
+  App._rgOverdueCount = () => (DATA.tasks || []).filter(t => t && !t._deleted && _overdueBy(t, _todayIso())).length;
+  // Phase 1 單值
+  RT.SYS_FIELDS = [
+    { key: 'today', label: '今日日期', get: () => new Date().toLocaleDateString('zh-TW') },
+    { key: 'projTotal', label: '專案總數', get: () => (DATA.projects || []).length },
+    { key: 'projActive', label: '進行中專案數', get: () => (DATA.projects || []).filter(p => !App._rgIsDone(p)).length },
+    { key: 'projDone', label: '已完成專案數', get: () => (DATA.projects || []).filter(p => App._rgIsDone(p)).length },
+    { key: 'taskTotal', label: '任務總數', get: () => (DATA.tasks || []).filter(t => !t._deleted).length },
+    { key: 'taskDone', label: '已完工任務數', get: () => (DATA.tasks || []).filter(t => !t._deleted && t.status === 'done').length },
+    { key: 'taskOverdue', label: '逾期任務數', get: () => App._rgOverdueCount() },
+  ];
+  const sysField = k => RT.SYS_FIELDS.find(f => f.key === k);
+  // Phase 2 逐列欄位（record＝task）
+  const projName = id => { const p = (DATA.projects || []).find(x => x.id === id); return (p && p.name) || id || ''; };
+  RT.TABLE_FIELDS = [
+    { key: 'proj', label: '專案名稱', get: t => projName(t.project) },
+    { key: 'seq', label: '項次/序號', get: t => t.seq != null ? t.seq : '' },
+    { key: 'name', label: '議題/任務名', get: t => t.name || '' },
+    { key: 'stage', label: '階段', get: t => t.stage || '' },
+    { key: 'status', label: '狀態', get: t => (typeof STATUS_LABELS_ZH !== 'undefined' && STATUS_LABELS_ZH[t.status]) || t.status || '' },
+    { key: 'plannedEnd', label: '預計完成日', get: t => t.plannedEnd || '' },
+    { key: 'actualEnd', label: '實際完成日', get: t => t.actualEnd || t.completedAt || '' },
+    { key: 'owner', label: '負責人', get: t => t.owner || '' },
+    { key: 'delayReason', label: '延誤理由', get: t => t.delayReason || '' },
+    { key: 'effort', label: '投入%', get: t => t.effortRatio != null ? t.effortRatio : '' },
+  ];
+  const tblField = k => RT.TABLE_FIELDS.find(f => f.key === k);
+  const liveTasks = () => (DATA.tasks || []).filter(t => t && !t._deleted && t.measureType !== 'hours');
+  // 解析分頁名日期（民國 115.6.16／西元 2026-06-16 等·回 Date 或 null）
+  const pad2 = n => String(n).padStart(2, '0');
+  const isoOf = dt => dt.getFullYear() + '-' + pad2(dt.getMonth() + 1) + '-' + pad2(dt.getDate());
+  RT.parseSheetDate = function (name) {
+    const m = String(name || '').match(/(\d{2,4})[.\-\/](\d{1,2})[.\-\/](\d{1,2})/);
+    if (!m) return null; let y = +m[1]; if (y < 1911) y += 1911; const d = new Date(y, +m[2] - 1, +m[3]); return isNaN(d) ? null : d;
+  };
+  RT.ROW_SOURCES = [
+    { key: 'allTasks', label: '所有專案任務', get: () => liveTasks() },
+    { key: 'activeTasks', label: '未完成任務（不含已完工）', get: () => liveTasks().filter(t => t.status !== 'done') },
+    { key: 'overdueTasks', label: '逾期任務', get: () => { const d = _todayIso(); return liveTasks().filter(t => _overdueBy(t, d)); } },
+    { key: 'weekBySheet', label: '此分頁週別的任務（依分頁名日期·前 7 天）', get: ctx => {
+        const d = ctx && RT.parseSheetDate(ctx.sheetName); if (!d) return liveTasks();   // 分頁名無日期→退化全部
+        const end = isoOf(d), start = isoOf(new Date(d.getFullYear(), d.getMonth(), d.getDate() - 6));
+        return liveTasks().filter(t => { const x = t.actualEnd || t.plannedEnd; return x && x >= start && x <= end; });
+      } },
+  ];
+  const rowSource = k => RT.ROW_SOURCES.find(s => s.key === k) || RT.PROJ_ROW_SOURCES.find(s => s.key === k);
+
+  // ── §24.15.11 批2：重複頁「每專案一頁」資料面（per-專案欄位目錄＋來源＋scoped 列來源）──
+  //   重複頁內的槽綁 PROJ_FIELDS（fieldGet=RT.projField·resolveBinding 同一解析器）；
+  //   該頁表格列來源用 PROJ_ROW_SOURCES（get(ctx) 吃 ctx.project·產出逐頁代入該專案）。
+  const projOverdueN = p => { const d = _todayIso(); return liveTasks().filter(t => t.project === p.id && _overdueBy(t, d)).length; };
+  RT.PROJ_FIELDS = [
+    { key: 'pjName', label: '專案名稱', get: p => p.name || '' },
+    { key: 'pjStage', label: '目前階段', get: p => (typeof Portfolio !== 'undefined' && Portfolio.currentStage) ? Portfolio.currentStage(p.id) : '' },
+    { key: 'pjStatus', label: '狀態', get: p => App._rgIsDone(p) ? '已完成' : '進行中' },
+    { key: 'pjProgress', label: '進度%', get: p => { const r = (typeof Portfolio !== 'undefined' && Portfolio.projectProgress) ? Portfolio.projectProgress(p.id, new Date()) : null; return r && r.actual != null ? r.actual : ''; } },
+    { key: 'pjPm', label: 'PM／擔當', get: p => { if (typeof isPmTask !== 'function') return ''; const seen = {}; liveTasks().forEach(t => { if (t.project === p.id && isPmTask(t, p)) String(t.owner || '').split(/[、,，\/+＋&]/).map(s => s.trim()).filter(Boolean).forEach(n => { seen[n] = 1; }); }); return Object.keys(seen).join('、'); } },
+    { key: 'pjStart', label: '開案日', get: p => (p.createdAt || '').slice(0, 10) },
+    { key: 'pjTarget', label: '目標可販日', get: p => p.targetDate || '' },
+    { key: 'pjNextMile', label: '下個里程碑', get: p => { const ms = liveTasks().filter(t => t.project === p.id && t.taskType === 'milestone' && t.status !== 'done' && App._taskDate(t)).sort((a, b) => App._taskDate(a) - App._taskDate(b)); return ms[0] ? (ms[0].name + '（' + isoOf(App._taskDate(ms[0])) + '）') : ''; } },
+    { key: 'pjOverdue', label: '逾期任務數', get: p => projOverdueN(p) },
+  ];
+  RT.projField = k => RT.PROJ_FIELDS.find(f => f.key === k);
+  RT.PROJ_SOURCES = [
+    { key: 'activeProjects', label: '進行中專案', get: () => (DATA.projects || []).filter(p => !App._rgIsDone(p)) },
+    { key: 'allProjects', label: '所有專案', get: () => (DATA.projects || []).slice() },
+    { key: 'overdueProjects', label: '有逾期任務的專案', get: () => (DATA.projects || []).filter(p => !App._rgIsDone(p) && projOverdueN(p) > 0) },
+  ];
+  // rep={source,sort} → 排好序的專案清單（＝重複頁頁序·預設開案日新→舊）
+  RT.repeatRecords = function (rep) {
+    const src = RT.PROJ_SOURCES.find(s => s.key === (rep && rep.source)) || RT.PROJ_SOURCES[0];
+    const list = src.get().slice();
+    if (rep && rep.sort === 'name') list.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-Hant'));
+    else list.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    return list;
+  };
+  RT.PROJ_ROW_SOURCES = [
+    { key: 'projActiveTasks', label: '此專案的未完成任務', get: ctx => liveTasks().filter(t => t.project === ctx.project.id && t.status !== 'done') },
+    { key: 'projOverdueTasks', label: '此專案的逾期任務', get: ctx => { const d = _todayIso(); return liveTasks().filter(t => t.project === ctx.project.id && _overdueBy(t, d)); } },
+    { key: 'projAllTasks', label: '此專案的全部任務', get: ctx => liveTasks().filter(t => t.project === ctx.project.id) },
+  ];
+
+  // ── §24.15 配方解析：cat／轉換／空值策略 單一真實來源（單格·表格欄·PPT 段落三處共用·rule10/13）──
+  RT.SKIP = { skip: true };   // keep(保留原樣)→ caller 不寫該格/段落·沿用範本原值
+  RT._parseDate = function (v) {
+    if (v == null || v === '') return null;
+    if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+    const s = String(v).trim();
+    const m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/);
+    if (m) { const d = new Date(+m[1], +m[2] - 1, +m[3]); return isNaN(d.getTime()) ? null : d; }
+    const d = new Date(s); return isNaN(d.getTime()) ? null : d;
+  };
+  RT._dateOffset = function (v, days) { const d = RT._parseDate(v); if (!d) return v; d.setDate(d.getDate() + (Number(days) || 0)); return isoOf(d); };
+  RT._monthOnly = function (v) { const d = RT._parseDate(v); return d ? (d.getMonth() + 1) + '月' : v; };
+  // b={cat,field,text,transform?,empty?}·rec=逐列 task（單格傳 undefined）·fieldGet=sysField(單格)/tblField(表格)
+  RT.resolveBinding = function (b, rec, fieldGet) {
+    b = b || {};
+    const cat = b.cat || 'auto';
+    if (cat === 'keep') return RT.SKIP;                     // 保留原樣：不寫（沿用範本原值）
+    if (cat === 'blank' || cat === 'manual') return '';     // 留空 / 手填佔位
+    if (cat === 'fixed') return b.text || '';
+    const getF = k => { const f = fieldGet(k); return f ? f.get(rec) : ''; };   // cat=auto：撈系統資料
+    const t = b.transform;
+    let raw;
+    if (t && t.type === 'concat') raw = (t.parts || []).map(p => p.k === 'text' ? (p.v || '') : getF(p.v)).join('');
+    else raw = getF(b.field);
+    if (t && t.type === 'dateOffset') raw = RT._dateOffset(raw, t.days);
+    else if (t && t.type === 'monthOnly') raw = RT._monthOnly(raw);
+    if (raw === '' || raw == null) {   // 空值策略（預設 dash「—」）
+      const e = b.empty || 'dash';
+      if (e === 'blank') return '';
+      if (e === 'keep') return RT.SKIP;
+      return '—';   // dash（預設）；hideRow（列刪除）待第①期後補·暫同 dash
+    }
+    return raw;   // number(effort) 或 string
+  };
+
+  // ══ §24.15 第①期 分類引擎（掃 scan → 每槽信心分 → 三層：自動配/待確認/手填·配不了）══
+  //   讀每格鄰近標籤 → 模糊比對 SYS_FIELDS（複用 §13.7 正規化）→ high 自動配(auto)/mid 待確認(confirm)；
+  //   標籤是「系統沒有、要人寫的概念」(對策/結論/重點…)→手填(manual)；detectTable 命中→表格槽(confirm)。
+  //   有標籤但非欄位又非人寫概念→不列（避免退回「全攤開」）。純函式：吃 scan 回結構·node/console 皆可驗。
+  //   UI（第①期 B–E）吃此輸出 render；此處只分類、不改 mapping/tables（Slice B 才接線）。
+  const _clNorm = s => (typeof impNorm === 'function'
+    ? impNorm(typeof toTrad === 'function' ? toTrad(s) : s)
+    : String(s == null ? '' : s).trim().toLowerCase().replace(/[！-～]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/[\s　]/g, '').replace(/[（(][^（()）]*[)）]/g, ''));
+  // 標籤→欄位：回 {field,conf('high'|'mid')} 或 null。high=正規化相等；mid=唯一雙向子字串(≥2·恰一命中)
+  RT._matchField = function (label, fields) {
+    const nl = _clNorm(label); if (nl.length < 2) return null;
+    for (const f of fields) { if (_clNorm(f.label) === nl) return { field: f.key, conf: 'high' }; }
+    const subs = fields.filter(f => { const nf = _clNorm(f.label); return nf.length >= 2 && (nl.indexOf(nf) >= 0 || nf.indexOf(nl) >= 0); });
+    return subs.length === 1 ? { field: subs[0].key, conf: 'mid' } : null;
+  };
+  // 「系統沒有、要人寫」的概念標籤（非 PM-Core 欄位·路由手填）·保守清單
+  RT._MANUAL_WORDS = ['對策', '結論', '心得', '建議', '摘要', '檢討', '重點', '風險', '下週', '本週', '備註', '說明', '總結', '因應'];
+  RT._isManualConcept = function (label) { const s = String(label || ''); return RT._MANUAL_WORDS.some(w => s.indexOf(w) >= 0); };
+  // 掃單格標籤→值槽（標籤＝字串格；值槽＝右鄰空格 或 下鄰空格；跳過表格區）
+  function _scanScalars(sheet, tReg) {
+    const aoa = sheet.aoa, out = [], seen = {};
+    const cell = (r, c) => (aoa[r] || [])[c];
+    const empty = v => v == null || v === '';
+    const inT = r => tReg && r >= tReg.s && r <= tReg.e;
+    for (let r = 0; r < aoa.length; r++) {
+      if (inT(r)) continue;
+      const row = aoa[r] || [];
+      for (let c = 0; c < row.length; c++) {
+        const lab = row[c];
+        if (typeof lab !== 'string' || !lab.trim()) continue;
+        let sr = -1, sc = -1;
+        if (empty(cell(r, c + 1))) { sr = r; sc = c + 1; }                                  // 右鄰空→值槽
+        else if (r + 1 < aoa.length && !inT(r + 1) && empty(cell(r + 1, c))) { sr = r + 1; sc = c; }   // 否則下鄰空
+        if (sr < 0) continue;
+        const ref = RT.cellRef(sheet, sr, sc);
+        if (seen[ref]) continue; seen[ref] = 1;
+        out.push({ ref, label: lab.trim(), r: sr, c: sc });
+      }
+    }
+    return out;
+  }
+  // scan → { slots:[{kind,tier,role,sheetName,ref?,guess?,det?,dupCount?,dupRefs?}], sheets:[{name,cov('g'|'a'|'n')}], counts }
+  RT.classifySlots = function (scan) {
+    const slots = [], sheets = [];
+    (scan && scan.sheets || []).forEach(function (sheet) {
+      if (sheet.empty) { sheets.push({ name: sheet.name, cov: 'n' }); return; }
+      let hasAuto = false, hasAny = false;
+      const det = RT.detectTable(sheet);
+      const tReg = det ? { s: det.headerRow0, e: det.dataEnd0 } : null;
+      if (det) { slots.push({ kind: 'table', tier: 'confirm', role: sheet.name + ' · 逐列表格', sheetName: sheet.name, det: det }); hasAny = true; }
+      _scanScalars(sheet, tReg).forEach(function (s) {
+        const m = RT._matchField(s.label, RT.SYS_FIELDS);
+        let tier, guess = null;
+        if (m && m.conf === 'high') { tier = 'auto'; guess = m; hasAuto = true; }
+        else if (m) { tier = 'confirm'; guess = m; }
+        else if (RT._isManualConcept(s.label)) { tier = 'manual'; }
+        else return;   // 有標籤但非欄位、非人寫概念 → 不列（避免全攤開）
+        slots.push({ kind: tier === 'manual' ? 'manual' : 'scalar', tier: tier, role: s.label, sheetName: sheet.name, ref: s.ref, guess: guess });
+        hasAny = true;
+      });
+      sheets.push({ name: sheet.name, cov: hasAuto ? 'g' : (hasAny ? 'a' : 'n') });
+    });
+    // 去重（多分身）：同一 guess.field 的 scalar 槽折成一條·主槽帶 dupCount/dupRefs
+    const byField = {}, dropped = [];
+    slots.forEach(function (s) { if (s.kind === 'scalar' && s.guess) (byField[s.guess.field] = byField[s.guess.field] || []).push(s); });
+    Object.keys(byField).forEach(function (k) {
+      const g = byField[k]; if (g.length < 2) return;
+      g[0].dupCount = g.length; g[0].dupRefs = g.map(function (x) { return { ref: x.ref, sheetName: x.sheetName }; });
+      g.slice(1).forEach(function (x) { dropped.push(x); });
+    });
+    const finalSlots = slots.filter(function (s) { return dropped.indexOf(s) < 0; });
+    const counts = { auto: 0, confirm: 0, manual: 0, disp: 0 };
+    finalSlots.forEach(function (s) { counts[s.tier] = (counts[s.tier] || 0) + 1; });
+    return { slots: finalSlots, sheets: sheets, counts: counts };
+  };
+
+  // slides（scanSlides 輸出）→ 同 classifySlots 結構（PPT 版·比對段落文字·涵蓋率改頁碼·一般內文不列＝保留原樣）
+  //   單位＝段落（pptMap key=path#pi）＋投影片表格（pptTables）。fillPptx 對「無綁定段落」不碰＝天然保留原樣。
+  RT.classifyPptSlots = function (slides, repeats) {
+    const repSet = {}; (repeats || []).forEach(function (r) { repSet[r.slidePath] = 1; });   // §24.15.11：重複頁比對 per-專案欄位目錄
+    const slots = [], pages = [];
+    (slides || []).forEach(function (s) {
+      let hasAuto = false, hasAny = false;
+      (s.tables || []).forEach(function (tb) {
+        slots.push({ kind: 'table', tier: 'confirm', role: '第 ' + s.no + ' 頁 · 表格', slidePath: s.path, slideNo: s.no, tblIndex: tb.tblIndex, tb: tb }); hasAny = true;
+      });
+      (s.paras || []).forEach(function (p, pi) {
+        const text = String(p.text || '').trim();
+        if (!text || p.inTable) return;
+        const m = RT._matchField(text, repSet[s.path] ? RT.PROJ_FIELDS : RT.SYS_FIELDS);
+        let tier, guess = null;
+        if (m && m.conf === 'high') { tier = 'auto'; guess = m; hasAuto = true; }
+        else if (m) { tier = 'confirm'; guess = m; }
+        else if (RT._isManualConcept(text)) { tier = 'manual'; }
+        else return;   // 一般內文→不列（保留原樣·fillPptx 不碰）
+        slots.push({ kind: tier === 'manual' ? 'manual' : 'para', tier: tier, role: text, slidePath: s.path, slideNo: s.no, pIndex: pi, guess: guess }); hasAny = true;
+      });
+      pages.push({ no: s.no, path: s.path, cov: hasAuto ? 'g' : (hasAny ? 'a' : 'n') });
+    });
+    const byField = {}, dropped = [];
+    // 多分身去重跳過重複頁（§24.15.11）：重複頁的槽逐頁代入不同專案值·折進他頁的槽會綁錯
+    slots.forEach(function (s) { if (s.kind === 'para' && s.guess && !repSet[s.slidePath]) (byField[s.guess.field] = byField[s.guess.field] || []).push(s); });
+    Object.keys(byField).forEach(function (k) {
+      const g = byField[k]; if (g.length < 2) return;
+      g[0].dupCount = g.length; g[0].dupRefs = g.map(function (x) { return { slidePath: x.slidePath, slideNo: x.slideNo, pIndex: x.pIndex }; });
+      g.slice(1).forEach(function (x) { dropped.push(x); });
+    });
+    const finalSlots = slots.filter(function (s) { return dropped.indexOf(s) < 0; });
+    const counts = { auto: 0, confirm: 0, manual: 0, disp: 0 };
+    finalSlots.forEach(function (s) { counts[s.tier] = (counts[s.tier] || 0) + 1; });
+    return { slots: finalSlots, pages: pages, counts: counts };
+  };
+  // §24.15.11 重複頁偵測提議：頁內命中 ≥2 個「唯獨 per-專案才有」的欄位標籤（排除與全域目錄同名的·如逾期任務數）→ 提議設為重複頁
+  RT.suggestRepeatPages = function (slides) {
+    const sysL = {}; RT.SYS_FIELDS.forEach(function (f) { sysL[f.label] = 1; });
+    const uniq = RT.PROJ_FIELDS.filter(function (f) { return !sysL[f.label]; });
+    return (slides || []).filter(function (s) {
+      let n = 0;
+      (s.paras || []).forEach(function (p) { const t = String(p.text || '').trim(); if (t && !p.inTable && RT._matchField(t, uniq)) n++; });
+      return n >= 2;
+    }).map(function (s) { return s.path; });
+  };
+
+  // ══ §24.15 第②期 範本指紋比對（上傳→判定像哪個存過的範本→提議延續對應）══
+  //   指紋＝結構骨架·內容無關（同範本換資料→同指紋）。Excel: 分頁名+各頁表頭文字集；PPT: 頁數+表格欄數集+短標籤集。
+  //   純函式（吃 rg-like）·node/console 皆可驗。存檔存 fp、匯入比對；閾值 FP_THRESHOLD。
+  const _fpLabelOk = t => t.length <= 12 && /[^\d\s\/\-.:]/.test(t) && !/^\d/.test(t);   // 短且非純數字/日期＝穩定標籤
+  RT.fingerprint = function (rg) {
+    if (!rg) return null;
+    if (rg.type === 'pptx') {
+      const slides = rg.slides || [], tb = [], lb = {};
+      slides.forEach(function (s) {
+        (s.tables || []).forEach(function (t) { tb.push(t.colCount || 0); });
+        (s.paras || []).forEach(function (p) { const t = String(p.text || '').trim(); if (t && !p.inTable && _fpLabelOk(t)) { const k = _clNorm(t); if (k) lb[k] = 1; } });
+      });
+      return { t: 'pptx', n: slides.length, tb: tb.sort(), lb: Object.keys(lb).sort() };
+    }
+    const sheets = (rg.scan && rg.scan.sheets) || [];
+    const sh = sheets.filter(function (s) { return !s.empty; }).map(function (s) {
+      const hdr = (s.aoa[s.headerRow] || []).map(_clNorm).filter(Boolean).sort();
+      return { n: _clNorm(s.name), h: hdr };
+    });
+    return { t: 'xlsx', sh: sh };
+  };
+  function _jac(a, b) { const A = new Set(a), B = new Set(b); if (!A.size && !B.size) return 1; let inter = 0; A.forEach(function (x) { if (B.has(x)) inter++; }); return inter / (A.size + B.size - inter || 1); }
+  RT.fpSimilarity = function (a, b) {
+    if (!a || !b || a.t !== b.t) return 0;
+    if (a.t === 'pptx') {
+      const nA = a.n || 0, nB = b.n || 0, nScore = 1 - Math.abs(nA - nB) / (Math.max(nA, nB) || 1);
+      return 0.25 * nScore + 0.30 * _jac(a.tb || [], b.tb || []) + 0.45 * _jac(a.lb || [], b.lb || []);
+    }
+    const bByName = {}; (b.sh || []).forEach(function (s) { bByName[s.n] = s; });
+    let sum = 0; (a.sh || []).forEach(function (s) { const m = bByName[s.n]; if (m) sum += _jac(s.h, m.h); });
+    return sum / (Math.max((a.sh || []).length, (b.sh || []).length) || 1);
+  };
+  RT.FP_THRESHOLD = 0.7;
+  RT.bestFpMatch = function (fp, templates) {
+    let best = null;
+    (templates || []).forEach(function (t) {
+      if (!t.fp) return;
+      const score = RT.fpSimilarity(fp, t.fp);
+      if (!best || score > best.score) best = { id: t.id, name: t.name, score: score };
+    });
+    return best;   // caller 用 FP_THRESHOLD 判是否提議延續
+  };
+
+  // ══ §24.15 第②期 種隱形錨點（第一批：純量單格 Excel／段落 PPT·POC-anchor 全綠）══
+  //   定型時 byte 種入「內容無關的隱形標記」：Excel＝隱藏名稱範圍(defined name)、PPT＝shape alt-text(descr)。
+  //   Office 會讓這些標記跟著插列/重排自動搬 → re-import 讀標記拿「現在的座標」重對錨，取代死抱舊 key。
+  //   設計＝純字串函式（node 可測·免 jszip）＋薄 JSZip 包裝（zip 層已 POC 驗）。
+  const ANCHOR_PREFIX = '_PMC_';
+  function _hexEnc(s) { return Array.from(new TextEncoder().encode(s)).map(b => b.toString(16).padStart(2, '0')).join(''); }
+  function _hexDec(h) { try { return new TextDecoder().decode(new Uint8Array((String(h).match(/../g) || []).map(x => parseInt(x, 16)))); } catch (e) { return ''; } }
+  function _unesc(s) { return String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&'); }
+  RT._anchorName = key => ANCHOR_PREFIX + _hexEnc(key);           // mapping key→合法唯一 defined name（hex·不撞中文分頁）
+  // ── Excel：mapping key「分頁!C5」↔ defined name ref「'分頁'!$C$5」──
+  RT._keyToRef = function (key) { const m = String(key).match(/^(.+)!([A-Z]+)(\d+)$/); return m ? "'" + m[1].replace(/'/g, "''") + "'!$" + m[2] + "$" + m[3] : null; };
+  RT._refToKey = function (ref) { const m = String(ref).match(/^\s*'?(.+?)'?!\$?([A-Z]+)\$?(\d+)\s*$/); return m ? m[1].replace(/''/g, "'") + "!" + m[2] + m[3] : null; };
+  RT._seedDefinedNames = function (xml, entries) {   // entries=[{name,ref}]·冪等（先清舊 _PMC_ 再加）
+    xml = xml.replace(/<definedName\s+name="_PMC_[^"]*"[^>]*>[^<]*<\/definedName>/g, '');
+    if (!entries.length) return xml.replace(/<definedNames>\s*<\/definedNames>/, '');
+    const block = entries.map(e => `<definedName name="${e.name}" hidden="1">${e.ref}</definedName>`).join('');
+    if (/<definedNames>/.test(xml)) return xml.replace('</definedNames>', block + '</definedNames>');
+    if (/<\/sheets>/.test(xml)) return xml.replace('</sheets>', '</sheets><definedNames>' + block + '</definedNames>');
+    return xml;
+  };
+  RT._readAnchorsXlsx = function (xml) {   // →[{origKey,curKey}]（純量·排除 T: 表格欄錨點）
+    const out = []; const re = /<definedName\s+name="_PMC_([0-9a-f]+)"[^>]*>([^<]+)<\/definedName>/g; let m;
+    while ((m = re.exec(xml))) { const origKey = _hexDec(m[1]); if (/^T:/.test(origKey)) continue; const curKey = RT._refToKey(_unesc(m[2])); if (origKey && curKey) out.push({ origKey, curKey }); }
+    return out;
+  };
+  // ── 第二批 表格欄錨點（Excel）：每個綁定欄在「表頭格」種 defined name·名字帶原欄字母·ref 給現在欄字母（插欄也認得）──
+  RT._tcolName = (sheetName, col) => ANCHOR_PREFIX + _hexEnc('T:' + sheetName + '!' + col);
+  RT._readTableColsXlsx = function (xml) {   // →[{sheetName,origCol,curCol}]
+    const out = []; const re = /<definedName\s+name="_PMC_([0-9a-f]+)"[^>]*>([^<]+)<\/definedName>/g; let m;
+    while ((m = re.exec(xml))) {
+      const key = _hexDec(m[1]), tm = key.match(/^T:(.+)!([A-Z]+)$/); if (!tm) continue;
+      const cur = RT._refToKey(_unesc(m[2])), cm = cur && cur.match(/^(.+)!([A-Z]+)\d+$/);
+      if (cm) out.push({ sheetName: tm[1], origCol: tm[2], curCol: cm[2] });
+    }
+    return out;
+  };
+  // 重對錨 Excel 表格：①按新檔重偵測列位置（detectTable）②靠欄錨點把 cols 的欄字母搬到現在位置
+  RT.reanchorTablesXlsx = function (tables, scan, tcols) {
+    if (!tables || !tables.length) return { tables: tables, moved: 0 };
+    const byCol = {}; (tcols || []).forEach(a => { (byCol[a.sheetName] = byCol[a.sheetName] || {})[a.origCol] = a.curCol; });
+    const sheets = {}; (scan && scan.sheets || []).forEach(s => { sheets[s.name] = s; });
+    let moved = 0;
+    const out = tables.map(t => {
+      const nt = Object.assign({}, t);
+      const sh = sheets[t.sheetName], det = sh ? RT.detectTable(sh) : null;
+      if (det && (det.headerRow !== t.headerRow || det.dataStartRow !== t.dataStartRow || det.curCount !== t.curCount || det.footerLastRow !== t.footerLastRow)) {
+        nt.headerRow = det.headerRow; nt.dataStartRow = det.dataStartRow; nt.curCount = det.curCount; nt.footerLastRow = det.footerLastRow; moved++;
+      }
+      const cm = byCol[t.sheetName];
+      if (cm) { const nc = {}; Object.keys(t.cols || {}).forEach(col => { const ncol = cm[col] || col; if (ncol !== col) moved++; nc[ncol] = t.cols[col]; }); nt.cols = nc; }
+      return nt;
+    });
+    return { tables: out, moved };
+  };
+  // ── PPT：全 slide 的 <a:p> 位置（全域段落序·同 pptParagraphs）＋各 <p:sp> span ──
+  function _pptParaPos(xml) { const pos = []; let m; const re = /<a:p>/g; while ((m = re.exec(xml))) pos.push(m.index); return pos; }
+  function _pptSpSpans(xml) { const out = []; let m; const re = /<p:sp>[\s\S]*?<\/p:sp>/g; while ((m = re.exec(xml))) out.push({ start: m.index, end: m.index + m[0].length }); return out; }
+  // gIdx（全域段落 index）→ {shapeIdx, localIdx}；段落不在任何 p:sp（表格/群組）→ null（不種·退回位置 key）
+  RT._pptLocate = function (xml, gIdx) {
+    const pos = _pptParaPos(xml), spans = _pptSpSpans(xml), p = pos[gIdx]; if (p == null) return null;
+    for (let si = 0; si < spans.length; si++) if (p >= spans[si].start && p < spans[si].end) {
+      const offset = pos.filter(q => q < spans[si].start).length; return { shapeIdx: si, localIdx: gIdx - offset };
+    }
+    return null;
+  };
+  function _stripPmcDescr(xml) { return xml.replace(/(<p:cNvPr\b[^>]*?)\s+descr="_PMC:[^"]*"/g, '$1'); }
+  RT._seedDescrShapes = function (xml, payloads) {   // payloads={shapeIdx:'local=orig|...'}（傳入前已 _stripPmcDescr）
+    let i = -1;
+    return xml.replace(/<p:sp>[\s\S]*?<\/p:sp>/g, block => {
+      i++; const pl = payloads[i]; if (pl == null) return block;
+      const descr = '_PMC:' + pl;
+      if (/<p:cNvPr\b[^>]*\/>/.test(block)) return block.replace(/(<p:cNvPr\b[^>]*?)(\s*\/>)/, `$1 descr="${descr}"$2`);
+      return block.replace(/(<p:cNvPr\b[^>]*?)(>)/, `$1 descr="${descr}"$2`);
+    });
+  };
+  RT._readAnchorsPptx = function (xml, path) {   // →[{origKey,curKey}]
+    const pos = _pptParaPos(xml), spans = _pptSpSpans(xml), out = [];
+    spans.forEach(sp => {
+      const block = xml.slice(sp.start, sp.end), dm = block.match(/<p:cNvPr\b[^>]*\bdescr="(_PMC:[^"]*)"/);
+      if (!dm) return;
+      const offset = pos.filter(q => q < sp.start).length;
+      dm[1].replace(/^_PMC:/, '').split('|').forEach(seg => { const kv = seg.split('='); if (kv[1] == null) return; out.push({ origKey: path + '#' + kv[1], curKey: path + '#' + (offset + Number(kv[0])) }); });
+    });
+    return out;
+  };
+  // ── 共用：把 {origKey→curKey} 錨點套進 mapping/pptMap（key 位移·config 不動·rule10/15 單一重對邏輯）──
+  RT.reanchorMap = function (mapping, anchors) {
+    if (!anchors || !anchors.length) return { map: mapping, moved: 0 };
+    const byOrig = {}; anchors.forEach(a => { byOrig[a.origKey] = a.curKey; });
+    const out = {}; Object.keys(mapping || {}).forEach(k => { out[byOrig[k] || k] = mapping[k]; });
+    const moved = anchors.filter(a => a.origKey !== a.curKey && mapping && mapping[a.origKey] != null).length;
+    return { map: out, moved };
+  };
+  // ── 薄 JSZip 包裝（定型種／re-import 讀）──
+  RT.seedAnchorsXlsx = async function (ab, mapping, tables) {
+    const zip = await JSZip.loadAsync(ab), f = zip.file('xl/workbook.xml'); if (!f) return new Uint8Array(ab);
+    let xml = await f.async('string');
+    const entries = Object.keys(mapping || {}).map(k => ({ name: RT._anchorName(k), ref: escXml(RT._keyToRef(k) || '') })).filter(e => e.ref);
+    (tables || []).forEach(t => {   // 第二批：表格每個綁定欄→表頭格 defined name
+      const q = "'" + String(t.sheetName).replace(/'/g, "''") + "'!$";
+      Object.keys(t.cols || {}).forEach(col => { if (t.headerRow) entries.push({ name: RT._tcolName(t.sheetName, col), ref: escXml(q + col + '$' + t.headerRow) }); });
+    });
+    zip.file('xl/workbook.xml', RT._seedDefinedNames(xml, entries));
+    return zip.generateAsync({ type: 'uint8array' });
+  };
+  RT.readAnchorsXlsx = async function (ab) {
+    const zip = await JSZip.loadAsync(ab), f = zip.file('xl/workbook.xml'); return f ? RT._readAnchorsXlsx(await f.async('string')) : [];
+  };
+  RT.readTableColsXlsx = async function (ab) {
+    const zip = await JSZip.loadAsync(ab), f = zip.file('xl/workbook.xml'); return f ? RT._readTableColsXlsx(await f.async('string')) : [];
+  };
+  RT.seedAnchorsPptx = async function (ab, pptMap) {
+    const zip = await JSZip.loadAsync(ab), bySlide = {};
+    Object.keys(pptMap || {}).forEach(k => { const i = k.indexOf('#'); if (i < 0) return; (bySlide[k.slice(0, i)] = bySlide[k.slice(0, i)] || []).push(Number(k.slice(i + 1))); });
+    const names = Object.keys(zip.files).filter(n => /ppt\/slides\/slide\d+\.xml$/.test(n));
+    for (const path of names) {
+      let xml = _stripPmcDescr(await zip.file(path).async('string'));
+      const gidxs = bySlide[path] || [];
+      if (gidxs.length) {
+        const payloads = {};
+        gidxs.forEach(gi => { const loc = RT._pptLocate(xml, gi); if (!loc) return; payloads[loc.shapeIdx] = (payloads[loc.shapeIdx] ? payloads[loc.shapeIdx] + '|' : '') + (loc.localIdx + '=' + gi); });
+        xml = RT._seedDescrShapes(xml, payloads);
+      }
+      zip.file(path, xml);
+    }
+    return zip.generateAsync({ type: 'uint8array' });
+  };
+  RT.readAnchorsPptx = async function (ab) {
+    const zip = await JSZip.loadAsync(ab), out = [];
+    const names = Object.keys(zip.files).filter(n => /ppt\/slides\/slide\d+\.xml$/.test(n));
+    for (const path of names) out.push.apply(out, RT._readAnchorsPptx(await zip.file(path).async('string'), path));
+    return out;
+  };
+
+  // ══ PPT 引擎（段落級·多 run 免疫·§24.14 Phase 4·POC-3+ppt-engine 已驗）══
+  const pEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  function pptParagraphs(xml) {
+    const out = [], tbl = [];
+    let tm; const tRe = /<a:tbl>[\s\S]*?<\/a:tbl>/g; while ((tm = tRe.exec(xml))) tbl.push([tm.index, tm.index + tm[0].length]);
+    let m; const pRe = /<a:p>([\s\S]*?)<\/a:p>/g;
+    while ((m = pRe.exec(xml))) {
+      const text = (m[1].match(/<a:t>([\s\S]*?)<\/a:t>/g) || []).map(t => t.replace(/<\/?a:t>/g, '')).join('');
+      out.push({ text, inTable: tbl.some(([a, b]) => m.index >= a && m.index < b) });
+    }
+    return out;
+  }
+  function pptSetPara(xml, pIndex, newText) {
+    let i = -1;
+    return xml.replace(/<a:p>([\s\S]*?)<\/a:p>/g, (m, inner) => {
+      i++; if (i !== pIndex) return m;
+      const pPr = (inner.match(/<a:pPr[\s\S]*?(?:\/>|<\/a:pPr>)/) || [''])[0];
+      const rPr = (inner.match(/<a:rPr[\s\S]*?(?:\/>|<\/a:rPr>)/) || [''])[0];
+      const endPr = (inner.match(/<a:endParaRPr[\s\S]*?(?:\/>|<\/a:endParaRPr>)/) || [''])[0];
+      return '<a:p>' + pPr + '<a:r>' + rPr + '<a:t>' + pEsc(newText) + '</a:t></a:r>' + endPr + '</a:p>';
+    });
+  }
+  // 表格：scan（每頁 <a:tbl> 欄/表頭/資料列數）＋逐列填入（clone <a:tr>·POC 9/9 驗）
+  function pptScanTables(xml) {
+    return (xml.match(/<a:tbl>[\s\S]*?<\/a:tbl>/g) || []).map((t, tblIndex) => {
+      const rows = t.match(/<a:tr\b[\s\S]*?<\/a:tr>/g) || [];
+      const cols = (rows[0] || '').match(/<a:tc>[\s\S]*?<\/a:tc>/g) || [];
+      return { tblIndex, colCount: cols.length, dataRowCount: Math.max(0, rows.length - 1), headerTexts: cols.map(c => (c.match(/<a:t>([\s\S]*?)<\/a:t>/) || [, ''])[1]) };
+    });
+  }
+  function pptSetCell(cellXml, text) {
+    let done = false;
+    return cellXml.replace(/<a:p>([\s\S]*?)<\/a:p>/, (m, inner) => {
+      if (done) return m; done = true;
+      const pPr = (inner.match(/<a:pPr[\s\S]*?(?:\/>|<\/a:pPr>)/) || [''])[0];
+      const rPr = (inner.match(/<a:rPr[\s\S]*?(?:\/>|<\/a:rPr>)/) || [''])[0];
+      const endPr = (inner.match(/<a:endParaRPr[\s\S]*?(?:\/>|<\/a:endParaRPr>)/) || [''])[0];
+      return '<a:p>' + pPr + '<a:r>' + rPr + '<a:t>' + pEsc(text) + '</a:t></a:r>' + endPr + '</a:p>';
+    });
+  }
+  function pptBuildTbl(tblXml, headerRows, records) {
+    const rows = tblXml.match(/<a:tr\b[\s\S]*?<\/a:tr>/g) || [];
+    const grid = (tblXml.match(/<a:tblGrid>[\s\S]*?<\/a:tblGrid>/) || [''])[0];
+    const pr = (tblXml.match(/<a:tblPr[\s\S]*?(?:\/>|<\/a:tblPr>)/) || ['<a:tblPr/>'])[0];
+    const header = rows.slice(0, headerRows).join('');
+    const tmpl = rows[headerRows] || rows[rows.length - 1];
+    const trOpen = tmpl.match(/<a:tr\b[^>]*>/)[0];
+    const data = records.map(rec => {
+      const cells = tmpl.match(/<a:tc>[\s\S]*?<\/a:tc>/g) || [];
+      return trOpen + cells.map((c, i) => pptSetCell(c, rec[i] != null ? rec[i] : '')).join('') + '</a:tr>';
+    }).join('');
+    return '<a:tbl>' + pr + grid + header + data + '</a:tbl>';
+  }
+  function pptFillTable(xml, tblIndex, headerRows, records) {
+    let i = -1;
+    return xml.replace(/<a:tbl>[\s\S]*?<\/a:tbl>/g, m => { i++; return i === tblIndex ? pptBuildTbl(m, headerRows, records) : m; });
+  }
+  RT.scanSlides = async function (ab) {
+    const zip = await JSZip.loadAsync(ab);
+    const names = Object.keys(zip.files).filter(n => /ppt\/slides\/slide\d+\.xml$/.test(n)).sort((a, b) => (+a.match(/slide(\d+)/)[1]) - (+b.match(/slide(\d+)/)[1]));
+    const slides = [];
+    // no＝檔內順序位置 1..n（非檔名數字——刪過頁的檔 slideN 不連號·位置制才對齊 User 在 PowerPoint 看到的頁次·範圍選頁靠它）
+    for (let i = 0; i < names.length; i++) { const n = names[i], xml = await zip.file(n).async('string'); slides.push({ path: n, no: i + 1, paras: pptParagraphs(xml), tables: pptScanTables(xml) }); }
+    return slides;
+  };
+  // spec = { paraEdits:[{slidePath,pIndex,text}], tableFills:[{slidePath,tblIndex,headerRows,records}] }
+  RT.fillPptx = async function (ab, spec) {
+    const paraEdits = spec.paraEdits || (Array.isArray(spec) ? spec : []), tableFills = spec.tableFills || [];
+    const zip = await JSZip.loadAsync(ab), bySlide = {};
+    paraEdits.forEach(e => (bySlide[e.slidePath] = bySlide[e.slidePath] || { p: [], t: [] }).p.push(e));
+    tableFills.forEach(e => (bySlide[e.slidePath] = bySlide[e.slidePath] || { p: [], t: [] }).t.push(e));
+    for (const [sp, ops] of Object.entries(bySlide)) {
+      const f = zip.file(sp); if (!f) continue;   // 失聯頁防呆：對應指到檔裡不存在的投影片（延續舊範本/換過原檔）→ 跳過不炸
+      let xml = await f.async('string');
+      ops.p.sort((a, b) => b.pIndex - a.pIndex).forEach(e => { xml = pptSetPara(xml, e.pIndex, e.text); });   // 先段落（不改 <a:p> 數）
+      ops.t.forEach(e => { xml = pptFillTable(xml, e.tblIndex, e.headerRows || 1, e.records); });               // 再表格（改列數）
+      zip.file(sp, xml);
+    }
+    return zip.generateAsync({ type: 'uint8array' });
+  };
+
+  // ══ §24.15.11 批2：重複區塊 slide 克隆引擎（坑6 深拷貝檢查表·zip 層由 scratchpad/report-poc/poc-clone.js POC 驗過）══
+  //   克隆＝拷 slideN.xml＋同名 .rels（媒體/版面沿用同目標·不複製本體·notesSlide 關聯剝除）
+  //   ＋ [Content_Types].xml Override ＋ presentation.xml.rels Relationship ＋ sldIdLst 插在範本頁正後方（原位展開）。
+  RT._stripNotesRel = rels => String(rels).replace(/<Relationship [^>]*notesSlide[^>]*\/>/g, '');
+  // 純字串核心（node 可測免 jszip）：算新檔名/rId/sldId＋三處註冊字串。找不到範本頁回 null。
+  RT._cloneSlidesCore = function (opts) {
+    const pres = opts.pres, presRels = opts.presRels, ct = opts.ct, count = opts.count;
+    const tplName = String(opts.tplPath).split('/').pop();
+    const slideCT = 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml';
+    const relHit = (presRels.match(new RegExp('<Relationship [^>]*Target="slides/' + tplName + '"[^>]*/>')) || [])[0];
+    if (!relHit) return null;
+    const tplRid = (relHit.match(/Id="([^"]+)"/) || [])[1];
+    const tplSld = (pres.match(new RegExp('<p:sldId id="\\d+" r:id="' + tplRid + '"\\s*/>')) || [])[0];
+    if (!tplSld) return null;
+    const maxNo = Math.max.apply(null, opts.slideNames.map(n => +(String(n).match(/slide(\d+)\.xml$/) || [0, 0])[1]));
+    const maxRid = Math.max.apply(null, Array.from(presRels.matchAll(/Id="rId(\d+)"/g)).map(m => +m[1]));
+    const maxSid = Math.max.apply(null, [255].concat(Array.from(pres.matchAll(/<p:sldId id="(\d+)"/g)).map(m => +m[1])));
+    let relAdd = '', sldAdd = '', ctAdd = '';
+    const clones = [];
+    for (let i = 1; i <= count; i++) {
+      const name = 'slide' + (maxNo + i) + '.xml';
+      clones.push('ppt/slides/' + name);
+      ctAdd += '<Override PartName="/ppt/slides/' + name + '" ContentType="' + slideCT + '"/>';
+      relAdd += '<Relationship Id="rId' + (maxRid + i) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/' + name + '"/>';
+      sldAdd += '<p:sldId id="' + (maxSid + i) + '" r:id="rId' + (maxRid + i) + '"/>';
+    }
+    return {
+      pres: pres.replace(tplSld, tplSld + sldAdd),
+      presRels: presRels.replace('</Relationships>', relAdd + '</Relationships>'),
+      ct: ct.replace('</Types>', ctAdd + '</Types>'),
+      clones: clones,
+    };
+  };
+  // JSZip 薄包裝：把範本頁克隆 count 份（內容原樣·填值交給 fillPptx）。回 {u8, clonePaths}。
+  RT.cloneSlidesPptx = async function (ab, tplPath, count) {
+    const zip = await JSZip.loadAsync(ab);
+    if (!count || count <= 0) return { u8: await zip.generateAsync({ type: 'uint8array' }), clonePaths: [] };
+    const read = p => zip.file(p).async('string');
+    const core = RT._cloneSlidesCore({
+      pres: await read('ppt/presentation.xml'), presRels: await read('ppt/_rels/presentation.xml.rels'),
+      ct: await read('[Content_Types].xml'), tplPath: tplPath, count: count,
+      slideNames: Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n)),
+    });
+    if (!core) throw new Error('找不到重複頁：' + tplPath);
+    const tplXml = await read(tplPath);
+    const relsFile = zip.file('ppt/slides/_rels/' + tplPath.split('/').pop() + '.rels');
+    const tplRels = relsFile ? RT._stripNotesRel(await relsFile.async('string')) : null;
+    core.clones.forEach(p => { zip.file(p, tplXml); if (tplRels) zip.file('ppt/slides/_rels/' + p.split('/').pop() + '.rels', tplRels); });
+    zip.file('ppt/presentation.xml', core.pres);
+    zip.file('ppt/_rels/presentation.xml.rels', core.presRels);
+    zip.file('[Content_Types].xml', core.ct);
+    return { u8: await zip.generateAsync({ type: 'uint8array' }), clonePaths: core.clones };
+  };
+  // 重複頁產出規劃（純函式·node 可測）：範本頁＋克隆頁逐頁代入該頁 record。
+  //   pagePaths[0]=範本頁（第 1 個專案）、其後=克隆頁；map/tables 只認掛在範本頁 path 的綁定。
+  //   fieldGet=RT.projField（可注入測試替身）；rowsFor(pt, rec)=該頁表格列資料（批4 接 PROJ_ROW_SOURCES＋colmap）。
+  RT.buildRepeatSpec = function (opts) {
+    const tplPath = opts.tplPath, pagePaths = opts.pagePaths, records = opts.records;
+    const paraEdits = [], tableFills = [];
+    pagePaths.forEach(function (path, k) {
+      const rec = records[k]; if (!rec) return;
+      Object.keys(opts.map || {}).forEach(function (key) {
+        if (key.indexOf(tplPath + '#') !== 0) return;
+        const r = RT.resolveBinding(opts.map[key], rec, opts.fieldGet);
+        if (r === RT.SKIP) return;
+        paraEdits.push({ slidePath: path, pIndex: +key.slice(tplPath.length + 1), text: r == null ? '' : String(r) });
+      });
+      (opts.tables || []).forEach(function (pt) {
+        if (pt.slidePath !== tplPath) return;
+        tableFills.push({ slidePath: path, tblIndex: pt.tblIndex, headerRows: pt.headerRows || 1, records: opts.rowsFor ? opts.rowsFor(pt, rec) : [] });
+      });
+    });
+    return { paraEdits: paraEdits, tableFills: tableFills };
+  };
+
+  // ══ IndexedDB blob store（原檔二進位·上限 Excel5+PPT5·每範本留「上一版+最新」共 ≤20·§24.3/§24.14）══
+  RT.CAP = 5;
+  const IDB = { name: 'pmcore-report', store: 'blobs' };
+  function idb() { return new Promise((res, rej) => { const r = indexedDB.open(IDB.name, 1); r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains(IDB.store)) r.result.createObjectStore(IDB.store); }; r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+  function idbOp(mode, fn) { return idb().then(db => new Promise((res, rej) => { const tx = db.transaction(IDB.store, mode); const st = tx.objectStore(IDB.store); const rq = fn(st); tx.oncomplete = () => res(rq && rq.result); tx.onerror = () => rej(tx.error); })); }
+  const prevKey = id => id + '__prev';
+  RT.blobGet = id => idbOp('readonly', st => st.get(id));
+  RT.blobHasPrev = id => idbOp('readonly', st => st.get(prevKey(id))).then(v => !!v);
+  RT.blobPut = async function (id, u8, keepPrev) {
+    if (keepPrev) { const cur = await RT.blobGet(id); if (cur) await idbOp('readwrite', st => st.put(cur, prevKey(id))); }
+    return idbOp('readwrite', st => st.put(u8, id));
+  };
+  RT.blobDel = id => idbOp('readwrite', st => { st.delete(id); return st.delete(prevKey(id)); });
+  RT.blobRestorePrev = async function (id) { const prev = await RT.blobGet(prevKey(id)), cur = await RT.blobGet(id); if (!prev) return false; if (cur) await idbOp('readwrite', st => st.put(cur, prevKey(id))); await idbOp('readwrite', st => st.put(prev, id)); return true; };
+
+  // ══ base64（僅舊資料遷移用）/ 取範本原檔（IndexedDB·相容舊 b64→自動遷移）/ 下載 ══
+  function b64ToU8(b64) { const s = atob(b64); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+  function u8ToB64(u8) { let s = ''; const ch = 0x8000; for (let i = 0; i < u8.length; i += ch) s += String.fromCharCode.apply(null, u8.subarray(i, i + ch)); return btoa(s); }
+  async function rgGetBlob(t) {
+    const u8 = await RT.blobGet(t.id); if (u8) return u8.buffer ? u8.buffer : u8;
+    if (t.b64) { const u = b64ToU8(t.b64); await RT.blobPut(t.id, u); Store.reportTemplates.update(t.id, { b64: null }); return u.buffer; }   // 舊資料遷移
+    throw new Error('找不到範本原檔（可能在別台機器匯入·本機沒有）');
+  }
+  function rgCountType(type) { return (DATA.reportTemplates || []).filter(t => (t.type || 'xlsx') === type).length; }
+  const MIME = { xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
+  function downloadFile(u8, filename, type) {
+    const blob = new Blob([u8], { type: MIME[type] || MIME.xlsx });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+  }
+
+  // ══ 頁面 ══
+
+  App._rgSwitchTab = function (t) { App._rgTab = t; App.renderReportGen(); };
+  function rgCardHtml(t) {
+    const type = t.type || 'xlsx', badge = type === 'pptx' ? '<span class="rg-badge pptx">◧ PPT</span>' : '<span class="rg-badge">▦ EXCEL</span>';
+    let body;
+    if (type === 'pptx') {
+      const n = Object.keys(t.pptMap || {}).length, nt = (t.pptTables || []).length;
+      body = `<div>🖼 ${t.slideCount || '?'} 頁投影片</div><div>🔗 ${n} 個文字對應${nt ? `　🔁 ${nt} 張重複表格` : ''}</div>`;
+    } else {
+      const tabs = (t.tables && t.tables.length) ? t.tables : (t.table ? [t.table] : []);
+      const tbl = tabs.length ? `<div>🔁 重複表格 ${tabs.length} 張：${tabs.map(x => `${U.esc(x.sheetName)}(${Object.keys(x.cols || {}).length}欄)`).join('、')}</div>` : '';
+      body = `<div>🔗 ${Object.keys(t.mapping || {}).length} 個單格對應</div>${tbl}`;
+    }
+    return `<div class="rg-card">${badge}
+      <div class="rg-name">${U.esc(t.name)}</div>
+      <div class="rg-src"><div>📄 原始檔：${U.esc(t.srcName || '')}</div>${body}
+        <div>⏳ ${t.updatedAt ? '上次產出 ' + U.esc(t.updatedAt) : '尚未產出'}</div></div>
+      <div class="rg-acts">
+        <button class="rg-btn primary rg-main" onclick="App._rgProduce('${t.id}')">⚡ 產生最新報表</button>
+        <button class="rg-btn ghost" onclick="App._rgEdit('${t.id}')">⚙ 編輯對應設定</button>
+        <div class="rg-more-wrap">
+          <button class="rg-btn rg-more" onclick="App._rgCardMenu(event,'${t.id}')" title="更多（低頻）">⋯</button>
+          <div class="rg-menu" id="rgmenu-${t.id}">
+            <div class="rg-menu-h">更多（低頻）</div>
+            <button class="rg-menu-i" onclick="App._rgCardMenuDo(event,'_rgDownloadMaster','${t.id}')" title="下載已種隱形錨點的工作母檔。你／上級改這份，改完用「更新原檔」上傳，對應會自動跟著搬（插列、重排也不脫鉤）">⬇ 下載工作母檔</button>
+            <button class="rg-menu-i" onclick="App._rgCardMenuDo(event,'_rgReplaceFile','${t.id}')" title="上傳新版原檔取代（舊版降為上一版）">🔄 更新原檔（換新版）</button>
+            <button class="rg-menu-i" onclick="App._rgCardMenuDo(event,'_rgRestorePrev','${t.id}')" title="還原到上一版原檔">↩ 還原上一版</button>
+            <button class="rg-menu-i danger" onclick="App._rgCardMenuDo(event,'_rgDelete','${t.id}')">🗑 刪除範本</button>
+          </div>
+        </div></div></div>`;
+  }
+  // §24.15.10 ① 溢位「⋯」選單：純 DOM 開合·點外自動關（不重繪整頁）
+  App._rgCardMenu = function (ev, id) {
+    ev.stopPropagation();
+    const menu = document.getElementById('rgmenu-' + id); if (!menu) return;
+    const open = menu.classList.contains('open');
+    document.querySelectorAll('.rg-menu.open').forEach(m => m.classList.remove('open'));
+    if (!open) {
+      menu.classList.add('open');
+      setTimeout(() => document.addEventListener('click', function h() { menu.classList.remove('open'); document.removeEventListener('click', h); }), 0);
+    }
+  };
+  App._rgCardMenuDo = function (ev, fn, id) { ev.stopPropagation(); const m = ev.target.closest('.rg-menu'); if (m) m.classList.remove('open'); App[fn](id); };
+  App.renderReportGen = function () {
+    const el = document.getElementById('page-reportgen'); if (!el) return;
+    const tpls = DATA.reportTemplates || [];
+    const nx = rgCountType('xlsx'), np = rgCountType('pptx');
+    if (App._rgTab !== 'xlsx' && App._rgTab !== 'pptx') App._rgTab = (nx === 0 && np > 0) ? 'pptx' : 'xlsx';
+    const tab = App._rgTab, isP = tab === 'pptx';
+    const cards = tpls.filter(t => (t.type || 'xlsx') === tab).map(rgCardHtml).join('')
+      || '<div class="rg-empty-tab">這一類還沒有範本，點左邊「上傳新報表範本」建立第一個。</div>';
+    const hint = App.buildHintBox({ key: 'reportgen-intro', icon: 'ti-help-circle', collapsed: true,
+      title: '報表產出怎麼用？', summary: '匯入你現有的 Excel／PPT 格式一次，之後按「更新產出」就撈最新資料、匯出一模一樣的檔',
+      bodyHtml: '① 上傳你現有的報表（Excel／PPT）→ ② 點格子／欄／文字設定「哪一格要撈系統的什麼資料」→ ③ 之後按「更新產出」就撈最新資料、匯出格式一模一樣的檔（公式／圖表／版面 byte 零破壞，系統只換資料格）。<br>原檔存在你這台電腦（IndexedDB），每份保留「上一版＋最新」；換機器用右上「匯出／匯入範本包」帶著走。' });
+    el.innerHTML = `<div class="rg-wrap">
+      <div class="rg-head"><div class="rg-headrow"><h1>報表產出</h1>
+        <div class="rg-headacts"><button class="rg-btn ghost-green" onclick="App._rgExportPack()" title="把所有範本＋原檔打包成一個檔·帶到別台匯入">⬇ 匯出範本包</button>
+          <button class="rg-btn ghost-green" onclick="document.getElementById('rg-file-pack').click()" title="匯入別台匯出的範本包">⬆ 匯入範本包</button></div></div>
+        ${hint}</div>
+      <div class="tabs rg-tabs2">
+        <button class="tab-btn ${!isP ? 'active' : ''}" onclick="App._rgSwitchTab('xlsx')">▦ Excel 報表 (${nx}/${RT.CAP})</button>
+        <button class="tab-btn ${isP ? 'active' : ''}" onclick="App._rgSwitchTab('pptx')">◧ PPT 簡報 (${np}/${RT.CAP})</button></div>
+      <div class="rg-grid">
+        <div class="rg-new" onclick="document.getElementById('rg-file').click()">
+          <div class="rg-plus">＋</div><div class="rg-new-t">上傳新報表範本</div>
+          <div class="rg-new-h">${isP ? '上傳你現有的 PPT（.pptx）' : '上傳你現有的 Excel（.xlsx）'}，也可直接拖進來</div>
+          <div class="rg-cap">${isP ? 'PPT' : 'Excel'} 額度 ${isP ? np : nx}/${RT.CAP}</div></div>
+        ${cards}
+      </div>
+      <input type="file" id="rg-file" accept=".xlsx,.pptx" style="display:none" onchange="App._rgOnFile(this)">
+      <input type="file" id="rg-file-replace" accept=".xlsx,.pptx" style="display:none" onchange="App._rgOnReplace(this)">
+      <input type="file" id="rg-file-pack" accept=".json" style="display:none" onchange="App._rgImportPack(this)"></div>`;
+  };
+
+  App._rgOnFile = function (input) {
+    const file = input.files && input.files[0]; if (!file) return;
+    const isPpt = /\.pptx$/i.test(file.name), type = isPpt ? 'pptx' : 'xlsx';
+    if (!isPpt && !/\.xlsx$/i.test(file.name)) { input.value = ''; return App.confirmModal({ title: '格式不支援', msg: '目前只支援 .xlsx 與 .pptx。', okText: '知道了', cancelText: null }); }
+    if (rgCountType(type) >= RT.CAP) { input.value = ''; return App.confirmModal({ title: '已達上限', msg: `${type === 'pptx' ? 'PPT' : 'Excel'} 範本最多 ${RT.CAP} 個，請先刪一個再匯入。`, okText: '知道了', cancelText: null }); }
+    const rd = new FileReader();
+    rd.onload = async e => {
+      try {
+        const ab = e.target.result;
+        if (isPpt) {
+          const slides = await RT.scanSlides(ab);
+          _rgOpenWithFpCheck({ srcName: file.name, name: file.name.replace(/\.pptx$/i, ''), type: 'pptx', ab, slides, pptMap: {}, pptTables: [], slideIdx: 0, sel: null, selKey: null, editId: null });
+        } else {
+          _rgOpenWithFpCheck({ srcName: file.name, name: file.name.replace(/\.xlsx$/i, ''), type: 'xlsx', ab, scan: RT.scanWorkbook(ab), sheetIdx: 0, mapping: {}, tables: [], sel: null, editId: null });
+        }
+      } catch (err) { App.confirmModal({ title: '讀取失敗', msg: '這個檔案讀不進來：' + (err.message || err), okText: '知道了', cancelText: null }); }
+      input.value = '';
+    };
+    rd.readAsArrayBuffer(file);
+  };
+  // §24.15 第②期：先開新精靈（fresh），若指紋比對到相似存檔→疊 confirmModal 提議延續其對應
+  function _rgOpenWithFpCheck(base) {
+    base._fp = RT.fingerprint(base);
+    App._rg = base; App._rgWizard();
+    const cands = (DATA.reportTemplates || []).filter(t => (t.type || 'xlsx') === base.type && t.fp);
+    const m = RT.bestFpMatch(base._fp, cands);
+    if (m && m.score >= RT.FP_THRESHOLD) {
+      App.confirmModal({
+        title: '偵測到相似範本', icon: 'ti-copy',
+        msg: `這份檔案的結構很像你存過的範本「<b>${U.esc(m.name)}</b>」（結構相似 <b>${Math.round(m.score * 100)}%</b>）。要<b>延續它的對應設定</b>當起點嗎？延續後仍可逐項調整。`,
+        okText: '延續它的對應', cancelText: '當作全新範本',
+        onConfirm: () => _rgApplyTemplateConfig(m.id)
+      });
+    }
+  }
+  function _rgApplyTemplateConfig(id) {
+    const t = (DATA.reportTemplates || []).find(x => x.id === id), rg = App._rg;
+    if (!t || !rg) return;
+    if (rg.type === 'pptx') { rg.pptMap = JSON.parse(JSON.stringify(t.pptMap || {})); rg.pptTables = JSON.parse(JSON.stringify(t.pptTables || [])); rg.repeats = JSON.parse(JSON.stringify(t.repeats || [])); rg.cls = null; }   // §24.15.11 延續也帶重複頁身分·重分類讓欄位目錄換邊
+    else { rg.mapping = JSON.parse(JSON.stringify(t.mapping || {})); rg.tables = t.tables ? JSON.parse(JSON.stringify(t.tables)) : (t.table ? [JSON.parse(JSON.stringify(t.table))] : []); }
+    rg._seeded = false;         // 重新 seed 補範本沒涵蓋的新槽（不覆蓋延續來的對應）
+    rg._contFrom = t.name;
+    App._rgWizard(); U.toast('已延續「' + t.name + '」的對應');
+  }
+  // §24.15 第②期：下載「帶錨點工作母檔」（即時種入當前對應的隱形錨點·不論範本何時建的都拿到最新錨點）
+  App._rgDownloadMaster = async function (id) {
+    const t = (DATA.reportTemplates || []).find(x => x.id === id); if (!t) return;
+    let ab; try { ab = await rgGetBlob(t); } catch (e) { return App.confirmModal({ title: '找不到原檔', msg: e.message, okText: '知道了', cancelText: null }); }
+    const type = t.type || 'xlsx';
+    try {
+      const seeded = type === 'pptx' ? await RT.seedAnchorsPptx(ab, t.pptMap) : await RT.seedAnchorsXlsx(ab, t.mapping, tablesOf(t));
+      downloadFile(seeded, (t.name || '範本') + '_帶錨點.' + type, type);
+      U.toast('已下載帶錨點母檔');
+    } catch (e) { App.confirmModal({ title: '下載失敗', msg: '種錨點時出錯：' + (e.message || e), okText: '知道了', cancelText: null }); }
+  };
+  App._rgRestorePrev = async function (id) {
+    if (!(await RT.blobHasPrev(id))) return U.toast('沒有上一版可還原', 'warning');
+    App.confirmModal({ title: '還原上一版', msg: '把這個範本的原檔換回「上一版」？（會與目前這版對調）', okText: '還原', onConfirm: async () => { await RT.blobRestorePrev(id); U.toast('已還原上一版'); } });
+  };
+  // 更新原檔：上傳新版取代（舊版降為上一版·對應設定沿用）
+  App._rgReplaceFile = function (id) { App._rgReplaceId = id; document.getElementById('rg-file-replace').click(); };
+  App._rgOnReplace = function (input) {
+    const file = input.files && input.files[0], id = App._rgReplaceId; input.value = ''; App._rgReplaceId = null;
+    if (!file || !id) return;
+    const t = (DATA.reportTemplates || []).find(x => x.id === id); if (!t) return;
+    const type = t.type || 'xlsx', ok = type === 'pptx' ? /\.pptx$/i.test(file.name) : /\.xlsx$/i.test(file.name);
+    if (!ok) return App.confirmModal({ title: '類型不符', msg: `這個範本是 ${type === 'pptx' ? 'PPT' : 'Excel'}，請上傳同類型的檔。`, okText: '知道了', cancelText: null });
+    const rd = new FileReader();
+    rd.onload = async e => {
+      try {
+        const ab = e.target.result;
+        await RT.blobPut(id, new Uint8Array(ab), true);   // keepPrev：舊版降為上一版
+        const upd = { srcName: file.name };
+        let newSlides = null;
+        if (type === 'pptx') { newSlides = await RT.scanSlides(ab); upd.slideCount = newSlides.length; }
+        let moved = 0, pruned = 0;   // §24.15 第②期：新檔帶隱形錨點→按現在位置重對錨（結構位移也不脫鉤·無錨點則保持原對應）
+        try {   // TODO(實測·真Excel)：defined name 插列/插欄自動調整＋此重對錨全鏈路，需一次真 Excel 開檔存檔驗證（headless 無法跑 Excel）
+          if (type === 'pptx') {
+            const r = RT.reanchorMap(t.pptMap || {}, await RT.readAnchorsPptx(ab)); if (r.moved) moved = r.moved;
+            // 失聯頁剪裁：新檔沒有的投影片·其對應 key 移除（否則產出永遠指到不存在的頁）
+            const live = {}; (newSlides || []).forEach(sl => { live[sl.path] = 1; });
+            const map = {}; Object.keys(r.map || {}).forEach(k => { if (live[k.split('#')[0]]) map[k] = r.map[k]; else pruned++; });
+            const pt = (t.pptTables || []).filter(p => { if (live[p.slidePath]) return true; pruned++; return false; });
+            if (moved || pruned) { upd.pptMap = map; upd.pptTables = pt; }
+          }
+          else {
+            const scan = RT.scanWorkbook(ab), liveSheet = {}; (scan.sheets || []).forEach(sh => { liveSheet[sh.name] = 1; });
+            const r = RT.reanchorMap(t.mapping || {}, await RT.readAnchorsXlsx(ab)); if (r.moved) moved = r.moved;
+            const map = {}; Object.keys(r.map || {}).forEach(k => { if (liveSheet[k.split('!')[0]]) map[k] = r.map[k]; else pruned++; });
+            if (moved || pruned) upd.mapping = map;
+            let tabs = tablesOf(t);   // 第二批：表格重偵測列＋欄錨點重對欄
+            const beforeTabs = tabs.length; tabs = tabs.filter(x => liveSheet[x.sheetName]); pruned += beforeTabs - tabs.length;
+            if (tabs.length) { const rt = RT.reanchorTablesXlsx(tabs, scan, await RT.readTableColsXlsx(ab)); moved += rt.moved; if (rt.moved || pruned) { upd.tables = rt.tables; upd.table = null; } }
+            else if (pruned) { upd.tables = []; upd.table = null; }
+          }
+        } catch (e) { /* 無錨點/讀取失敗→保持原對應 */ }
+        Store.reportTemplates.update(id, upd);
+        App.renderReportGen();
+        const anchorNote = (moved ? `偵測到隱形錨點，已自動把 ${moved} 個對應點跟著新位置重新對齊。` : '') + (pruned ? `新檔裡找不到的 ${pruned} 個舊對應已移除。` : '');
+        App.confirmModal({ title: '原檔已更新', msg: anchorNote + '新版原檔已存，舊版已保留為「上一版」（可用 ↩ 上一版 還原）。若新檔結構有變，記得「編輯對應」重新檢查填空點。', okText: '知道了', cancelText: null });
+      } catch (err) { App.confirmModal({ title: '更新失敗', msg: '更新原檔時出錯：' + (err.message || err), okText: '知道了', cancelText: null }); }
+    };
+    rd.readAsArrayBuffer(file);
+  };
+  // 範本包匯出/匯入（跨機分享·純前端可攜檔·metadata＋原檔 base64 打包成單一 JSON）
+  App._rgExportPack = async function () {
+    const tpls = DATA.reportTemplates || []; if (!tpls.length) return U.toast('沒有範本可匯出', 'warning');
+    App.openLoadingModal('匯出中', '正在打包範本與原檔…');
+    try {
+      const out = { app: 'pm-core-report', version: 1, exportedAt: new Date().toISOString(), templates: [] };
+      for (const t of tpls) { let u8 = await RT.blobGet(t.id); if (!u8 && t.b64) u8 = b64ToU8(t.b64); out.templates.push(Object.assign({}, t, { b64: u8 ? u8ToB64(u8) : null })); }
+      const blob = new Blob([JSON.stringify(out)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'report-templates_' + new Date().toISOString().slice(0, 10) + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+      App.closeModal(); U.toast('已匯出 ' + tpls.length + ' 個範本包');
+    } catch (e) { App.closeModal(); App.confirmModal({ title: '匯出失敗', msg: e.message || e, okText: '知道了', cancelText: null }); }
+  };
+  App._rgImportPack = function (input) {
+    const file = input.files && input.files[0]; input.value = ''; if (!file) return;
+    const rd = new FileReader();
+    rd.onload = async e => {
+      try {
+        const pack = JSON.parse(e.target.result);
+        if (!pack || pack.app !== 'pm-core-report' || !Array.isArray(pack.templates)) throw new Error('這不是有效的範本包檔');
+        let added = 0, skipped = 0;
+        for (const tp of pack.templates) {
+          const type = tp.type || 'xlsx';
+          if (rgCountType(type) >= RT.CAP) { skipped++; continue; }
+          let id = tp.id; if ((DATA.reportTemplates || []).some(x => x.id === id)) id = 'rpt_' + Date.now() + '_' + added;
+          if (tp.b64) await RT.blobPut(id, b64ToU8(tp.b64), false);
+          Store.reportTemplates.add(Object.assign({}, tp, { id, b64: null })); added++;
+        }
+        App.renderReportGen();
+        App.confirmModal({ title: '匯入完成', msg: '已匯入 ' + added + ' 個範本' + (skipped ? '，' + skipped + ' 個因達上限略過' : '') + '。', okText: '知道了', cancelText: null });
+      } catch (err) { App.confirmModal({ title: '匯入失敗', msg: err.message || err, okText: '知道了', cancelText: null }); }
+    };
+    rd.readAsText(file);
+  };
+  App._rgEdit = async function (id) {
+    const t = (DATA.reportTemplates || []).find(x => x.id === id); if (!t) return;
+    let ab; try { ab = await rgGetBlob(t); } catch (e) { return App.confirmModal({ title: '找不到原檔', msg: e.message, okText: '知道了', cancelText: null }); }
+    if ((t.type || 'xlsx') === 'pptx') {
+      App._rg = { srcName: t.srcName, name: t.name, type: 'pptx', ab, slides: await RT.scanSlides(ab), pptMap: JSON.parse(JSON.stringify(t.pptMap || {})), pptTables: JSON.parse(JSON.stringify(t.pptTables || [])), repeats: JSON.parse(JSON.stringify(t.repeats || [])), slideIdx: 0, sel: null, selKey: null, editId: id };
+      return App._rgWizard();
+    }
+    const tables = t.tables ? JSON.parse(JSON.stringify(t.tables)) : (t.table ? [JSON.parse(JSON.stringify(t.table))] : []);   // 舊 table 單張→tables[] 遷移
+    App._rg = { srcName: t.srcName, name: t.name, type: 'xlsx', ab, scan: RT.scanWorkbook(ab), sheetIdx: 0,
+      mapping: JSON.parse(JSON.stringify(t.mapping || {})), tables, sel: null, editId: id };
+    App._rgWizard();
+  };
+
+  // ══ §24.15 智慧對應精靈（第①期·變體 C 左欄·吃 RT.classifySlots·取代「全攤開」grid）══
+  //   B（本批）：新殼＋左欄三層分區＋辨識條；中欄暫沿用既有 assign 面板（四型編輯器 Slice C 換入）。
+  //   底層 state（mapping/tables）與 _rgSave 不動——只換填 state 的方式（智慧預填→User 確認）。
+  // ── 型別工具（Excel/PPT 共用同一套殼·規則13·差異走這些 helper）──
+  const _isPpt = () => App._rg.type === 'pptx';
+  const _smStore = () => _isPpt() ? App._rg.pptMap : App._rg.mapping;                                  // 純量/段落綁定字典
+  const _smSlotKey = s => _isPpt() ? (s.slidePath + '#' + s.pIndex) : (s.sheetName + '!' + s.ref);      // 綁定 key
+  const _smRefKey = r => _isPpt() ? (r.slidePath + '#' + r.pIndex) : (r.sheetName + '!' + r.ref);        // dupRef → key
+  const _smRefLoc = r => _isPpt() ? ('第 ' + r.slideNo + ' 頁') : (r.sheetName + '!' + r.ref);
+  const _smExKey = s => _isPpt() ? s.slidePath : s.sheetName;                                            // 涵蓋率排除 key（整頁/整表）
+  const pptTblByPath = (path, ti) => (App._rg.pptTables || []).find(x => x.slidePath === path && x.tblIndex === ti);
+  // ── §24.15.11 批3：重複頁「每專案一頁」UX helpers／handlers ──
+  const _repOf = path => (App._rg.repeats || []).find(r => r.slidePath === path);
+  const _repRecsOf = rep => RT.repeatRecords(rep);
+  const _repPrevRec = rep => { const recs = _repRecsOf(rep), rg = App._rg; const i = Math.max(0, Math.min(rg._repIdx || 0, recs.length - 1)); return { recs, i, rec: recs[i] }; };
+  function _rgRepReclassify(path) {   // 標記/取消後：清該頁段落綁定＋確認旗標 → 重分類＋重 seed（欄位目錄換邊）
+    const rg = App._rg;
+    Object.keys(rg.pptMap || {}).forEach(k => { if (k.indexOf(path + '#') === 0) delete rg.pptMap[k]; });
+    (rg.pptTables || []).forEach(pt => { if (pt.slidePath === path) pt.rowSource = _repOf(path) ? 'projActiveTasks' : RT.ROW_SOURCES[0].key; });
+    Object.keys(rg.confirmed || {}).forEach(k => { if (k.indexOf(path + '#') === 0) delete rg.confirmed[k]; });
+    rg.cls = null; rg._seeded = false; rg._repIdx = 0; rg.selKey = null; rg.sel = null;
+    App._rgWizard();
+  }
+  App._rgRepMark = function (path) {
+    const rg = App._rg; rg.repeats = rg.repeats || [];
+    if (!_repOf(path)) rg.repeats.push({ slidePath: path, source: 'activeProjects', sort: 'openDate' });
+    _rgRepReclassify(path); U.toast('已設為重複頁——產出時每個專案長一頁');
+  };
+  App._rgRepUnmark = function (path) {
+    App.confirmModal({ title: '取消重複頁', msg: '取消後這頁變回一般頁；頁上的 per-專案對應會清掉、由系統重新自動配。', okText: '取消重複',
+      onConfirm: () => { const rg = App._rg; rg.repeats = (rg.repeats || []).filter(r => r.slidePath !== path); _rgRepReclassify(path); } });
+  };
+  App._rgRepDismiss = function (path) { const rg = App._rg; rg._repSuggOff = rg._repSuggOff || {}; rg._repSuggOff[path] = 1; App._rgWizard(); };
+  App._rgRepSrc = function (path, v) { const r = _repOf(path); if (r) { r.source = v; App._rg._repIdx = 0; App._rgWizard(); } };
+  App._rgRepSort = function (path, v) { const r = _repOf(path); if (r) { r.sort = v; App._rg._repIdx = 0; App._rgWizard(); } };
+  App._rgRepNav = function (d) { const rg = App._rg; rg._repIdx = (rg._repIdx || 0) + d; App._rgWizard(); };
+  App._rgRepSel = function (path) { const rg = App._rg; rg.selKey = 'rep!' + path; rg.sel = null; App._rgWizard(); };
+  const _smSlotId = s => s.kind === 'table' ? (_isPpt() ? ('ptbl!' + s.slidePath + '!' + s.tblIndex) : ('tbl!' + s.sheetName)) : _smSlotKey(s);
+  // 排除的工作表/投影片不計入（涵蓋率膠囊可點掉）
+  function _smActiveSlots() { const exc = App._rg.excluded || {}; return App._rg.cls.slots.filter(s => !exc[_smExKey(s)]); }
+  // 表格是否「每個有標題的欄都已對好」（全配好→視為就緒·收綠色）
+  function _tableAllMapped(s) {
+    const rg = App._rg;
+    if (_isPpt()) {
+      const pt = pptTblByPath(s.slidePath, s.tblIndex); if (!pt) return false;
+      return (s.tb.headerTexts || []).every((h, ci) => h == null || h === '' || (pt.cols || {})[ci] != null);
+    }
+    const tbl = rgTable(s.sheetName); if (!tbl) return false;
+    const sheet = rg.scan.sheets.find(x => x.name === s.sheetName);
+    const hr0 = s.det ? s.det.headerRow0 : (sheet ? sheet.headerRow : 0);
+    return ((sheet && sheet.aoa[hr0]) || []).every((h, c) => {
+      if (h == null || h === '') return true;
+      const col = RT.cellRef(sheet, hr0, c).match(/^[A-Z]+/)[0];
+      return (tbl.cols || {})[col] != null;
+    });
+  }
+  // 動態 effective tier（靈魂·§24.15.10 核心）：即時算「這張卡還需不需要 User」——
+  //   表格全欄配好→auto(就緒)；confirm 單格經一鍵點頭確認→auto；其餘沿用 classify 的 tier。
+  function _smEffTier(s) {
+    const rg = App._rg;
+    if (s.kind === 'table') return _tableAllMapped(s) ? 'auto' : 'confirm';
+    if (s.tier === 'confirm') return (rg.confirmed && rg.confirmed[_smSlotId(s)]) ? 'auto' : 'confirm';
+    return s.tier;   // auto / manual / disp
+  }
+  App._rgSmConfirm = function (id) { const rg = App._rg; rg.confirmed = rg.confirmed || {}; rg.confirmed[id] = true; App._rgWizard(); };
+  App._rgSmUnconfirm = function (id) { const rg = App._rg; if (rg.confirmed) delete rg.confirmed[id]; App._rgWizard(); };
+  function _smActiveCounts() { const c = { auto: 0, confirm: 0, manual: 0, disp: 0 }; _smActiveSlots().forEach(s => c[_smEffTier(s)]++); return c; }
+  // 左清單依分頁：只顯示當前分頁的字卡（頁籤切換→左清單跟著換·PPT 舊殼維持全部）
+  function _smSheetSlots() {
+    if (_isPpt()) {
+      const sl = (App._rg.slides || [])[App._rg.slideIdx || 0];
+      return _smActiveSlots().filter(s => s.slidePath === (sl && sl.path));
+    }
+    const sh = App._rg.scan.sheets[App._rg.sheetIdx || 0];
+    return _smActiveSlots().filter(s => s.sheetName === (sh && sh.name));
+  }
+  function _smSheetCounts() { const c = { auto: 0, confirm: 0, manual: 0, disp: 0 }; _smSheetSlots().forEach(s => c[_smEffTier(s)]++); return c; }
+  // 高信心段落/單格＋偵測表格 → 預填進 state（不覆蓋既有·開窗只 seed 一次）
+  // 表格欄位自動比對表頭→TABLE_FIELDS（與單格 scalar 的自動配一致·規則15·省 User 面對一排「不填」）
+  function _autoColMapXlsx(sheet, hr0) {
+    const cols = {}; if (!sheet) return cols;
+    (sheet.aoa[hr0] || []).forEach(function (h, c) {
+      if (h == null || h === '') return;
+      const m = RT._matchField(String(h), RT.TABLE_FIELDS);
+      if (m) { const col = RT.cellRef(sheet, hr0, c).match(/^[A-Z]+/)[0]; cols[col] = { cat: 'auto', field: m.field }; }
+    });
+    return cols;
+  }
+  function _autoColMapPpt(headerTexts) {
+    const cols = {};
+    (headerTexts || []).forEach(function (h, ci) { const m = RT._matchField(String(h || ''), RT.TABLE_FIELDS); if (m) cols[ci] = m.field; });
+    return cols;
+  }
+  function _rgSeedFromClassify() {
+    const rg = App._rg; if (!rg.cls) return;
+    if (_isPpt()) {
+      rg.cls.slots.forEach(function (s) {
+        if (s.kind === 'para' && s.guess) { const k = s.slidePath + '#' + s.pIndex; if (!rg.pptMap[k]) rg.pptMap[k] = { cat: 'auto', field: s.guess.field }; }
+        else if (s.kind === 'table' && !pptTblByPath(s.slidePath, s.tblIndex)) rg.pptTables.push({ slidePath: s.slidePath, tblIndex: s.tblIndex, headerRows: 1, colCount: s.tb.colCount, headerTexts: s.tb.headerTexts, rowSource: _repOf(s.slidePath) ? 'projActiveTasks' : RT.ROW_SOURCES[0].key, cols: _autoColMapPpt(s.tb.headerTexts) });
+      });
+      return;
+    }
+    rg.cls.slots.forEach(function (s) {
+      if (s.kind === 'scalar' && s.guess) { const key = s.sheetName + '!' + s.ref; if (!rg.mapping[key]) rg.mapping[key] = { cat: 'auto', field: s.guess.field }; }
+      else if (s.kind === 'table' && s.det && !rgTable(s.sheetName)) rg.tables.push({ sheetName: s.det.sheetName, headerRow: s.det.headerRow, dataStartRow: s.det.dataStartRow, curCount: s.det.curCount, footerLastRow: s.det.footerLastRow, rowSource: RT.ROW_SOURCES[0].key, cols: _autoColMapXlsx(rg.scan.sheets.find(x => x.name === s.det.sheetName), s.det.headerRow0) });
+    });
+  }
+  function _smItemHtml(s) {
+    const rg = App._rg, id = _smSlotId(s), active = rg.selKey === id;
+    const clip = t => { t = String(t || ''); return t.length > 26 ? t.slice(0, 26) + '…' : t; };
+    let src = '', role;
+    if (s.kind === 'table') { src = '<span class="sm-badge b-tbl">表格·逐列</span>'; role = _isPpt() ? U.esc(s.role) : U.esc(s.sheetName) + ' 表'; }
+    else if (s.kind === 'manual') { src = '<span class="sm-badge b-none">系統沒有此資料</span>'; role = U.esc(clip(s.role)); }
+    else {
+      role = U.esc(clip(s.role));
+      if (s.guess) {
+        const f = RT.SYS_FIELDS.find(x => x.key === s.guess.field);
+        src = `← <code>${U.esc((f && f.label) || s.guess.field)}</code> <span class="sm-badge b-conf">信心 ${s.guess.conf === 'high' ? '高' : '中'}</span>`
+          + (s.dupCount ? ` <span class="sm-badge b-dup">出現 ${s.dupCount} 處</span>` : '');
+      }
+    }
+    const loc = s.kind !== 'table' ? ` <span style="color:var(--ink4);font-size:11px">${_isPpt() ? ('第 ' + s.slideNo + ' 頁') : (U.esc(s.sheetName) + '!' + s.ref)}</span>` : '';
+    return `<div class="sm-item${active ? ' active' : ''}" onclick="App._rgSmSel('${id.replace(/'/g, "\\'")}')"><span class="role">${role}</span><div class="src">${src}${loc}</div></div>`;
+  }
+  function _smZoneHtml(tier, zcls, ico, title, sub, showStart, collapsedDefault) {
+    const rg = App._rg, slots = _smSheetSlots().filter(s => _smEffTier(s) === tier);
+    if (!slots.length) return '';
+    const zc = rg._zoneCollapsed || {}, collapsed = zc[tier] != null ? zc[tier] : !!collapsedDefault;
+    return `<section class="sm-zone ${zcls}${collapsed ? ' collapsed' : ''}">
+      <header class="sm-zone-h" onclick="App._rgSmToggleZone('${tier}')">
+        <span class="sm-zone-ico">${ico}</span><span class="sm-zone-tt"><b>${title}</b><small>${sub}</small></span>
+        <span class="sm-zone-cnt">${slots.length}</span><span class="sm-zone-chev">▾</span></header>
+      ${showStart ? '<div class="sm-zone-start">↓ 建議從這裡開始</div>' : ''}
+      <div class="sm-zone-body">${slots.map(_smItemHtml).join('')}</div></section>`;
+  }
+  function _smListHtml() {
+    const rg = App._rg, c = _smSheetCounts(), need = c.confirm + c.manual + c.disp;
+    const auto = _smSheetSlots().filter(s => _smEffTier(s) === 'auto');
+    let rep = '';   // §24.15.11：PPT 當前頁的重複頁 bar（已標→綠 bar 點入設定卡；未標→低調手動入口）
+    if (_isPpt()) {
+      const sl = (rg.slides || [])[rg.slideIdx || 0];
+      if (sl) {
+        const r = _repOf(sl.path), pe = sl.path.replace(/'/g, "\\'");
+        rep = r
+          ? `<div class="sm-repbar${rg.selKey === ('rep!' + sl.path) ? ' active' : ''}" onclick="App._rgRepSel('${pe}')">🔁 <b>重複頁</b> × ${U.esc((RT.PROJ_SOURCES.find(s => s.key === r.source) || {}).label || '')}<span class="pill">${_repRecsOf(r).length} 頁</span></div>`
+          : `<button class="sm-repmark" onclick="App._rgRepMark('${pe}')">🔁 設為重複頁（每個專案長一頁）</button>`;
+      }
+    }
+    let h = rep + `<div class="sm-ov">
+      <div class="sm-ov-top">${need ? `<b>${need}</b>項還需你決定` : '<b>✓</b> 這個分頁都設好了'}${c.auto ? `<span class="sm-ov-auto">已自動 ${c.auto} ✓</span>` : ''}</div>
+      <div class="sm-ov-bar">${c.confirm ? `<span class="seg seg-amber" style="flex:${c.confirm}"></span>` : ''}${c.manual ? `<span class="seg seg-slate" style="flex:${c.manual}"></span>` : ''}${c.disp ? `<span class="seg seg-stone" style="flex:${c.disp}"></span>` : ''}${need ? '' : '<span class="seg" style="flex:1;background:var(--sage-500)"></span>'}</div>
+      <div class="sm-ov-legend"><span><i class="sm-dotc" style="background:var(--amber-deep)"></i>待確認 ${c.confirm}</span><span><i class="sm-dotc" style="background:var(--slate)"></i>手填 ${c.manual}</span><span><i class="sm-dotc" style="background:var(--stone-300)"></i>待處置 ${c.disp}</span></div></div>`;
+    if (auto.length) {
+      h += `<div class="sm-autobar${rg._autoOpen ? ' open' : ''}" onclick="App._rgSmToggleAuto()"><div class="ck">✓</div><div class="txt"><b>這個分頁系統已自動對應 ${auto.length} 項</b><div class="s">高信心·已收折（展開可改）</div></div><div class="chev">▸</div></div>`;
+      if (rg._autoOpen) h += `<div class="sm-zone-body" style="padding-top:0">${auto.map(_smItemHtml).join('')}</div>`;
+    }
+    h += _smZoneHtml('confirm', 'sm-zone-amber', '⚠', '待確認', '系統猜了，你按確認', true, false);
+    h += _smZoneHtml('manual', 'sm-zone-slate', '✍', '手填', '系統沒有、要你寫', false, false);
+    h += _smZoneHtml('disp', 'sm-zone-stone', '🗂', '系統沒有此資料', '額外內容·可整區保留', false, true);
+    if (!_smSheetSlots().length) h += '<div class="sm-empty">這個分頁沒有要設定的項目<br>（整頁是自由文字或圖片時屬正常）。</div>';
+    return h;
+  }
+  // ── 四型配方編輯器（純量單格／表格逐列／手填／配不了處置·對齊引擎欄位·不自創）──
+  function _smSelSlot() { const rg = App._rg; return rg.cls.slots.find(x => _smSlotId(x) === rg.selKey); }
+  function _smBind() { const k = App._rg.sel.key, st = _smStore(); return st[k] || (st[k] = { cat: 'auto' }); }
+  function _smEditorHtml() {
+    const rg = App._rg;
+    if (_isPpt() && rg.selKey && rg.selKey.indexOf('rep!') === 0) return _smRepEd(rg.selKey.slice(4));
+    const s = _smSelSlot();
+    if (!s) return `<div class="sm-ed-empty">← 點左邊任一項目開始設定<br><br>已對應 <b>${Object.keys(_smStore()).length}</b> 個${_isPpt() ? '段落' : '單格'} · <b>${(_isPpt() ? App._rg.pptTables : App._rg.tables || []).length}</b> 張表格</div>`;
+    if (s.kind === 'table') return _isPpt() ? _smPptTableEd(s) : _smTableEd(s);
+    if (s.tier === 'disp') return _smDispEd(s);
+    if (s.kind === 'manual') return _smManualEd(s);
+    return _smScalarEd(s);   // Excel 純量單格 / PPT 段落文字 共用（皆綁 SYS_FIELDS 全域純量·resolveBinding 同）
+  }
+  // §24.15.11 重複頁設定卡（中欄·點左欄 🔁 bar 進入）：來源＋排序＋取消；>20 頁警示、0 專案提示
+  function _smRepEd(path) {
+    const rg = App._rg, r = _repOf(path); if (!r) return '';
+    const recs = _repRecsOf(r), sl = (rg.slides || []).find(s => s.path === path), pe = path.replace(/'/g, "\\'");
+    const srcOpts = RT.PROJ_SOURCES.map(s => `<option value="${s.key}"${r.source === s.key ? ' selected' : ''}>${U.esc(s.label)}（${s.get().length} 個）</option>`).join('');
+    const warn = recs.length > 20 ? `<div class="sm-hbox warn"><b>⚠ 會產出 ${recs.length} 頁</b>——專案很多時建議改「有逾期任務的專案」縮小範圍。</div>` : '';
+    const none = !recs.length ? `<div class="sm-hbox warn"><b>目前這個來源是 0 個專案</b>——產出時此頁會保留範本原樣。</div>` : '';
+    return `<div class="sm-ed-head">第 ${sl ? sl.no : '?'} 頁 · 重複頁設定 <span class="sm-ed-chip b-per">🔁 每個專案長一頁</span></div>
+      <div class="sm-ed-sub">產出時照這頁的版面，替下面清單裡的每個專案各長一頁；這頁本身＝第 1 個專案，不會多一頁空範本。</div>
+      <div class="sm-fld"><label>哪些專案</label><select class="sm-selbox" onchange="App._rgRepSrc('${pe}', this.value)">${srcOpts}</select></div>
+      <div class="sm-fld"><label>頁的順序</label><select class="sm-selbox" onchange="App._rgRepSort('${pe}', this.value)"><option value="openDate"${r.sort !== 'name' ? ' selected' : ''}>照開案日（新→舊）</option><option value="name"${r.sort === 'name' ? ' selected' : ''}>照專案名稱</option></select></div>
+      ${warn}${none}
+      <div class="sm-hbox ok"><b>格式不用你管：</b>每一頁都完整複製這頁的版面/字體/底色，系統只把值換成該專案的。</div>
+      <div style="margin-top:10px"><a class="sm-replink" onclick="App._rgRepUnmark('${pe}')">取消重複（變回一般頁）</a></div>`;
+  }
+  // PPT 表格編輯器（欄位對應 by 欄 index·比照 Excel colmap·寫 pptTables）
+  // §24.15.10 #4：欄位對應清單的表頭（左＝你檔案裡的欄位名·右＝要填入的系統資料·User 才知道在選什麼）
+  const _cmHead = () => '<div class="sm-cm-head"><span>你報表裡的欄位</span><span></span><span>要填入的系統資料</span></div>';
+  function _smPptTableEd(s) {
+    if (!pptTblByPath(s.slidePath, s.tblIndex)) _rgSeedFromClassify();
+    const rep = _repOf(s.slidePath);   // §24.15.11：重複頁表格→scoped「此專案的…」列來源（筆數以目前預覽的專案算）
+    const pt = pptTblByPath(s.slidePath, s.tblIndex) || { rowSource: rep ? 'projActiveTasks' : RT.ROW_SOURCES[0].key, cols: {}, headerTexts: s.tb.headerTexts || [] };
+    const srcList = rep ? RT.PROJ_ROW_SOURCES : RT.ROW_SOURCES;
+    const srcCtx = rep ? { project: _repPrevRec(rep).rec } : { sheetName: '' };
+    const srcOpts = srcList.map(rs => `<option value="${rs.key}"${pt.rowSource === rs.key ? ' selected' : ''}>${U.esc(rs.label)}（${rep ? '此專案現有' : '現有'} ${srcCtx.project || !rep ? rs.get(srcCtx).length : 0} 筆）</option>`).join('');
+    const fldOpt = cur => '<option value="">— 不填 —</option>' + RT.TABLE_FIELDS.map(f => `<option value="${f.key}"${cur === f.key ? ' selected' : ''}>${U.esc(f.label)}</option>`).join('') + `<option value="manual"${cur === 'manual' ? ' selected' : ''}>每次手填（清空）</option>`;
+    const rg = App._rg;
+    let unmapped = '', mapped = '', nMap = 0, nUn = 0, mapPrev = [];
+    (s.tb.headerTexts || []).forEach((h, ci) => {
+      const cur = (pt.cols || {})[ci] || '';
+      const row = `<div class="sm-cm-row"><span class="sm-cm-col">${U.esc(h || ('第' + (ci + 1) + '欄'))}<small>第 ${ci + 1} 欄</small></span><span class="sm-cm-arrow">←</span><select class="sm-selbox" onchange="App._rgSmPptColBind(${ci}, this.value)">${fldOpt(cur)}</select></div>`;
+      if (cur) { mapped += row; nMap++; mapPrev.push(String(h || ('第' + (ci + 1) + '欄'))); } else { unmapped += row; nUn++; }
+    });
+    const foldKey = s.slidePath + '!' + s.tblIndex, pathEsc = s.slidePath.replace(/'/g, "\\'"), advOpen = rg._tblColsOpen && rg._tblColsOpen[foldKey];
+    const needBlock = nUn
+      ? `<div class="sm-fld"><label>還有 <b>${nUn}</b> 欄系統配不上，要你選：</label><div class="sm-colmap">${_cmHead()}${unmapped}</div></div>`
+      : (nMap ? `<div class="sm-cm-alldone">✓ 這張表 ${nMap} 個欄位系統都自動對好了——瞄一下下方「資料來源」對不對就行。</div>` : '<div class="sm-cm-alldone" style="color:var(--ink4)">這張表沒有可讀的欄位標題。</div>');
+    const mapBlock = nMap
+      ? `<div class="sm-cm-fold"><div class="sm-cm-foldbar${advOpen ? ' open' : ''}" onclick="App._rgSmPptTblCols('${pathEsc}', ${s.tblIndex})"><span class="ck">✓</span><span class="tx">系統已自動對好 ${nMap} 欄（${U.esc(mapPrev.slice(0, 3).join('／'))}${nMap > 3 ? '…' : ''}）</span><span class="chev">▾</span></div>${advOpen ? `<div class="sm-colmap">${_cmHead()}${mapped}</div>` : ''}</div>`
+      : '';
+    return `<div class="sm-ed-head">第 ${s.slideNo} 頁 表格 <span class="sm-ed-chip b-tbl">表格 · 逐列長出</span></div>
+      <div class="sm-ed-sub">系統已自動對好 ${nMap} 欄${nUn ? `，還有 ${nUn} 欄要你選` : '，都配好了'}。產出時逐列 clone 長出（表頭列保留）。</div>
+      ${needBlock}
+      <div class="sm-fld"><label>每列的資料來源</label><select class="sm-selbox" onchange="App._rgSmPptRowSource(this.value)">${srcOpts}</select></div>
+      ${mapBlock}
+      <div class="sm-hbox ok"><b>✓ ${s.tb.colCount} 欄表格</b> —— 產出時依來源逐列 clone 增減·表頭列保留、系統不碰樣式。</div>
+      <div class="sm-hbox warn"><b>PPT 表格天花板：</b>投影片版面有限，資料太多會超出頁面——建議設合理列數（超量走續頁＝後續版本）。</div>`;
+  }
+  App._rgSmPptTblCols = function (path, ti) { const rg = App._rg; rg._tblColsOpen = rg._tblColsOpen || {}; const k = path + '!' + ti; rg._tblColsOpen[k] = !rg._tblColsOpen[k]; App._rgWizard(); };
+  App._rgSmPptRowSource = function (k) { const s = _smSelSlot(), pt = pptTblByPath(s.slidePath, s.tblIndex); if (pt) pt.rowSource = k; App._rgWizard(); };
+  App._rgSmPptColBind = function (ci, val) { const s = _smSelSlot(), pt = pptTblByPath(s.slidePath, s.tblIndex); if (!pt) return; pt.cols = pt.cols || {}; if (val) pt.cols[ci] = val; else delete pt.cols[ci]; App._rgWizard(); };
+  function _smScalarEd(s) {
+    const rg = App._rg, key = _smSlotKey(s), st = _smStore(), id = _smSlotId(s), idEsc = id.replace(/'/g, "\\'");
+    // §24.15.11：重複頁的槽走 per-專案欄位目錄（取值以目前預覽的專案·右欄 ◀▶ 切換即時跟動）
+    const rep = _isPpt() && _repOf(s.slidePath), pv = rep ? _repPrevRec(rep) : null;
+    const fields = rep ? RT.PROJ_FIELDS : RT.SYS_FIELDS, fget = rep ? RT.projField : sysField, rec = pv ? pv.rec : undefined;
+    const unit = _isPpt() ? '段落文字' : '純量單格';
+    const b = st[key] || (st[key] = { cat: 'auto', field: (s.guess && s.guess.field) || fields[0].key });
+    const eff = _smEffTier(s), needNod = eff === 'confirm';                       // 待確認→一鍵點頭；auto/已確認→展開可改
+    const advOpen = !needNod || (rg._advOpen && rg._advOpen[id]);
+    const chip = (eff === 'auto' ? `<span class="sm-ed-chip b-auto">已確認 · ${unit}</span>` : `<span class="sm-ed-chip b-conf">待你確認 · ${unit}</span>`)
+      + (rep ? '<span class="sm-ed-chip b-per">每頁不同</span>' : '');
+    const fLabel = (fields.find(f => f.key === b.field) || {}).label || b.field;
+    let curVal = RT.resolveBinding(b, rec, fget); curVal = curVal === RT.SKIP ? '（沿用原值）' : String(curVal == null ? '' : curVal);
+    const exVal = f => { try { return String(rep ? (rec ? f.get(rec) : '—') : f.get()); } catch (e) { return '—'; } };
+    const srcOpts = fields.map(f => `<option value="${f.key}"${b.field === f.key ? ' selected' : ''}>${U.esc(f.label)}（現在＝${U.esc(exVal(f))}）</option>`).join('');
+    const t = b.transform, tType = t ? t.type : '';
+    const tOpt = (v, l) => `<option value="${v}"${tType === v ? ' selected' : ''}>${l}</option>`;
+    let tParam = '';
+    if (tType === 'dateOffset') tParam = `<div class="sm-fld"><label>加減天數（可負·如 -3）</label><input class="sm-inp" type="number" value="${(t && t.days) || 0}" oninput="App._rgSmTransDays(this.value)"></div>`;
+    else if (tType === 'concat') tParam = `<div class="sm-fld"><label>接在後面的文字</label><input class="sm-inp" value="${U.esc((t.parts && t.parts[1] && t.parts[1].v) || '')}" oninput="App._rgSmConcatText(this.value)" placeholder="例：（週報）"></div>`;
+    const eOpt = (v, l) => `<option value="${v}"${(b.empty || 'dash') === v ? ' selected' : ''}>${l}</option>`;
+    const dup = s.dupCount ? _smDupHtml(s) : '';
+    const nod = needNod ? `<div class="sm-nod">
+        <div class="sm-nod-q">系統從你的${_isPpt() ? '簡報' : ' Excel'}看這格要填 <b>${U.esc(fLabel)}</b> <span class="sm-nod-val">現在＝${U.esc(curVal)}</span>，對嗎？</div>
+        <div class="sm-nod-btns"><button class="rg-btn primary sm" onclick="App._rgSmConfirm('${idEsc}')">✓ 對，就用這個</button><button class="rg-btn ghost sm" onclick="App._rgSmAdv('${idEsc}')">改用別的 ${advOpen ? '▴' : '▾'}</button></div></div>` : '';
+    const confirmedBar = (eff === 'auto' && s.tier === 'confirm') ? `<div class="sm-confirmed">✓ 已確認採用 <b>${U.esc(fLabel)}</b> · <a onclick="App._rgSmUnconfirm('${idEsc}')">重新選</a></div>` : '';
+    const adv = advOpen ? `<div class="sm-fld"><label>這個槽要放什麼資料</label><select class="sm-selbox" onchange="App._rgSmField(this.value)">${srcOpts}</select></div>
+      <div class="sm-row2">
+        <div class="sm-fld"><label>小轉換（可選）</label><select class="sm-selbox" onchange="App._rgSmTransform(this.value)">${tOpt('', '無')}${tOpt('concat', '拼接文字')}${tOpt('dateOffset', '日期加減')}${tOpt('monthOnly', '只顯示月份')}</select></div>
+        <div class="sm-fld"><label>資料是空的時候</label><select class="sm-selbox" onchange="App._rgSmEmpty(this.value)">${eOpt('dash', '顯示「—」（預設）')}${eOpt('blank', '留空白')}${eOpt('keep', '保留範本原字')}</select></div>
+      </div>${tParam}` : '';
+    return `<div class="sm-ed-head">${U.esc(s.role)} ${chip}</div>
+      <div class="sm-ed-sub">${needNod ? '系統猜了這格的資料來源，你點頭確認就好——不用懂欄位設定。' : '格式沿用你範本裡設好的，系統只寫值。'}</div>
+      ${nod}${confirmedBar}${adv}${dup}
+      <div class="sm-hbox ok"><b>格式不用你管：</b>字體/字級/顏色/粗細沿用你範本裡設好的樣式，系統只寫「值」。</div>`;
+  }
+  App._rgSmAdv = function (id) { const rg = App._rg; rg._advOpen = rg._advOpen || {}; rg._advOpen[id] = !rg._advOpen[id]; App._rgWizard(); };
+  function _smTableEd(s) {
+    const rg = App._rg;
+    if (!rgTable(s.sheetName)) _rgSeedFromClassify();
+    const tbl = rgTable(s.sheetName) || { rowSource: RT.ROW_SOURCES[0].key, cols: {}, headerRow: 1, curCount: 0 };
+    const sheet = rg.scan.sheets.find(sh => sh.name === s.sheetName);
+    const hr0 = s.det ? s.det.headerRow0 : (sheet ? sheet.headerRow : 0);
+    const headerCells = (sheet && sheet.aoa[hr0]) || [];
+    const srcOpts = RT.ROW_SOURCES.map(rs => `<option value="${rs.key}"${tbl.rowSource === rs.key ? ' selected' : ''}>${U.esc(rs.label)}（現有 ${rs.get({ sheetName: s.sheetName }).length} 筆）</option>`).join('');
+    const fldOpt = cur => '<option value="">— 不填 —</option>' + RT.TABLE_FIELDS.map(f => `<option value="${f.key}"${cur === f.key ? ' selected' : ''}>${U.esc(f.label)}</option>`).join('');
+    let unmapped = '', mapped = '', nMap = 0, nUn = 0, mapPrev = [];
+    headerCells.forEach((h, c) => {
+      if (h == null || h === '') return;
+      const col = RT.cellRef(sheet, hr0, c).match(/^[A-Z]+/)[0];
+      const cur = (tbl.cols[col] && tbl.cols[col].cat === 'auto') ? tbl.cols[col].field : '';
+      const row = `<div class="sm-cm-row"><span class="sm-cm-col">${U.esc(String(h))}<small>第 ${col} 欄</small></span><span class="sm-cm-arrow">←</span><select class="sm-selbox" onchange="App._rgSmColField('${col}', this.value)">${fldOpt(cur)}</select></div>`;
+      if (cur) { mapped += row; nMap++; mapPrev.push(String(h)); } else { unmapped += row; nUn++; }
+    });
+    const nameEsc = s.sheetName.replace(/'/g, "\\'"), advOpen = rg._tblColsOpen && rg._tblColsOpen[s.sheetName];
+    const needBlock = nUn
+      ? `<div class="sm-fld"><label>還有 <b>${nUn}</b> 欄系統配不上，要你選：</label><div class="sm-colmap">${_cmHead()}${unmapped}</div></div>`
+      : `<div class="sm-cm-alldone">✓ 這張表 ${nMap} 個欄位系統都自動對好了，不用你設定——瞄一下下方「資料來源」對不對就行。</div>`;
+    const mapBlock = nMap
+      ? `<div class="sm-cm-fold"><div class="sm-cm-foldbar${advOpen ? ' open' : ''}" onclick="App._rgSmTblCols('${nameEsc}')"><span class="ck">✓</span><span class="tx">系統已自動對好 ${nMap} 欄（${U.esc(mapPrev.slice(0, 3).join('／'))}${nMap > 3 ? '…' : ''}）</span><span class="chev">▾</span></div>${advOpen ? `<div class="sm-colmap">${_cmHead()}${mapped}</div>` : ''}</div>`
+      : '';
+    return `<div class="sm-ed-head">${U.esc(s.sheetName)} 表 <span class="sm-ed-chip b-tbl">表格 · 逐列長出</span></div>
+      <div class="sm-ed-sub">系統已自動對好 ${nMap} 欄${nUn ? `，還有 ${nUn} 欄要你選` : '，都配好了'}。產出時整張表逐列自動長。</div>
+      ${needBlock}
+      <div class="sm-fld"><label>每列的資料來源</label><select class="sm-selbox" onchange="App._rgSmRowSource(this.value)">${srcOpts}</select></div>
+      ${mapBlock}
+      <div class="sm-hbox ok"><b>✓ 偵測到表頭在第 ${s.det ? s.det.headerRow : tbl.headerRow} 列、${s.det ? s.det.curCount : tbl.curCount} 筆資料列</b> —— 產出時逐列自動增減。若這區是 Excel 表格(Ctrl+T)，新增列會自動套你設的條件格式/斑馬紋/合計公式。</div>`;
+  }
+  App._rgSmTblCols = function (name) { const rg = App._rg; rg._tblColsOpen = rg._tblColsOpen || {}; rg._tblColsOpen[name] = !rg._tblColsOpen[name]; App._rgWizard(); };
+  function _smManualEd(s) {
+    const key = _smSlotKey(s), st = _smStore();
+    const b = st[key] || (st[key] = { cat: 'manual' });
+    const isFixed = b.cat === 'fixed';
+    return `<div class="sm-ed-head">${U.esc(s.role)} <span class="sm-ed-chip b-slate">手填 · 系統沒有此資料</span></div>
+      <div class="sm-ed-sub">「異常原因／對策／結論」PM-Core 沒有，本來就該你寫。可每次產出時手填，或先寫一段固定文字。</div>
+      <div class="sm-disp-grid" style="margin-bottom:14px">
+        <div class="sm-disp${!isFixed ? ' sel' : ''}" onclick="App._rgSmManualMode('manual')"><div class="dt">✍ 每次產出手填</div><div class="dd">產出時這格清空，你在 Excel/PPT 裡自己寫。</div></div>
+        <div class="sm-disp${isFixed ? ' sel' : ''}" onclick="App._rgSmManualMode('fixed')"><div class="dt">📌 填固定文字</div><div class="dd">每次產出都填同一段（如標準註記）。</div></div>
+      </div>
+      ${isFixed ? `<div class="sm-fld"><label>固定文字內容</label><textarea class="sm-inp" rows="3" style="resize:vertical" oninput="App._rgSmFixedText(this.value)" placeholder="例：本週依計畫進行，無重大異常。">${U.esc(b.text || '')}</textarea></div>` : ''}
+      ${_isPpt()
+        ? '<div class="sm-hbox warn"><b>PPT 爆版防線：</b>填太長、範本文字框塞不下時，系統會<b>偵測並警示「可能爆版」</b>讓你精簡——<b>不會偷偷截斷你的內容</b>。真實長相以打開檔案為準。</div>'
+        : '<div class="sm-hbox ok"><b>填太長也不會不見：</b>Excel 會依欄寬顯示、資料完整保留（不像 PPT 有文字框限制）。看不完整就在 Excel 拉寬欄位或設「自動換行」。</div>'}`;
+  }
+  // 多分身漸進：選好資料來源那一刻才展開勾選面板（提議不廣播·User 拍板）
+  function _smDupHtml(s) {
+    const rg = App._rg;
+    if (!rg._dupOpen) return `<div class="sm-dupbar" onclick="App._rgSmDupOpen()">🔗 <span>系統偵測到另外 <b>${s.dupCount - 1} 處</b>也對應同一欄位…（點開處理·教一次全檔同步）</span></div>`;
+    const f = RT.SYS_FIELDS.find(x => x.key === (s.guess && s.guess.field));
+    const chk = rg._dupCheck || {}, primaryKey = _smSlotKey(s);
+    const rows = (s.dupRefs || []).map(function (r) {
+      const rk = _smRefKey(r), isPrim = rk === primaryKey, on = isPrim || chk[rk] !== false;
+      const attr = isPrim ? ' disabled' : ' onclick="App._rgSmDupToggle(\'' + rk.replace(/'/g, "\\'") + '\')"';
+      return `<label class="sm-dup-row"><input type="checkbox" ${on ? 'checked' : ''}${attr}>${U.esc(_isPpt() ? ('第 ' + r.slideNo + ' 頁') : r.sheetName)}${isPrim ? ' （這一處）' : ''}<span class="loc">${U.esc(_smRefLoc(r))}</span></label>`;
+    }).join('');
+    return `<div class="sm-dup-panel">
+      <div class="dh">🔗 綁定 <b>${U.esc((f && f.label) || (s.guess && s.guess.field))}</b> ——這 ${s.dupCount} 處要一起套嗎？<span style="font-weight:400;color:var(--ink4)">（教一次·全檔同步）</span></div>
+      <div class="sm-dup-list">${rows}</div>
+      <div class="sm-dup-actions"><button class="rg-btn primary sm" onclick="App._rgSmDupApply(true)">✓ 全收（${s.dupCount} 處）</button><button class="rg-btn ghost sm" onclick="App._rgSmDupApply(false)">套用勾選的</button></div></div>`;
+  }
+  App._rgSmDupOpen = function () { App._rg._dupOpen = true; App._rgWizard(); };
+  App._rgSmDupToggle = function (rk) { const rg = App._rg; rg._dupCheck = rg._dupCheck || {}; rg._dupCheck[rk] = rg._dupCheck[rk] === false ? true : false; App._rgWizard(); };
+  App._rgSmDupApply = function (all) {
+    const rg = App._rg, s = _smSelSlot(); if (!s || !s.dupRefs) return;
+    const st = _smStore(), primaryKey = _smSlotKey(s), base = st[primaryKey] || { cat: 'auto', field: s.guess.field }, chk = rg._dupCheck || {};
+    let n = 1;
+    s.dupRefs.forEach(function (r) {
+      const rk = _smRefKey(r); if (rk === primaryKey) return;
+      if (all || chk[rk] !== false) { st[rk] = JSON.parse(JSON.stringify(base)); n++; } else delete st[rk];
+    });
+    rg._dupOpen = false; App._rgWizard(); U.toast('已套用到 ' + n + ' 處');
+  };
+  function _smDispEd(s) {
+    const key = _smSlotKey(s), b = _smStore()[key] || {};
+    const cat = b.cat || 'keep';
+    const card = (c, ico, t, d, rec) => `<div class="sm-disp${cat === c ? ' sel' : ''}" onclick="App._rgSmDisp('${c}')"><div class="dt">${ico} ${t}${rec ? '<span class="rec">推薦</span>' : ''}</div><div class="dd">${d}</div></div>`;
+    return `<div class="sm-ed-head">${U.esc(s.role)} <span class="sm-ed-chip b-none">配不了 · 待處置</span></div>
+      <div class="sm-ed-sub">這塊系統判讀不了（內容不在 PM-Core）。你要怎麼處理？</div>
+      <div class="sm-disp-grid">
+        ${card('keep', '📄', '保留原樣', '系統完全不動這塊，維持原內容。', true)}
+        ${card('blank', '⬜', '留空', '清成空白待填格。')}
+        ${card('auto', '🔧', '我來給配方', '其實有對應資料？改抓系統欄位。')}
+        ${card('manual', '✍', '標記手填', '每次產出精靈都會問你。')}
+      </div>
+      <div class="sm-hbox"><b>怕逐項點到起肖？</b>之後可用左側「一鍵批次」整區設「保留原樣」（下一批加入）。</div>`;
+  }
+  App._rgSmField = function (field) { const b = _smBind(); b.cat = 'auto'; b.field = field; if (b.transform && b.transform.type === 'concat' && b.transform.parts) b.transform.parts[0] = { k: 'field', v: field }; App._rgWizard(); };
+  App._rgSmTransform = function (type) {
+    const b = _smBind();
+    if (!type) b.transform = null;
+    else if (type === 'monthOnly') b.transform = { type: 'monthOnly' };
+    else if (type === 'dateOffset') b.transform = { type: 'dateOffset', days: (b.transform && b.transform.days) || 0 };
+    else if (type === 'concat') b.transform = { type: 'concat', parts: [{ k: 'field', v: b.field }, { k: 'text', v: (b.transform && b.transform.parts && b.transform.parts[1] && b.transform.parts[1].v) || '' }] };
+    App._rgWizard();
+  };
+  App._rgSmTransDays = function (v) { const b = _smBind(); if (b.transform && b.transform.type === 'dateOffset') b.transform.days = Number(v) || 0; };   // 不重繪·保留輸入焦點
+  App._rgSmConcatText = function (v) { const b = _smBind(); if (b.transform && b.transform.type === 'concat') b.transform.parts = [{ k: 'field', v: b.field }, { k: 'text', v: v }]; };
+  App._rgSmEmpty = function (v) { const b = _smBind(); if (v === 'dash') delete b.empty; else b.empty = v; App._rgWizard(); };
+  App._rgSmRowSource = function (k) { const t = rgTable(_smSelSlot().sheetName); if (t) t.rowSource = k; App._rgWizard(); };
+  App._rgSmColField = function (col, field) { const t = rgTable(_smSelSlot().sheetName); if (!t) return; if (!field) delete t.cols[col]; else t.cols[col] = { cat: 'auto', field: field }; App._rgWizard(); };
+  App._rgSmManualMode = function (m) { const b = _smBind(); b.cat = m; if (m === 'manual') delete b.text; else if (b.text == null) b.text = ''; App._rgWizard(); };
+  App._rgSmFixedText = function (v) { const b = _smBind(); b.cat = 'fixed'; b.text = v; };   // 不重繪·保留焦點
+  App._rgSmDisp = function (c) { const b = _smBind(); b.cat = c; if (c === 'auto' && !b.field) b.field = RT.SYS_FIELDS[0].key; App._rgWizard(); };
+  // ══ §24.15.10 第②批 看左做右（Excel）：頂部分頁頁籤＋左看高擬真網格 ══
+  // 頂部分頁頁籤：各工作表一顆·顯示該分頁待確認數 badge·點切當前檢視分頁（走既有 rg.sheetIdx）
+  function _smSheetTabs() {
+    const rg = App._rg, sheets = rg.scan.sheets || [], cur = rg.sheetIdx || 0;
+    const btns = sheets.map(function (sh, i) {
+      const own = _smActiveSlots().filter(s => s.sheetName === sh.name);
+      const need = own.filter(s => _smEffTier(s) !== 'auto').length;
+      const done = own.length && !need;
+      const badge = need ? `<span class="sm2-tab-n">${need}</span>` : (done ? '<span class="sm2-tab-ok">✓</span>' : '');
+      return { need: need, isCur: i === cur, html: `<button class="sm2-tab${i === cur ? ' on' : ''}" onclick="App._rgSmSheetTab(${i})">${U.esc(sh.name)}${badge}</button>` };
+    });
+    return _smTabsFold(btns);
+  }
+  App._rgSmSheetTab = function (i) { const rg = App._rg; rg.sheetIdx = i; rg.selKey = null; rg.sel = null; App._rgWizard(); };
+  // 左看：當前分頁前若干列 1:1 高擬真網格（A/B/C 字母表頭＋列號＋表頭列粗底·空格淡底·純預覽不操作）
+  function _smGridHtml() {
+    const rg = App._rg, sheet = (rg.scan.sheets || [])[rg.sheetIdx || 0];
+    if (!sheet || sheet.empty) return '<div class="sm2-look-head">看 · 這張分頁</div><div class="sm2-look-empty">這個分頁是空的，沒有可預覽的內容。</div>';
+    const aoa = sheet.aoa, sel = _smSelSlot();
+    // 高亮聯動：算當前選中項目對應 Excel 哪些格/欄＋泡泡說明（§24.15.10 ③·讓 User 看得到系統指哪）
+    const hlCell = {}, hlCol = {}; let bubble = '';
+    if (sel && !_isPpt() && sel.sheetName === sheet.name) {
+      if (sel.kind === 'table') {
+        const tbl = rgTable(sel.sheetName), hr0 = sel.det ? sel.det.headerRow0 : sheet.headerRow, need = [], done = [];
+        ((sheet.aoa[hr0]) || []).forEach((h, c) => {
+          if (h == null || h === '') return;
+          const col = RT.cellRef(sheet, hr0, c).match(/^[A-Z]+/)[0];
+          if (tbl && tbl.cols && tbl.cols[col]) { hlCol[col] = 'done'; done.push(col); } else { hlCol[col] = 'need'; need.push(col); }
+        });
+        bubble = need.length
+          ? `💡 發光的 <b>${need.join('／')}</b> 欄系統配不上，請在左邊選它要填什麼；另外 <b>${done.length}</b> 欄（淡綠）已自動對好、不用管。`
+          : `💡 這張表 <b>${done.length}</b> 欄系統全對好了，逐列自動長出、你不用設定。`;
+      } else {
+        hlCell[sel.ref] = 1;
+        const b = _smStore()[sel.sheetName + '!' + sel.ref] || { field: sel.guess && sel.guess.field };
+        const fL = (RT.SYS_FIELDS.find(f => f.key === b.field) || {}).label || '（未設定）';
+        let v = RT.resolveBinding(b, undefined, sysField); if (v === RT.SKIP) v = '（沿用原值）';
+        bubble = `💡 系統指的是 <b>${U.esc(sel.ref)}</b> 這格（發光處）：產出時會填入「<b>${U.esc(fL)}</b>」＝<b>${U.esc(String(v == null ? '' : v))}</b>`;
+      }
+    }
+    let maxR = Math.min(aoa.length, 12);
+    const selRow = (sel && sel.ref && sel.sheetName === sheet.name) ? (parseInt(String(sel.ref).replace(/^[A-Z]+/, ''), 10) - sheet.start.r - 1) : -1;
+    if (selRow >= maxR && selRow < aoa.length) maxR = Math.min(selRow + 2, aoa.length, 24);   // 選中格在 12 列外→擴到看得到
+    let maxC = 0; for (let r = 0; r < maxR; r++) maxC = Math.max(maxC, (aoa[r] || []).length);
+    maxC = Math.min(maxC || 1, 12);
+    const hr = sheet.headerRow, cells = [];
+    cells.push('<div class="xg-cell xg-corner"></div>');
+    for (let c = 0; c < maxC; c++) cells.push(`<div class="xg-cell xg-colh">${numToCol(sheet.start.c + c + 1)}</div>`);
+    for (let r = 0; r < maxR; r++) {
+      cells.push(`<div class="xg-cell xg-rowh">${sheet.start.r + r + 1}</div>`);
+      for (let c = 0; c < maxC; c++) {
+        const v = (aoa[r] || [])[c], isHead = r === hr, empty = v == null || v === '';
+        const ref = RT.cellRef(sheet, r, c), colL = ref.match(/^[A-Z]+/)[0];
+        const hlCls = hlCell[ref] ? ' xg-hl' : ((hlCol[colL] && r >= hr) ? (hlCol[colL] === 'need' ? ' xg-hl-col' : ' xg-hl-done') : '');
+        cells.push(`<div class="xg-cell${isHead ? ' xg-head' : ''}${empty ? ' xg-empty' : ''}${hlCls}">${empty ? '' : U.esc(String(v))}</div>`);
+      }
+    }
+    const cols = `36px repeat(${maxC}, minmax(84px, 1fr))`;
+    return `<div class="sm2-look-head">看 · 這張 Excel 長這樣（真實前 ${maxR} 列）</div>
+      <div class="xg-scroll"><div class="xg" style="grid-template-columns:${cols}">${cells.join('')}</div></div>
+      ${bubble ? `<div class="sm2-look-bubble">${bubble}</div>` : '<div class="sm2-look-note">點左邊任一項目，系統會在這張表發光標出「它對應 Excel 哪一格」。</div>'}`;
+  }
+  // ══ PPT 側對齊三區：頁碼頁籤＋spTree 結構縮圖（§24.15.9·非像素·對齊 Excel `_smSheetTabs`/`_smGridHtml`）══
+  // 頁籤共用組裝（Excel/PPT 同邏輯·rule13）：只顯示「還要 User 處理」的頁籤＋當前頁，其餘收進「✓ 其餘 N 頁不用管」摺疊
+  function _smTabsFold(btns) {
+    const rg = App._rg, vis = [], fold = [];
+    btns.forEach(b => { (b.need || b.isCur) ? vis.push(b.html) : fold.push(b.html); });
+    let h = vis.join('');
+    if (fold.length) {
+      h += `<button class="sm2-donefold" onclick="App._rgSmDoneTabs()">✓ 其餘 ${fold.length} ${_isPpt() ? '頁' : '個分頁'}不用管 ${rg._doneTabsOpen ? '▴' : '▾'}</button>`;
+      if (rg._doneTabsOpen) h += fold.join('');
+    }
+    return '<div class="sm2-tabrow">' + h + '</div>';
+  }
+  App._rgSmDoneTabs = function () { App._rg._doneTabsOpen = !App._rg._doneTabsOpen; App._rgWizard(); };
+  function _smSlideTabs() {
+    const rg = App._rg, slides = rg.slides || [], cur = rg.slideIdx || 0;
+    const btns = [];
+    slides.forEach(function (sl, i) {
+      if (rg.pgFrom && (sl.no < rg.pgFrom || sl.no > rg.pgTo)) return;   // 超出處理範圍的頁：整顆不顯示（保留原樣）
+      const own = _smActiveSlots().filter(s => s.slidePath === sl.path);
+      const need = own.filter(s => _smEffTier(s) !== 'auto').length;
+      const done = own.length && !need;
+      const badge = need ? `<span class="sm2-tab-n">${need}</span>` : (done ? '<span class="sm2-tab-ok">✓</span>' : '');
+      const isRep = !!_repOf(sl.path);   // §24.15.11：重複頁頁籤帶 🔁 綠標·永遠顯示（是「一種頁的身分」不收折）
+      btns.push({ need: need || isRep, isCur: i === cur, html: `<button class="sm2-tab${isRep ? ' rep' : ''}${i === cur ? ' on' : ''}" onclick="App._rgSmSlideTab(${i})">${isRep ? '🔁 ' : ''}第 ${sl.no} 頁${badge}</button>` });
+    });
+    return _smTabsFold(btns);
+  }
+  App._rgSmSlideTab = function (i) { const rg = App._rg; rg.slideIdx = i; rg.selKey = null; rg.sel = null; App._rgWizard(); };
+  // §24.15.10 #1（A+B）：處理範圍列——只設定第 X 到第 Y 頁，範圍外整頁保留原樣（=排除·不寫入範本）
+  function _smRangeBar() {
+    const rg = App._rg, n = (rg.slides || []).length;
+    if (n < 2) return '';
+    return `<div class="sm2-range">🎯 這份共 <b>${n}</b> 頁 —— 只設定第
+      <input type="number" id="rg-pg-from" min="1" max="${n}" value="${rg.pgFrom || 1}"> 到
+      <input type="number" id="rg-pg-to" min="1" max="${n}" value="${rg.pgTo || n}"> 頁
+      <button class="rg-btn ghost sm" onclick="App._rgSmRangeApply()">套用範圍</button>
+      ${rg.pgFrom ? `<span class="sm2-range-on">已鎖定第 ${rg.pgFrom}–${rg.pgTo} 頁，其餘 ${n - (rg.pgTo - rg.pgFrom + 1)} 頁保留原樣</span><button class="rg-btn sm" onclick="App._rgSmRangeAll()">全部頁</button>` : '<span class="sm2-range-hint">範圍外的頁完全不動、維持原稿</span>'}</div>`;
+  }
+  App._rgSmRangeApply = function () {
+    const rg = App._rg, n = (rg.slides || []).length;
+    let a = parseInt((document.getElementById('rg-pg-from') || {}).value, 10) || 1;
+    let b = parseInt((document.getElementById('rg-pg-to') || {}).value, 10) || n;
+    if (a > b) { const t = a; a = b; b = t; }
+    a = Math.max(1, a); b = Math.min(n, b);
+    rg.pgFrom = a; rg.pgTo = b; rg.excluded = {};
+    (rg.slides || []).forEach(sl => { if (sl.no < a || sl.no > b) rg.excluded[sl.path] = true; });
+    const idx = (rg.slides || []).findIndex(sl => sl.no >= a && sl.no <= b);
+    if (idx >= 0) rg.slideIdx = idx;
+    rg.selKey = null; rg.sel = null; rg._doneTabsOpen = false;
+    App._rgWizard(); U.toast('已鎖定第 ' + a + '–' + b + ' 頁');
+  };
+  App._rgSmRangeAll = function () { const rg = App._rg; rg.pgFrom = null; rg.pgTo = null; rg.excluded = {}; App._rgWizard(); };
+  // §24.15.11 偵測提議卡（琥珀·當前頁命中且未標/未婉拒才出現）
+  function _smRepSuggestHtml() {
+    const rg = App._rg, sl = (rg.slides || [])[rg.slideIdx || 0];
+    if (!sl || _repOf(sl.path) || (rg._repSuggOff || {})[sl.path]) return '';
+    if (!(rg._repSugg || (rg._repSugg = RT.suggestRepeatPages(rg.slides))).includes(sl.path)) return '';
+    const n = RT.repeatRecords({ source: 'activeProjects' }).length, pe = sl.path.replace(/'/g, "\\'");
+    return `<div class="sm-repsug"><span class="ic">🔁</span><span class="tx"><b>第 ${sl.no} 頁看起來是「單一專案介紹頁」</b>——要每個專案自動長一頁嗎？（目前進行中 ${n} 個專案 → ${n} 頁）</span>
+      <span class="btns"><button class="rg-btn primary sm" onclick="App._rgRepMark('${pe}')">設為重複頁</button><button class="rg-btn ghost sm" onclick="App._rgRepDismiss('${pe}')">不用</button></span></div>`;
+  }
+  // 「看」區（PPT）＝這一項的前後對照：範本原本寫什麼 → 產出後會變什麼（聚焦當前項·純文字·取代已否決的版面縮圖）
+  //   §24.15.11：重複頁加「◀ 專案 (k/N) ▶」切換器——教一次、逐專案看真值（中欄改對應→右欄即時跟動）
+  function _smSlidePreview() {
+    const rg = App._rg, slide = (rg.slides || [])[rg.slideIdx || 0];
+    if (!slide) return '<div class="sm2-look-head">看 · 投影片</div><div class="sm2-look-empty">讀不到這頁內容。</div>';
+    const rep = _repOf(slide.path), pv = rep ? _repPrevRec(rep) : null;
+    let navHtml = '';
+    if (rep && pv.recs.length) {
+      navHtml = `<div class="sm-pv-nav"><button class="pn"${pv.i <= 0 ? ' disabled' : ''} onclick="App._rgRepNav(-1)">◀</button>
+        <span class="cur">${U.esc(pv.rec.name || '')}</span><span class="cnt">（第 ${pv.i + 1} / ${pv.recs.length} 個專案）</span>
+        <button class="pn"${pv.i >= pv.recs.length - 1 ? ' disabled' : ''} onclick="App._rgRepNav(1)">▶</button></div>`;
+    } else if (rep) navHtml = '<div class="sm-pv-nav"><span class="cnt">（來源 0 個專案·此頁將保留原樣）</span></div>';
+    const sel = _smSelSlot(), headHtml = `<div class="sm2-look-head">看 · 第 ${slide.no} 頁 · 這一項的前後對照</div>` + navHtml;
+    if (!sel || sel.slidePath !== slide.path) {
+      const own = _smSheetSlots(), bound = own.filter(s => _smEffTier(s) === 'auto').length;
+      return headHtml + `<div class="sm2-look-empty">點左邊任一項目，這裡會顯示<br>「範本原本寫什麼 → 產出後會變什麼」。</div>
+        <div class="sm2-look-note">這一頁：${(slide.paras || []).filter(p => p.text && !p.inTable).length} 段文字、${(slide.tables || []).length} 張表格 —— 系統只動已對應的 ${bound + own.filter(s => _smEffTier(s) !== 'auto').length} 處，其餘全部保留原稿。</div>`;
+    }
+    if (sel.kind === 'table') {
+      const pt = pptTblByPath(sel.slidePath, sel.tblIndex), heads = (sel.tb && sel.tb.headerTexts) || [];
+      const recs = pt ? (rep && !(pv && pv.rec) ? [] : (rowSource(pt.rowSource) || { get: () => [] }).get(rep ? { project: pv.rec } : { sheetName: '' })) : [];
+      const hRow = '<tr>' + heads.map(h => `<th>${U.esc(h || '—')}</th>`).join('') + '</tr>';
+      const rows = recs.slice(0, 3).map(rec => '<tr>' + heads.map((h, ci) => {
+        const fk = pt && (pt.cols || {})[ci]; let v = '—';
+        if (fk && fk !== 'manual') { const tf = tblField(fk); v = tf ? tf.get(rec) : '—'; }
+        else if (fk === 'manual') v = '（手填）';
+        return `<td>${U.esc(String(v == null || v === '' ? '—' : v))}</td>`;
+      }).join('') + '</tr>').join('');
+      return headHtml + `<div class="sm-pv">
+        <div class="sm-pv-sec">範本原本：這張表有表頭＋${sel.tb.dataRowCount} 列示範資料</div>
+        <div class="sm-pv-tblwrap"><table class="sm-pv-tbl">${hRow}</table></div>
+        <div class="sm-pv-arrow">↓ 產出後（示範列換成真實資料·共 ${recs.length} 列·逐列自動長）</div>
+        <div class="sm-pv-tblwrap"><table class="sm-pv-tbl">${hRow}${rows || '<tr><td>（先在中間選好欄位）</td></tr>'}</table></div>
+        ${recs.length > 3 ? `<div class="sm-pv-note">…以下共 ${recs.length} 列自動長出。</div>` : ''}
+        <div class="sm-pv-note">表格框線／底色／字體全部沿用你範本設好的樣式。「—」＝該欄未綁定，維持範本原字。</div></div>`;
+    }
+    const paras = slide.paras || [], pi = sel.pIndex;
+    const ctxOf = (from, dir) => { for (let j = from + dir; j >= 0 && j < paras.length; j += dir) { const p = paras[j]; if (p && p.text && p.text.trim() && !p.inTable) return p.text.trim(); } return ''; };
+    const prev = ctxOf(pi, -1), next = ctxOf(pi, 1);
+    const key = sel.slidePath + '#' + pi, b = _smStore()[key] || { cat: 'auto', field: sel.guess && sel.guess.field };
+    let produced;
+    if (b.cat === 'manual') produced = '（產出時清空，由你在 PPT 裡自己寫）';
+    else if (b.cat === 'fixed') produced = b.text || '（固定文字·尚未輸入）';
+    else if (b.cat === 'keep') produced = '（保留原字不動）';
+    else if (b.cat === 'blank') produced = '（留空白）';
+    else { let v = RT.resolveBinding(b, rep ? (pv && pv.rec) : undefined, rep ? RT.projField : sysField); produced = v === RT.SKIP ? '（保留原字不動）' : String(v == null ? '' : v); }
+    return headHtml + `<div class="sm-pv">
+      <div class="sm-pv-sec">範本第 ${slide.no} 頁 · 原本這樣寫（前後文幫你認位置）</div>
+      ${prev ? `<div class="sm-pv-ctx">${U.esc(prev)}</div>` : ''}
+      <div class="sm-pv-here">▸ ${U.esc(sel.role)}</div>
+      ${next ? `<div class="sm-pv-ctx">${U.esc(next)}</div>` : ''}
+      <div class="sm-pv-arrow">↓ 產出後這段會變成</div>
+      <div class="sm-pv-val">${U.esc(produced)}</div>
+      <div class="sm-pv-note">只有這段會被改，前後文與版面、字體、顏色全部保留原稿。</div></div>`;
+  }
+  App._rgWizard = function () {
+    const rg = App._rg;
+    if (!rg.cls) rg.cls = _isPpt() ? RT.classifyPptSlots(rg.slides, rg.repeats) : RT.classifySlots(rg.scan);
+    if (!rg._seeded) { _rgSeedFromClassify(); rg._seeded = true; }
+    const c = _smActiveCounts(), need = c.confirm + c.manual + c.disp;
+    const unitN = _isPpt() ? ((rg.slides || []).length + ' 頁投影片') : ((rg.scan.sheets || []).length + ' 個工作表');
+    const head = `<div class="sm-head">
+        <div class="sm-steps">
+          <div class="sm-step done"><span class="n">✓</span>上傳範本</div><span class="sm-step-arrow">→</span>
+          <div class="sm-step done"><span class="n">✓</span>系統分析</div><span class="sm-step-arrow">→</span>
+          <div class="sm-step now"><span class="n">3</span>對應設定</div><span class="sm-step-arrow">→</span>
+          <div class="sm-step"><span class="n">4</span>定型範本</div></div>
+        <div class="sm-recog"><div class="ico">${_isPpt() ? '◧' : '📊'}</div><div class="body">
+          <b>已掃描 ${unitN} · ${U.esc(rg.srcName)}</b>
+          <div class="sub">${rg._contFrom ? `<span class="hi">🧠 已延續「${U.esc(rg._contFrom)}」的對應</span> · ` : ''}系統掃描完成 —— <span class="hi">已自動配好 ${c.auto} 項</span>，只有 <span class="hi">${need} 項</span>需要你決定（去重後）。${_isPpt() ? '一般內文未列＝保留你的原稿。' : ''}</div></div></div>
+      </div>`;
+    const inner = `${_isPpt() ? _smRangeBar() : ''}<div class="sm2-tabs">${_isPpt() ? _smSlideTabs() : _smSheetTabs()}</div>${_isPpt() ? _smRepSuggestHtml() : ''}
+      <div class="sm2-work">
+        <div class="sm2-list">${_smListHtml()}</div>
+        <div class="sm2-editor">${_smEditorHtml()}</div>
+        <div class="sm2-grid">${_isPpt() ? _smSlidePreview() : _smGridHtml()}</div></div>`;
+    const body = `<div class="rg-sm rg-sm2">${head}${inner}</div>`;
+    const footer = `<div class="rg-foot">
+      <label class="rg-nm">範本名稱 <input id="rg-name" value="${U.esc(rg.name)}" oninput="App._rg.name=this.value"></label>
+      <span class="rg-foot-hint">確認沒問題就送出——產出會撈系統最新資料</span>
+      <span class="rg-foot-sp"></span>
+      <button class="rg-btn ghost" onclick="App.closeModal()">取消</button>
+      <button class="rg-btn ghost" onclick="App._rgSaveOnly()">${rg.editId ? '只儲存' : '只定型'}</button>
+      <button class="rg-btn primary" onclick="App._rgSaveProduce()">${rg.editId ? '儲存並產出報表 ▸' : '定型並產出報表 ▸'}</button></div>`;
+    App.openModal({ title: rg.editId ? '編輯智慧對應' : '智慧對應精靈', body, footer });
+  };
+  App._rgSmSel = function (id) {
+    const rg = App._rg, s = rg.cls.slots.find(x => _smSlotId(x) === id); if (!s) return;
+    rg.selKey = id; rg._dupOpen = false; rg._dupCheck = null;
+    if (s.kind === 'table') {
+      rg.sel = _isPpt() ? { mode: 'ppttable', slidePath: s.slidePath, tblIndex: s.tblIndex } : { mode: 'table', sheetName: s.sheetName };
+      if (!_isPpt()) { const i = rg.scan.sheets.findIndex(sh => sh.name === s.sheetName); if (i >= 0) rg.sheetIdx = i; }
+      else { const i = (rg.slides || []).findIndex(sl => sl.path === s.slidePath); if (i >= 0) rg.slideIdx = i; }   // PPT 點項目→縮圖切到該頁
+    } else {
+      const key = _smSlotKey(s); rg.sel = { mode: 'cell', key: key };
+      if (s.kind === 'manual' && !_smStore()[key]) _smStore()[key] = { cat: 'manual' };
+      if (!_isPpt() && s.sheetName) { const i = rg.scan.sheets.findIndex(sh => sh.name === s.sheetName); if (i >= 0) rg.sheetIdx = i; }   // 點項目→右網格切到該分頁
+      else if (_isPpt() && s.slidePath) { const i = (rg.slides || []).findIndex(sl => sl.path === s.slidePath); if (i >= 0) rg.slideIdx = i; }
+    }
+    App._rgWizard();
+  };
+  App._rgSmToggleAuto = function () { App._rg._autoOpen = !App._rg._autoOpen; App._rgWizard(); };
+  App._rgSmToggleZone = function (tier) { const rg = App._rg; rg._zoneCollapsed = rg._zoneCollapsed || {}; const cur = rg._zoneCollapsed[tier], def = tier === 'disp'; rg._zoneCollapsed[tier] = (cur == null ? !def : !cur); App._rgWizard(); };
+
+  // Phase 3 多表格：每分頁一張·App._rg.tables[]（智慧精靈 §24.15 共用此查詢）
+  function rgTable(name) { return (App._rg.tables || []).find(t => t.sheetName === name); }
+
+  App._rgSave = async function () {
+    const rg = App._rg, name = (rg.name || '').trim();
+    if (!name) return App.confirmModal({ title: '缺範本名稱', msg: '請先給這個報表範本一個名稱。', okText: '知道了', cancelText: null });
+    // 定型防呆：還有「待確認」沒點頭→先問（直接定型＝照系統猜的填·不偷偷寫）
+    const pendingConfirm = (rg.cls ? _smActiveSlots().filter(s => _smEffTier(s) === 'confirm').length : 0);
+    if (pendingConfirm && !rg._savePendingOk) {
+      return App.confirmModal({ title: '還有待確認項目', icon: 'ti-alert-triangle',
+        msg: `還有 <b>${pendingConfirm}</b> 項「待確認」你還沒點頭。直接定型的話，這些會<b>照系統的猜測</b>填入（之後仍可回來「編輯對應」調整）。`,
+        okText: '照系統猜的定型', cancelText: '回去確認',
+        onConfirm: () => { rg._savePendingOk = true; App._rgSave(); } });
+    }
+    const exc = rg.excluded || {};   // §24.15 排除的工作表／超出處理範圍的頁：不寫入範本（不刪 rg 狀態·重納入即恢復）
+    let xlMap = {}, xlTables = [], pMap = {}, pTables = [];
+    if (rg.type === 'pptx') {
+      const live = {}; (rg.slides || []).forEach(sl => { live[sl.path] = 1; });   // 失聯頁剪裁：延續舊範本帶進來、檔裡不存在的頁 key 不寫入
+      Object.keys(rg.pptMap || {}).forEach(k => { const sp = k.split('#')[0]; if (!exc[sp] && live[sp]) pMap[k] = rg.pptMap[k]; });
+      pTables = (rg.pptTables || []).filter(p => !exc[p.slidePath] && live[p.slidePath] && Object.values(p.cols || {}).filter(Boolean).length);
+      const ptCols = pTables.reduce((n, p) => n + Object.values(p.cols || {}).filter(Boolean).length, 0);
+      if (!Object.keys(pMap).length && !ptCols) return App.confirmModal({ title: '尚未設定填空點', msg: '請至少設定一個文字槽或表格欄，再儲存。' + (rg.pgFrom ? '（若你設定的頁被「處理範圍」排除了，先調整範圍再定型）' : ''), okText: '知道了', cancelText: null });
+    } else {
+      Object.keys(rg.mapping || {}).forEach(k => { if (!exc[k.split('!')[0]]) xlMap[k] = rg.mapping[k]; });
+      xlTables = (rg.tables || []).filter(t => Object.keys(t.cols || {}).length && !exc[t.sheetName]);
+      const tblCols = xlTables.reduce((n, t) => n + Object.keys(t.cols || {}).length, 0);
+      if (!Object.keys(xlMap).length && !tblCols) return App.confirmModal({ title: '尚未設定填空點', msg: '請至少綁一個欄或點一個格子，再儲存。', okText: '知道了', cancelText: null });
+    }
+    const id = rg.editId || 'rpt_' + Date.now();
+    try {   // §24.15 第②期：定型時 byte 種入隱形錨點（新匯入＋編輯都重種·冪等·存的就是「帶錨點母檔」）
+      const seeded = rg.type === 'pptx' ? await RT.seedAnchorsPptx(rg.ab, pMap) : await RT.seedAnchorsXlsx(rg.ab, xlMap, xlTables);
+      await RT.blobPut(id, seeded, false);
+    }
+    catch (e) { return App.confirmModal({ title: '儲存失敗', msg: '存原檔到本機時出錯：' + (e.message || e), okText: '知道了', cancelText: null }); }
+    const fp = rg._fp || RT.fingerprint(rg);   // §24.15 第②期：存範本指紋（下次同型上傳可比對延續）
+    const rec = rg.type === 'pptx'
+      ? { name, type: 'pptx', srcName: rg.srcName, pptMap: pMap, pptTables: pTables, repeats: (rg.repeats || []).filter(r => { const live = (rg.slides || []).some(sl => sl.path === r.slidePath); return live && !exc[r.slidePath]; }), slideCount: rg.slides.length, fp, b64: null }
+      : { name, type: 'xlsx', srcName: rg.srcName, mapping: xlMap, tables: xlTables, table: null, fp, b64: null };
+    if (rg.editId) Store.reportTemplates.update(id, rec);
+    else Store.reportTemplates.add(Object.assign({ id, updatedAt: null }, rec));
+    const alsoProduce = !!rg._alsoProduce;   // 「儲存並產出」閉環：存完直接跑產出（§24.15.10 Footer 定案）
+    App._rg = null; App.closeModal(); App.renderReportGen(); U.toast(rg.editId ? '對應已更新' : '報表範本已建立');
+    if (alsoProduce) App._rgProduce(id);
+  };
+  App._rgSaveProduce = function () { const rg = App._rg; if (!rg) return; rg._alsoProduce = true; App._rgSave(); };
+  App._rgSaveOnly = function () { const rg = App._rg; if (rg) rg._alsoProduce = false; App._rgSave(); };   // 清旗標：曾按過「並產出」但驗證擋下後改按只儲存·不誤產
+  App._rgDelete = function (id) {
+    const t = (DATA.reportTemplates || []).find(x => x.id === id); if (!t) return;
+    App.confirmModal({ title: '刪除報表範本', msg: `確定刪除「${U.esc(t.name)}」？（原始檔在你電腦裡不受影響；本機存的範本原檔會一併移除）`, okText: '刪除', okClass: 'danger',
+      onConfirm: async () => { await RT.blobDel(id); Store.reportTemplates.remove(id); App.renderReportGen(); U.toast('已刪除'); } });
+  };
+
+  // 多表格相容：新 tables[]／舊單張 table
+  const tablesOf = t => (t.tables && t.tables.length) ? t.tables : (t.table ? [t.table] : []);
+
+  App._rgProduce = async function (id) {
+    const t = (DATA.reportTemplates || []).find(x => x.id === id); if (!t) return;
+    if ((t.type || 'xlsx') === 'pptx') return App._rgDoProduce(id, true);   // PPT 無公式異常
+    // §24.7：跨所有重複表格偵測「合計/公式範圍沒涵蓋新列」，有就先問「延伸/維持」（不自作主張改公式）
+    try {
+      const ab = await rgGetBlob(t), anomalies = [];
+      for (const tb of tablesOf(t)) {
+        if (!Object.keys(tb.cols || {}).length) continue;
+        const src = rowSource(tb.rowSource), n = src ? src.get({ sheetName: tb.sheetName }).length : tb.curCount;
+        if (n === tb.curCount) continue;
+        const info = await RT.peekFormulaAnomaly(ab, tb, n);
+        if (info.hits.length) anomalies.push({ sheetName: tb.sheetName, label: (src || {}).label || '', newCount: n, curCount: tb.curCount, info });
+      }
+      if (anomalies.length) return rgAnomalyModal(t, anomalies);
+    } catch (e) { /* 偵測失敗照常產出 */ }
+    App._rgDoProduce(id, true);
+  };
+
+  function rgAnomalyModal(t, anomalies) {
+    const blocks = anomalies.map(a => {
+      const list = a.info.hits.slice(0, 6).map(h => `<li><code>${h.ref}</code>　<code>${U.esc(h.formula)}</code></li>`).join('');
+      const d = a.newCount - a.curCount;
+      return `<div class="rg-anom-blk"><div class="rg-anom-sheet">分頁「${U.esc(a.sheetName)}」（${U.esc(a.label)}）：${a.newCount} 筆·比原本${d > 0 ? '多' : '少'} ${Math.abs(d)} 列</div>
+        <ul class="rg-anom-list">${list}${a.info.hits.length > 6 ? '<li>…（其餘略）</li>' : ''}</ul></div>`;
+    }).join('');
+    App.openModal({
+      title: '公式範圍要延伸嗎？',
+      body: `<div class="rg-anom"><p>下列合計/公式的範圍還停在原本的末列、沒涵蓋新的資料列：</p>${blocks}
+        <p class="rg-anom-note">要幫你把這些公式範圍延伸到涵蓋全部列嗎？<br>「維持原樣」＝完全不動你的公式（系統絕不自作主張改·§24.1）。此選擇套用到所有表格。</p></div>`,
+      footer: `<button class="rg-btn ghost" onclick="App._rgDoProduce('${t.id}',false)">維持原樣</button>
+        <button class="rg-btn primary" onclick="App._rgDoProduce('${t.id}',true)">延伸公式範圍</button>`,
+    });
+  }
+
+  App._rgDoProduce = async function (id, extendFormulas) {
+    const t = (DATA.reportTemplates || []).find(x => x.id === id); if (!t) return;
+    try {
+      App.openLoadingModal('產出中', '正在撈最新資料、寫入檔案…');
+      const ab = await rgGetBlob(t);
+      if ((t.type || 'xlsx') === 'pptx') {   // PPT：段落文字外科替換＋表格逐列
+        const paraEdits = Object.entries(t.pptMap || {}).map(([key, m]) => {
+          const [slidePath, pIndex] = key.split('#');
+          const r = RT.resolveBinding(m, undefined, sysField);   // §24.15：cat/轉換/空值統一解析
+          if (r === RT.SKIP) return null;                        // keep 保留原樣→不改段落
+          return { slidePath, pIndex: +pIndex, text: r == null ? '' : String(r) };
+        }).filter(Boolean);
+        const tableFills = (t.pptTables || []).filter(pt => Object.values(pt.cols || {}).filter(Boolean).length).map(pt => {
+          const src = rowSource(pt.rowSource), recs = src ? src.get({ sheetName: '' }) : [];
+          const rows = recs.map(r => { const arr = []; for (let c = 0; c < pt.colCount; c++) { const fk = (pt.cols || {})[c]; if (!fk || fk === 'manual') { arr.push(''); continue; } const f = tblField(fk); arr.push(f ? String(f.get(r)) : ''); } return arr; });
+          return { slidePath: pt.slidePath, tblIndex: pt.tblIndex, headerRows: pt.headerRows || 1, records: rows };
+        });
+        const u8p = await RT.fillPptx(ab, { paraEdits, tableFills });
+        const fnp = (t.name || 'report') + '_' + new Date().toISOString().slice(0, 10) + '.pptx';
+        downloadFile(u8p, fnp, 'pptx');
+        Store.reportTemplates.update(id, { updatedAt: new Date().toLocaleString('zh-TW') });
+        App.closeModal(); App.renderReportGen(); return U.toast('已產出：' + fnp);
+      }
+      const cells = Object.entries(t.mapping || {}).map(([key, map]) => {
+        const [sheetName, ref] = key.split('!');
+        const r = RT.resolveBinding(map, undefined, sysField);   // §24.15：cat/轉換/空值統一解析
+        if (r === RT.SKIP) return null;                          // keep 保留原樣→不寫此格
+        return { sheetName, ref, value: r, type: typeof r === 'number' ? 'n' : 'inlineStr' };
+      }).filter(Boolean);
+      const tables = tablesOf(t).filter(tb => Object.keys(tb.cols || {}).length).map(tb => {
+        const src = rowSource(tb.rowSource), records = src ? src.get({ sheetName: tb.sheetName }) : [];
+        const cols = Object.entries(tb.cols).map(([col, b]) => ({
+          col, get: rec => { const r = RT.resolveBinding(b, rec, tblField); return r === RT.SKIP ? undefined : r; }   // keep→undefined→fillTable 跳過留範本原值；type 由 fillTable 逐格判
+        }));
+        return { sheetName: tb.sheetName, dataStartRow: tb.dataStartRow, curCount: tb.curCount, footerLastRow: tb.footerLastRow, cols, records, extendFormulas: extendFormulas !== false };
+      });
+      const u8 = await RT.fillWorkbook(ab, { cells, tables });
+      const fname = (t.name || 'report') + '_' + new Date().toISOString().slice(0, 10) + '.xlsx';
+      downloadFile(u8, fname, 'xlsx');
+      Store.reportTemplates.update(id, { updatedAt: new Date().toLocaleString('zh-TW') });
+      App.closeModal(); App.renderReportGen(); U.toast('已產出：' + fname);
+    } catch (err) { App.closeModal(); App.confirmModal({ title: '產出失敗', msg: '產出時出錯：' + (err.message || err), okText: '知道了', cancelText: null }); }
+  };
+
+})();

@@ -1,0 +1,1562 @@
+// ─── 物料分析總覽 · 料號主檔（§21 物料模組 Phase①）────────────────────────────
+// 定版 spec 見 docs/pm-core-architecture.md §21.6/§21.13。資料層走 Store.parts（§21.9）。
+// 料號主檔＝跨案·partId 主鍵·單價/交期單一真實來源；缺口/建議下單/買料前置全 derived。
+// 父階子階 where-used 樹＝Phase②（BOM 接主檔）起自動顯示，Phase① 先空狀態。
+const Materials = {
+  _state: { tab: 'gap', view: 'list', cat: 'ALL', q: '', proj: 'ALL', matProj: '', dqDraft: null, mgExpand: null, gapExpand: null },
+  _CATS: ['壓縮機', '閥件', '換熱器', '馬達', '電控', '感測器', '管件', '包材', '其他'],
+  // 被追蹤欄位（改動寫進 history·刪除規則以 history 筆數判定）
+  _TRACK: [['partNo', '料號'], ['unitPrice', '單價'], ['leadTime', '廠商交期'], ['internalBuffer', '內部緩衝'], ['moq', 'MOQ'], ['safetyStock', '安全庫存'], ['vendor', '廠商']],
+  _BUF_DEF: 4,
+
+  // ── derived helpers（同一把尺·§21.5）──
+  _num(v) { const n = Number(v); return isNaN(n) ? 0 : n; },
+  _health(p) { const on = this._num(p.onHand); return on < 0 ? 'bad' : on < this._num(p.safetyStock) ? 'warn' : 'ok'; },
+  _hlabel(h) { return h === 'bad' ? '已缺' : h === 'warn' ? '將缺' : '足'; },
+  _buyQty(p) { const on = this._num(p.onHand), safe = this._num(p.safetyStock), moq = this._num(p.moq) || 1;
+    if (on >= safe) return 0; const need = safe * 2 - on - this._num(p.inTransit); return Math.max(moq, Math.ceil(need / moq) * moq); },
+  _leadTotal(p) { return this._num(p.leadTime) + (p.internalBuffer != null ? this._num(p.internalBuffer) : this._BUF_DEF); },
+  _canDelete(p) { return (p.history || []).length <= 2; },
+  _money(n) { return '$' + this._num(n).toLocaleString(); },
+  _gauge(p) { const safe = this._num(p.safetyStock), on = this._num(p.onHand); const cap = Math.max(safe * 2, 1);
+    return { fill: Math.max(0, Math.min(100, (Math.max(on, 0) / cap) * 100)), safe: Math.min(100, (safe / cap) * 100) }; },
+  _today() { return new Date().toISOString().slice(0, 10); },
+  _addDays(iso, days) { if (!iso) return ''; const d = new Date(iso); if (isNaN(d.getTime())) return ''; d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10); },
+  _daysBetween(a, b) { if (!a || !b) return null; const da = new Date(a), db = new Date(b); if (isNaN(da.getTime()) || isNaN(db.getTime())) return null; return Math.round((db - da) / 86400000); },   // b−a 天（負＝b 在 a 之前）
+  _esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); },
+
+  _filtered() {
+    const q = this._state.q.trim().toLowerCase();
+    let projSet = null;
+    if (this._state.proj !== 'ALL') {
+      const proj = (DATA.projects || []).find(p => p.id === this._state.proj);
+      projSet = new Set(proj ? this._extractProjectMaterials(proj).map(m => m.partNo) : []);
+    }
+    return (DATA.parts || []).filter(p => {
+      if (projSet && !projSet.has(p.partNo)) return false;
+      if (this._state.cat !== 'ALL' && p.category !== this._state.cat) return false;
+      if (q && !((p.partNo || '') + (p.name || '') + (p.vendor || '')).toLowerCase().includes(q)) return false;
+      return true;
+    });
+  },
+  setProj(v) { this._state.proj = v; this._renderBody(); },
+
+  // ── 主 render ──
+  render() {
+    const page = document.getElementById('page-materials');
+    if (!page) return;
+    const tab = this._state.tab || 'parts';
+    const stab = (k, label) => `<button class="mat-subtab ${tab === k ? 'on' : ''}" onclick="Materials.setTab('${k}')">${label}</button>`;
+    page.innerHTML = `
+      <div class="mat-wrap">
+        <div class="mat-head">
+          <h1 class="mat-title">物料分析總覽 <span class="mat-idchip">物料控管</span></h1>
+          <div class="mat-subtabs">${stab('gap', '缺口總表')}${stab('parts', '料號主檔')}${stab('demand', '需求來源')}${stab('inv', '庫存異動')}${stab('mold', '模具費用')}${stab('docs', '單據歷史')}</div>
+        </div>
+        <div id="mat-tabbody"></div>
+      </div>
+      <div class="mat-drawer-scrim" id="mat-drawer-scrim" onclick="Materials.closeDrawer()"></div>
+      <aside class="mat-drawer" id="mat-drawer"></aside>`;
+    this._renderTab();
+  },
+  setTab(t) { this._state.tab = t; if (t !== 'demand') this._state.dqDraft = null; this.render(); },
+  _renderTab() {
+    const el = document.getElementById('mat-tabbody'); if (!el) return;
+    const tab = this._state.tab || 'gap';
+    if (tab === 'gap') { el.innerHTML = this._gapHtml(); return; }
+    if (tab === 'demand') { el.innerHTML = this._demandHtml(); return; }
+    if (tab === 'inv') { el.innerHTML = this._invHtml(); return; }
+    if (tab === 'mold') { el.innerHTML = this._moldHtml(); return; }
+    if (tab === 'docs') { el.innerHTML = this._docsHtml(); return; }
+    // 料號主檔（parts）
+    el.innerHTML = `
+      <div id="mat-newbanner"></div>
+      <div class="mat-kpirow" id="mat-kpirow"></div>
+      <div class="mat-tbar">
+        <div class="mat-search"><input type="text" placeholder="搜尋料號 / 品名 / 廠商" value="${this._esc(this._state.q)}" oninput="Materials.setSearch(this.value)"></div>
+        <select class="mat-sel" onchange="Materials.setProj(this.value)" title="依專案篩選：只看該案 BOM 用到的料號">
+          <option value="ALL">全部專案</option>
+          ${(DATA.projects || []).map(p => `<option value="${p.id}" ${this._state.proj === p.id ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('')}
+        </select>
+        <select class="mat-sel" onchange="Materials.setCat(this.value)">
+          <option value="ALL">全部類別</option>
+          ${this._CATS.map(c => `<option value="${c}" ${this._state.cat === c ? 'selected' : ''}>${c}</option>`).join('')}
+        </select>
+        <div class="mat-seg">
+          <button class="${this._state.view === 'list' ? 'on' : ''}" onclick="Materials.setView('list')">清單</button>
+          <button class="${this._state.view === 'table' ? 'on' : ''}" onclick="Materials.setView('table')">表格</button>
+        </div>
+        <button class="btn-ghost" onclick="Materials.openImportPicker()">📥 從專案帶入</button>
+        <button class="btn-ghost" onclick="Materials.openImporterFile()">📄 智慧匯入單據</button>
+        <button class="btn-mat" onclick="Materials.openAdd()">＋ 新增料號</button>
+      </div>
+      <div id="mat-body"></div>`;
+    this._renderBody();
+  },
+
+  _renderBody() {
+    const fp = this._filtered();
+    const bn = document.getElementById('mat-newbanner');
+    if (bn) { const news = this._allNewProjectParts(); const np = new Set(); news.forEach(n => n.projs.forEach(x => np.add(x))); bn.innerHTML = news.length ? `<div class="mat-newbn"><span class="mat-newbn-t">💡 偵測到 <b>${news.length}</b> 個全新料號（來自 ${np.size} 個專案 BOM）尚未登記至主檔</span><button class="btn-mat" onclick="Materials.importAllNewParts()">檢視並全部帶入</button></div>` : ''; }
+    document.getElementById('mat-kpirow').innerHTML = this._kpiHtml(fp);
+    document.getElementById('mat-body').innerHTML = (DATA.parts || []).length === 0
+      ? this._importHeroHtml(false)
+      : (this._state.view === 'list' ? this._listHtml(fp) : this._tableHtml(fp));
+  },
+
+  _emptyHtml() {
+    return `<div class="mat-empty">
+      <div class="mat-empty-ic">🧱</div>
+      <div class="mat-empty-t">還沒有任何料號</div>
+      <div class="mat-empty-d">料號主檔是物料/BOM/缺口計算的單一真實來源。先新增第一顆料號，或日後由 Excel 匯入／BOM 建檔自動長出。</div>
+      <button class="btn-mat" onclick="Materials.openAdd()">＋ 新增第一顆料號</button>
+    </div>`;
+  },
+
+  _kpiHtml(fp) {
+    const bad = fp.filter(p => this._health(p) === 'bad').length;
+    const warn = fp.filter(p => this._health(p) === 'warn').length;
+    const reorder = fp.filter(p => this._buyQty(p) > 0).length;
+    const filtered = this._state.cat !== 'ALL' || this._state.proj !== 'ALL' || this._state.q.trim();
+    const projName = this._state.proj !== 'ALL' ? ((DATA.projects || []).find(p => p.id === this._state.proj) || {}).name : '';
+    const cards = [
+      { cls: 'neu', k: projName ? '本專案用到料號' : (filtered ? '篩選出料號' : '料號總數'), v: fp.length, u: '項', sub: `共 ${(DATA.parts || []).length} 顆` },
+      { cls: 'bad', k: '已缺料', v: bad, u: '項', sub: '庫存 < 0，需立即下單' },
+      { cls: 'warn', k: '將缺料', v: warn, u: '項', sub: '低於安全水位' },
+      { cls: 'mat', k: '建議下單品項', v: reorder, u: '項', sub: '詳見缺口總表' },
+    ];
+    return cards.map(c => `<div class="mat-kpi mat-kpi-${c.cls}">
+      <div class="mat-kpi-k">${c.k}</div>
+      <div class="mat-kpi-v">${c.v}<small>${c.u}</small></div>
+      <div class="mat-kpi-s">${c.sub}</div></div>`).join('');
+  },
+
+  // ── 清單檢視（風險分層·方向1）──
+  _listHtml(fp) {
+    const grp = h => fp.filter(p => this._health(p) === h);
+    const bad = grp('bad'), warn = grp('warn'), ok = grp('ok');
+    const seg = (title, dot, arr, note) => `<div class="mat-lgroup">
+      <div class="mat-lgh"><span class="mat-dot ${dot}"></span>${title} <span class="mat-lgn">· ${arr.length} 項${note ? ' ' + note : ''}</span></div>
+      <div class="mat-lcard">${arr.length ? arr.map(p => this._rowHtml(p)).join('') : '<div class="mat-lempty">此分類目前無料號</div>'}</div></div>`;
+    return `<div class="mat-lgroups">
+      ${seg('已缺料', 'bad', bad, '需立即下單')}
+      ${seg('將缺料', 'warn', warn, '低於安全水位')}
+      ${seg('庫存充足', 'ok', ok, '')}
+    </div>
+    <div class="mat-hint">點任一料號展開詳情：現值、買料前置、料號/版本進版履歷、刪除。現有庫存/在途只設起始值，日後由庫存異動自動增減。父階子階用途樹於 BOM 接主檔（Phase②）後自動顯示。</div>`;
+  },
+
+  _rowHtml(p) {
+    const h = this._health(p), g = this._gauge(p), b = this._buyQty(p);
+    const color = `var(--mat-h-${h})`;
+    return `<div class="mat-row" onclick="Materials.openDrawer('${p.partId}')">
+      <span class="mat-stripe ${h}"></span>
+      <div class="mat-r-id">
+        <div class="mat-r-pn">${this._esc(p.partNo)}${p.ver ? `<span class="mat-ver">版 ${this._esc(p.ver)}</span>` : ''}${p.status === 'Preliminary' ? '<span class="mat-prelim">樣品</span>' : ''}<span class="mat-catchip">${this._esc(p.category || '未分類')}</span></div>
+        <div class="mat-r-nm">${this._esc(p.name)}</div>
+        <div class="mat-r-meta">${this._esc(p.spec || '')}${p.vendor ? ' · ' + this._esc(p.vendor) : ''}</div>
+      </div>
+      <div class="mat-r-gauge">
+        <div class="mat-glab"><span>現有庫存</span><b class="${this._num(p.onHand) < 0 ? 'neg' : ''}">${this._num(p.onHand)}</b></div>
+        <div class="mat-track"><div class="mat-fill" style="width:${g.fill}%;background:${color}"></div><div class="mat-safe" style="left:${g.safe}%"></div></div>
+        <div class="mat-glab mat-glab2"><span>安全 ${this._num(p.safetyStock)}${this._num(p.inTransit) ? ' · 在途 ' + this._num(p.inTransit) : ''}</span><span class="mat-pill ${h}">${this._hlabel(h)}</span></div>
+      </div>
+      <div class="mat-r-proc"><div><span class="k">單價</span> <b>${this._money(p.unitPrice)}</b></div><div><span class="k">買料前置</span> <b>${this._leadTotal(p)}天</b></div></div>
+      <div class="mat-r-buy"><div class="lb">建議下單</div><div class="v ${b > 0 ? 'pos' : ''}">${b > 0 ? '+' + b : '—'}</div></div>
+    </div>`;
+  },
+
+  // ── 表格檢視（扁平·方向2）──
+  _tableHtml(fp) {
+    const rows = fp.map(p => {
+      const h = this._health(p), lock = !this._canDelete(p);
+      return `<tr onclick="Materials.openDrawer('${p.partId}')">
+        <td><div class="mat-t-pn"><span class="mat-dot ${h}"></span>${this._esc(p.partNo)}${p.ver ? ` <span class="mat-ver">版${this._esc(p.ver)}</span>` : ''}</div><div class="mat-t-nm">${this._esc(p.name)}</div></td>
+        <td><span class="mat-catchip">${this._esc(p.category || '未分類')}</span></td>
+        <td class="r">${this._money(p.unitPrice)}</td>
+        <td class="r">${this._num(p.leadTime)}<span class="u">天</span></td>
+        <td class="r">${this._num(p.moq)}</td>
+        <td class="r">${this._num(p.safetyStock)}</td>
+        <td class="r ${this._num(p.onHand) < 0 ? 'neg' : ''}">${this._num(p.onHand)}</td>
+        <td class="r">${this._num(p.inTransit) || '–'}</td>
+        <td class="r mat-hcount ${lock ? 'lock' : ''}">${(p.history || []).length}${lock ? ' 🔒' : ''}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="mat-tcard"><div class="mat-twrap"><table class="mat-table">
+      <thead><tr><th>料號 / 品名</th><th>類別</th><th class="r">單價</th><th class="r">交期</th><th class="r">MOQ</th><th class="r">安全</th><th class="r">現有</th><th class="r">在途</th><th class="r">修改</th></tr></thead>
+      <tbody>${rows}</tbody></table></div></div>
+      <div class="mat-tfoot">顯示 ${fp.length} 筆 · 點列展開詳情。「修改」欄＝履歷筆數，>2（🔒）代表持續維護中的正確資料、不可刪除。</div>`;
+  },
+
+  // ── 控制 ──
+  setView(v) { this._state.view = v; this._renderBody(); },
+  setCat(v) { this._state.cat = v; this._renderBody(); },
+  setSearch(v) { this._state.q = v; this._renderBody(); },
+
+  // ── 新增 / 編輯（走 App.openModal；§21.11 確認後才寫入）──
+  _formBody(p, asNew) {
+    const g = (k, v) => this._esc(p && p[k] != null ? p[k] : (v == null ? '' : v));
+    const catOpts = this._CATS.map(c => `<option ${p && p.category === c ? 'selected' : ''}>${c}</option>`).join('');
+    const isEdit = !!p && !asNew;   // asNew＝複製為新料號：欄位帶入但視為新增（不顯履歷原因欄·submit 走新增）
+    return `<div class="mat-form">
+      <div class="mat-fgrid">
+        <label class="mat-fld"><span>料號 <b class="req">*</b></span><input id="mf-pn" value="${g('partNo')}" placeholder="FA000027B"></label>
+        <label class="mat-fld"><span>品名 <b class="req">*</b></span><input id="mf-nm" value="${g('name')}" placeholder="迴轉式壓縮機"></label>
+        <label class="mat-fld"><span>類別 <b class="req">*</b></span><select id="mf-cat">${catOpts}</select></label>
+        <label class="mat-fld"><span>狀態</span><select id="mf-st"><option ${p && p.status === 'Preliminary' ? 'selected' : ''}>Preliminary</option><option ${!p || p.status !== 'Preliminary' ? 'selected' : ''}>Released</option></select></label>
+      </div>
+      <div class="mat-fmore-h">採購參數／庫存起始（皆選填，可後補）</div>
+      <div class="mat-fgrid">
+        <label class="mat-fld"><span>規格</span><input id="mf-spec" value="${g('spec')}"></label>
+        <label class="mat-fld"><span>廠商</span><input id="mf-v" value="${g('vendor')}"></label>
+        <label class="mat-fld"><span>單價</span><input id="mf-price" type="number" value="${g('unitPrice')}"></label>
+        <label class="mat-fld"><span>廠商交期 L/T（天）</span><input id="mf-lt" type="number" value="${g('leadTime')}"></label>
+        <label class="mat-fld"><span>內部＋入庫緩衝（天·預設 4）</span><input id="mf-buf" type="number" value="${g('internalBuffer')}" placeholder="4"></label>
+        <label class="mat-fld"><span>MOQ 最小訂購量</span><input id="mf-moq" type="number" value="${g('moq')}"></label>
+        <label class="mat-fld"><span>安全庫存</span><input id="mf-safe" type="number" value="${g('safetyStock')}"></label>
+        <label class="mat-fld"><span>現有庫存（起始）</span><input id="mf-on" type="number" value="${g('onHand')}"></label>
+        <label class="mat-fld"><span>在途（起始）</span><input id="mf-tr" type="number" value="${g('inTransit')}"></label>
+        <label class="mat-fld"><span>替代料（A換B·不同料）</span><input id="mf-alt" value="${g('alternates')}" placeholder="選填"></label>
+      </div>
+      ${isEdit ? `<label class="mat-fld mat-fwide"><span>本次調整原因（選填·會存進履歷）</span><input id="mf-note" placeholder="例：Q2 銅料上漲反映 / 樣品料號轉正式"></label>` : ''}
+    </div>`;
+  },
+  _readForm() {
+    const val = id => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+    const numOrNull = id => { const v = val(id); return v === '' ? null : Number(v); };
+    return {
+      partNo: val('mf-pn'), name: val('mf-nm'), category: val('mf-cat'), status: val('mf-st'),
+      spec: val('mf-spec'), vendor: val('mf-v'),
+      unitPrice: numOrNull('mf-price'), leadTime: numOrNull('mf-lt'), internalBuffer: numOrNull('mf-buf'),
+      moq: numOrNull('mf-moq'), safetyStock: numOrNull('mf-safe'), onHand: numOrNull('mf-on'), inTransit: numOrNull('mf-tr'),
+      alternates: val('mf-alt'), note: val('mf-note'),
+    };
+  },
+  openAdd() {
+    App.openModal({ title: '新增料號', wide: true, body: this._formBody(null),
+      footer: `<button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._submit(null)">確定</button>` });
+  },
+  openEdit(partId) {
+    const p = Store.parts.find(partId); if (!p) return;
+    App.closeModal();
+    App.openModal({ title: '編輯料號 · ' + p.partNo, wide: true, body: this._formBody(p),
+      footer: `<button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._submit('${partId}')">確定</button>` });
+  },
+  openCopy(partId) {   // 複製相似料號：帶入來源欄位當範本、清空料號/庫存/履歷，submit 走新增（施工序⑤）
+    const src = Store.parts.find(partId); if (!src) return;
+    const seed = Object.assign({}, src, { partNo: '', ver: '', status: 'Released', onHand: null, inTransit: null, history: [] });
+    App.closeModal();
+    App.openModal({ title: '複製為新料號 · 參考 ' + src.partNo, wide: true, body: this._formBody(seed, true),
+      footer: `<button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._submit(null)">確定新增</button>` });
+  },
+  _submit(partId) {
+    const f = this._readForm();
+    if (!f.partNo || !f.name || !f.category) { U.toast('料號／品名／類別為必填'); return; }
+    // §21.11：確認後才寫入（改了無法還原）
+    App.confirmModal({
+      title: partId ? '確定要寫入這筆變更？' : '確定要新增此料號？',
+      msg: partId ? '物料資料改了無法還原先前值，變更會記進履歷、永久保留。' : `新增料號「${this._esc(f.partNo)}」到料號主檔。`,
+      okText: partId ? '確認寫入' : '確認新增', cancelText: '再想想',
+      onConfirm: () => Materials._commit(partId, f),
+    });
+  },
+  _commit(partId, f) {
+    const today = this._today();
+    if (!partId) {
+      const p = {
+        partId: 'pt_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+        partNo: f.partNo, name: f.name, category: f.category, status: f.status, ver: '',
+        spec: f.spec, vendor: f.vendor, unitPrice: f.unitPrice ?? 0, leadTime: f.leadTime ?? 0,
+        internalBuffer: f.internalBuffer, moq: f.moq ?? 0, safetyStock: f.safetyStock ?? 0,
+        onHand: f.onHand ?? 0, inTransit: f.inTransit ?? 0, alternates: f.alternates,
+        history: [], createdAt: today,
+      };
+      Store.parts.add(p);
+      U.toast('✓ 已新增料號 ' + p.partNo);
+    } else {
+      const p = Store.parts.find(partId); if (!p) return;
+      // 逐追蹤欄位 diff → 寫 history（append-only·刪除規則以此計數）
+      const changes = {};
+      this._TRACK.forEach(([k, label]) => {
+        const nv = f[k]; const ov = p[k];
+        const same = (nv == null && (ov == null || ov === '')) || String(nv) === String(ov);
+        if (!same) {
+          (p.history = p.history || []).push({ field: label, from: ov == null || ov === '' ? '（空）' : String(ov), to: nv == null ? '（空）' : String(nv), at: today, note: f.note || '', by: DATA.settings._role || '' });
+          changes[k] = nv;
+        }
+      });
+      // 非追蹤欄位直接覆寫；追蹤欄位一併覆寫
+      Object.assign(p, {
+        partNo: f.partNo, name: f.name, category: f.category, status: f.status,
+        spec: f.spec, vendor: f.vendor, unitPrice: f.unitPrice ?? 0, leadTime: f.leadTime ?? 0,
+        internalBuffer: f.internalBuffer, moq: f.moq ?? 0, safetyStock: f.safetyStock ?? 0,
+        onHand: f.onHand ?? 0, inTransit: f.inTransit ?? 0, alternates: f.alternates,
+      });
+      Store.parts.save();
+      U.toast('✓ 已更新料號 · 已記入履歷');
+    }
+    App.closeModal();
+    this.closeDrawer();
+    this.render();
+  },
+
+  // ── 刪除（規則：history ≤2 可刪·>2 鎖·§21.13 E）──
+  askDelete(partId) {
+    const p = Store.parts.find(partId); if (!p) return;
+    const n = (p.history || []).length;
+    if (n > 2) { U.toast('🔒 已有 ' + n + ' 筆修改紀錄（>2）·維護中不可刪'); return; }
+    App.confirmModal({
+      title: '刪除料號 ' + p.partNo + '？',
+      msg: `此料僅 ${n} 筆修改紀錄（≤2）·可能是手誤建立。刪除後不影響其他料號。`,
+      okText: '確認刪除', okClass: 'danger', cancelText: '取消',
+      onConfirm: () => { Store.parts.remove(partId); U.toast('已刪除料號 ' + p.partNo); Materials.closeDrawer(); Materials.render(); },
+    });
+  },
+
+  // ── 詳情 Drawer（右側滑出·§21.13 D）──
+  openDrawer(partId) {
+    const p = Store.parts.find(partId); if (!p) return;
+    const h = this._health(p), g = this._gauge(p), b = this._buyQty(p), lock = !this._canDelete(p);
+    const frow = (k, v) => `<div class="mat-drow"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+    const hist = (p.history || []);
+    const histHtml = hist.length ? `<div class="mat-tl">${hist.slice().reverse().map(e => `
+      <div class="mat-te"><div class="mat-td"></div>
+        <div class="mat-te-r"><span class="f">${this._esc(e.field)}</span><span class="v"><span class="o">${this._esc(e.from)}</span> → <span class="n">${this._esc(e.to)}</span></span><span class="d">${this._esc(e.at)}</span></div>
+        ${e.note ? `<div class="mat-te-note">${this._esc(e.note)}</div>` : ''}${e.by ? `<div class="mat-te-by">${this._esc(e.by)}</div>` : ''}</div>`).join('')}</div>`
+      : `<div class="mat-emptyk">尚無修改紀錄 — 新建立、未變更過的料號</div>`;
+    document.getElementById('mat-drawer').innerHTML = `
+      <div class="mat-dhead">
+        <div class="mat-dh-top">
+          <div><div class="mat-dh-pnrow"><span class="mat-dh-pn">${this._esc(p.partNo)}</span>${p.ver ? `<span class="mat-ver">版 ${this._esc(p.ver)}</span>` : ''}<span class="mat-pill ${h}">${h === 'ok' ? '庫存充足' : this._hlabel(h) + '料'}</span></div>
+          <div class="mat-dh-nm">${this._esc(p.name)} · <span class="mat-catchip">${this._esc(p.category || '未分類')}</span> · ${this._esc(p.status || 'Released')}</div></div>
+          <button class="mat-dclose" onclick="Materials.closeDrawer()">✕</button>
+        </div>
+      </div>
+      <div class="mat-dbody">
+        ${p.status === 'Preliminary' ? `<div class="mat-prelim-banner"><span>🧪 樣品/暫定料號 — 可先跑排程與買料通知，取得正式料號後轉正（走進版·庫存共用）</span><button class="btn-ghost sm" onclick="Materials.openEdit('${p.partId}')">🔗 轉正/改料號</button></div>` : ''}
+        <div class="mat-dsec"><div class="mat-dsh">庫存現況</div><div class="mat-dstat">
+          <div class="s"><div class="k">現有庫存</div><div class="v ${this._num(p.onHand) < 0 ? 'neg' : ''}">${this._num(p.onHand)}</div></div>
+          <div class="s"><div class="k">在途</div><div class="v">${this._num(p.inTransit) || '—'}</div></div>
+          <div class="s"><div class="k">建議下單</div><div class="v" style="color:${b > 0 ? 'var(--mat)' : 'inherit'}">${b > 0 ? '+' + b : '—'}</div></div>
+        </div><div class="mat-track" style="height:8px;margin-top:10px"><div class="mat-fill" style="width:${g.fill}%;height:100%;background:var(--mat-h-${h})"></div><div class="mat-safe" style="left:${g.safe}%"></div></div></div>
+        <div class="mat-dsec"><div class="mat-dsh">基本 / 採購參數 <button class="btn-ghost sm" onclick="Materials.openEdit('${p.partId}')">✎ 編輯</button></div>
+          ${frow('規格', this._esc(p.spec) || '—')}
+          ${frow('廠商', this._esc(p.vendor) || '—')}
+          ${frow('單價', this._money(p.unitPrice))}
+          ${frow('廠商交期 L/T', this._num(p.leadTime) + ' 天')}
+          ${frow('內部流程＋入庫緩衝', (p.internalBuffer != null ? this._num(p.internalBuffer) : this._BUF_DEF) + ' 天')}
+          ${frow('<b>買料前置（下單死線用）</b>', `<b style="color:var(--mat)">${this._leadTotal(p)} 天</b>`)}
+          ${frow('MOQ · 安全庫存', this._num(p.moq) + ' · ' + this._num(p.safetyStock))}
+          ${frow('替代料（A換B·不同料）', p.alternates ? `<span style="color:var(--mat)">${this._esc(p.alternates)}</span>` : '無')}
+        </div>
+        <div class="mat-dsec"><div class="mat-dsh">上階 · 被哪些專案/機種用到（where-used）<span class="mat-auto">自動來自 BOM</span></div>
+          ${this._whereUsedHtml(p)}</div>
+        <div class="mat-dsec"><div class="mat-dsh">下階 · 這顆的組成散料（BOM 展開）<span class="mat-auto">自動來自 BOM</span></div>
+          ${this._childrenHtml(p)}</div>
+        <div class="mat-dsec"><div class="mat-dsh">料號 / 版本 · 修改履歷（永久保留）</div>${histHtml}</div>
+      </div>
+      <div class="mat-dfoot">
+        <button class="btn-ghost sm" onclick="Materials.openEdit('${p.partId}')">✎ 編輯料號</button>
+        <button class="btn-ghost sm" onclick="Materials.openCopy('${p.partId}')">⧉ 複製為新料號</button>
+        <div style="flex:1"></div>
+        ${lock ? `<div class="mat-lockmsg">🔒 ${hist.length} 筆履歷（>2）· 維護中不可刪</div>` : `<button class="btn-ghost sm danger" onclick="Materials.askDelete('${p.partId}')">🗑 刪除料號</button>`}
+      </div>`;
+    document.getElementById('mat-drawer').classList.add('on');
+    document.getElementById('mat-drawer-scrim').classList.add('on');
+  },
+  closeDrawer() {
+    const d = document.getElementById('mat-drawer'), s = document.getElementById('mat-drawer-scrim');
+    if (d) d.classList.remove('on'); if (s) s.classList.remove('on');
+  },
+
+  // ── 專案帶入入口（§21.14·專案驅動）──
+  _projKind(p) { return p.ecnType ? 'ECN' : 'NPI'; },
+  _projHasBom(p) { return !!((p.bomModels && p.bomModels.length) || (p.bomRows && p.bomRows.length) || p.bomSheets); },
+  _projPartCount(p) {
+    if (p.bomModels && p.bomModels.length) { const s = new Set(); p.bomModels.forEach(m => (m.bomRows || []).forEach(r => { const k = r.replacePartNoB || r.partNoA; if (k) s.add(k); })); return s.size || (p.bomModels[0].bomRows || []).length; }
+    return (p.bomRows || []).length;
+  },
+  _fmtBomDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso), now = new Date();
+    const md = ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+    const days = Math.floor((now - d) / 86400000);
+    const rel = days <= 0 ? '今天' : days === 1 ? '昨天' : days + ' 天前';
+    return `${md}（${rel}）`;
+  },
+  _isFresh(iso) { return iso && (Date.now() - new Date(iso).getTime()) < 48 * 3600 * 1000; },   // 研發剛更新 48h 時效
+
+  _importHeroHtml(inModal) {
+    const projs = (DATA.projects || []).slice().sort((a, b) => {
+      const ba = this._projHasBom(a), bb = this._projHasBom(b);
+      if (ba !== bb) return ba ? -1 : 1;                       // 有 BOM 的排前
+      const ta = a.bomUpdatedAt ? new Date(a.bomUpdatedAt).getTime() : 0;
+      const tb = b.bomUpdatedAt ? new Date(b.bomUpdatedAt).getTime() : 0;
+      return tb - ta;                                          // 最近更新倒序
+    });
+    if (!projs.length) return `<div class="mat-empty"><div class="mat-empty-ic">🧱</div><div class="mat-empty-t">還沒有專案可帶入</div><div class="mat-empty-d">先建立 NPI／ECN 專案並做 BOM 比對，物料就能從專案帶入；或直接手動新增料號。</div><button class="btn-mat" onclick="Materials.openAdd()">＋ 手動新增料號</button></div>`;
+    const rows = projs.map(p => {
+      const kind = this._projKind(p), has = this._projHasBom(p);
+      const vcount = (p.variants && p.variants.length) || 1;
+      const meta = kind === 'NPI' ? `${vcount} 機種 · 開發案` : '設變案';
+      const fresh = this._isFresh(p.bomUpdatedAt) ? '<span class="mat-fresh">研發剛更新</span>' : '';
+      const bomStat = has
+        ? `<div class="mat-bomok">✅ 已有 BOM · ${this._projPartCount(p)} ${kind === 'ECN' ? '差異料' : '料號'}</div><div class="mat-bupd">${p.bomUpdatedAt ? 'BOM 更新於 ' + this._fmtBomDate(p.bomUpdatedAt) : 'BOM 已就緒'}</div>`
+        : `<div class="mat-bomno">⚠ 尚未做 BOM 比對</div><div class="mat-bupd">此案還沒有物料資料</div>`;
+      const act = has
+        ? `<button class="btn-mat sm" onclick="Materials.importFromProject('${p.id}')">帶入 →</button>`
+        : `<button class="btn-ghost sm" onclick="Materials.togglePaths('${p.id}')">帶入方式 ▾</button>`;
+      const paths = has ? '' : `<div class="mat-paths" id="mat-paths-${p.id}">
+        <div class="mat-ph">${this._esc(p.name)} 還沒有 BOM 資料，兩種方式取得：</div>
+        <div class="mat-pathcards">
+          <div class="mat-pathcard"><div class="pt">選項 A · 前去專案 BOM 頁比對 <span class="mat-reco">推薦</span></div><div class="pd">跳該案 BOM 頁、用前後版比對引擎洗乾淨資料，再回來一鍵帶入。</div><button class="btn-mat sm" onclick="Materials.gotoBomCompare('${p.id}')">前往該案 BOM 比對 →</button></div>
+          <div class="mat-pathcard"><div class="pt">選項 B · 直接上傳 Excel 就地導入</div><div class="pd">手頭有廠商新料表 Excel、不想跳轉 → 就地上傳批次帶入（快捷通道·後補）。</div><button class="btn-ghost sm" onclick="Materials.openExcelImport()">上傳 Excel 就地導入</button></div>
+        </div></div>`;
+      return `<div class="mat-prow">
+        <div class="mat-p-id"><div class="nm">${this._esc(p.name)} <span class="mat-kind ${kind.toLowerCase()}">${kind}</span> ${fresh}</div><div class="meta">${meta}</div></div>
+        <div class="mat-p-bom">${bomStat}</div>
+        <div class="mat-p-act">${act}</div>
+      </div>${paths}`;
+    }).join('');
+    return `<div class="mat-imp">
+      <div class="mat-imp-h"><div class="t"><span class="ic">📥</span>從專案帶入物料開始</div><div class="d">物料主檔是跨專案的單一真實來源。選一個專案，把它 BOM 的料號批次帶入——依「最近 BOM 更新」排序，研發剛改過的排最上、優先導入。</div></div>
+      <div class="mat-plist">${rows}</div>
+      <div class="mat-imp-foot">找不到要的料，或非專案雜項？<a onclick="Materials.openAdd()">＋ 手動新增單一料號</a> ｜ <a onclick="Materials.openExcelImport()">⬆ 上傳 Excel 批次導入</a>（次要入口·不綁專案）</div>
+    </div>`;
+  },
+  openImportPicker() { App.openModal({ title: '從專案帶入物料', wide: true, body: this._importHeroHtml(true) }); },
+  togglePaths(pid) {
+    document.querySelectorAll('.mat-paths').forEach(el => { if (el.id !== 'mat-paths-' + pid) el.classList.remove('on'); });
+    const el = document.getElementById('mat-paths-' + pid); if (el) el.classList.toggle('on');
+  },
+  gotoBomCompare(pid) {
+    App.closeModal();
+    App.currentProjectId = pid;
+    App.showPage('project');
+    if (App.switchProjectView) App.switchProjectView('bom');
+  },
+  // ── Case A 帶入（§21.14 B）──
+  _nameIdxOf(sheet) {   // 表頭比對找品名欄（bomSheets 未 index 品名·§21.14 施工現實·抓不到回 -1）
+    const grid = sheet && sheet.grid; if (!grid || !grid.length) return -1;
+    const hdr = grid[0] || [];
+    for (let i = 0; i < hdr.length; i++) {
+      const h = String(hdr[i] == null ? '' : hdr[i]).trim();
+      if (/品名|名稱|品名規格|part\s*name|description|^desc/i.test(h)) return i;
+    }
+    return -1;
+  },
+  _isMultiModel(proj) { return !!(proj && proj.bomModels && proj.bomModels.length >= 2); },   // §21.15 D #4：真多機種（≥2 bomModel）才走 per-model 精算軸；單機種維持現況
+  _bomFactor(proj) { return (proj.bomQuoteCurrency === proj.bomBaseCurrency) ? 1 : (parseFloat(proj.bomRate) || 1); },
+  // 單一 model 的可採購料 → {partNo:{partNo,name,price,qty(每台用量)}}（ECN 差異料／NPI 葉節點·複用 §19.6 引擎·規則13/15）
+  _oneModelMats(proj, m, isEcn, f) {
+    const out = {};
+    const add = (pn, name, price, qty) => {
+      pn = String(pn == null ? '' : pn).trim(); if (!pn) return;
+      if (!out[pn]) out[pn] = { partNo: pn, name: '', price: 0, qty: 0 };
+      if (!out[pn].name && name) out[pn].name = String(name).trim();
+      if (!out[pn].price && price) out[pn].price = price;
+      out[pn].qty += (this._num(qty) || 0);
+    };
+    if (isEcn) { (m.bomRows || []).forEach(r => { const pn = r.replacePartNoB || r.partNoA; add(pn, '', this._num(r.newPrice), this._num(r.newQty)); }); return out; }
+    const sheet = m.bomSheets && m.bomSheets.new;
+    if (!sheet || !sheet.grid || sheet.grid.length < 2 || sheet.partNoIdx == null) return out;
+    const g = sheet.grid, nameIdx = this._nameIdxOf(sheet), leafArr = [];
+    App._bomWholeMachine(sheet, null, null, leafArr);   // 自動判階次/材料類別·收葉節點列 index（同 _bomBuildModels per-model 口徑）
+    const leafSet = new Set(leafArr);
+    if (!leafArr.length) for (let i = 1; i < g.length; i++) { const pn = g[i] && g[i][sheet.partNoIdx]; if (pn != null && String(pn).trim() !== '') leafSet.add(i); }   // 判不出階層→退全部有料號列（與完整 BOM 匯出同退路·excel.js:1383）
+    leafSet.forEach(i => {
+      const row = g[i]; if (!row) return;
+      const pn = row[sheet.partNoIdx]; if (pn == null || String(pn).trim() === '') return;
+      const price = sheet.priceIdx != null ? this._num(row[sheet.priceIdx]) * f : 0;
+      const qty = sheet.qtyIdx != null ? (row[sheet.qtyIdx] === '' || row[sheet.qtyIdx] == null ? 1 : this._num(row[sheet.qtyIdx])) : 1;
+      add(pn, nameIdx >= 0 ? row[nameIdx] : '', price, qty);
+    });
+    return out;
+  },
+  // per bomModel 用量地圖：回 [{id,name,usage:{partNo→qty}}]（§21.15 D #4 精算·耗用＝Σ 各機種台數×該機種每台用量）
+  _modelUsageMaps(proj) {
+    const isEcn = this._projKind(proj) === 'ECN', f = this._bomFactor(proj);
+    return (proj.bomModels || []).map((m, i) => ({ id: m.id || ('m' + i), name: m.name || ('機種' + (i + 1)), usage: this._oneModelMats(proj, m, isEcn, f) }));
+  },
+  _extractProjectMaterials(proj) {   // 回 [{partNo,name,price,qty}]（去重·穩定·依專案型態分流·§21.14 B）
+    // ECN＝只帶設變差異料（bomRows）；NPI＝完整 BOM 但只留可採購葉節點。分流依「專案型態」而非 bomSheets 有無被建出，帶入/where-used/篩選同一把尺。
+    // ⚠ qty＝跨 model 加總（union 用途·料號清單/帶入用）；真多機種的耗用精算不吃此 qty，改走 _modelUsageMaps per-model（§21.15 D #4）。
+    const isEcn = this._projKind(proj) === 'ECN', f = this._bomFactor(proj);
+    const models = (proj.bomModels && proj.bomModels.length) ? proj.bomModels : [{ bomRows: proj.bomRows, bomSheets: proj.bomSheets }];
+    const out = {};
+    models.forEach(m => {
+      const one = this._oneModelMats(proj, m, isEcn, f);
+      Object.keys(one).forEach(pn => {
+        const o = one[pn];
+        if (!out[pn]) out[pn] = { partNo: pn, name: '', price: 0, qty: 0 };
+        if (!out[pn].name && o.name) out[pn].name = o.name;
+        if (!out[pn].price && o.price) out[pn].price = o.price;
+        out[pn].qty += o.qty;
+      });
+    });
+    return Object.values(out);
+  },
+  // ── where-used（上階·derived 掃 projects BOM·§21.14 D）──
+  _partWhereUsed(partNo) {
+    const res = [];
+    (DATA.projects || []).forEach(p => {
+      const mats = this._extractProjectMaterials(p);
+      if (mats.some(m => m.partNo === partNo)) {
+        res.push({ id: p.id, name: p.name, kind: this._projKind(p), models: (p.variants || []).map(v => (v && v.name) || v).filter(Boolean) });
+      }
+    });
+    return res;
+  },
+  _whereUsedHtml(p) {
+    const used = this._partWhereUsed(p.partNo);
+    if (!used.length) return `<div class="mat-emptyk">此料尚未被任何專案 BOM 引用 —— 從專案帶入（或該案做 BOM 比對）後，這裡自動列出用於哪些機種/組合。</div>`;
+    return `<div class="mat-wtree">${used.map(u => `
+      <div class="mat-wuse">
+        <div class="mat-wuse-h">${this._esc(u.name)} <span class="mat-kind ${u.kind.toLowerCase()}">${u.kind}</span></div>
+        ${u.models.length ? `<div class="mat-wuse-models">${u.models.map(m => `<span class="mat-mchip">${this._esc(m)}</span>`).join('')}</div>` : ''}
+        <div class="mat-wnode">└─ <b>${this._esc(p.partNo)}</b> <span class="tnm">${this._esc(p.name)}</span></div>
+      </div>`).join('')}</div>`;
+  },
+  // ── 下階 children（BOM 展開·derived·§21.14 D）：掃 projects BOM 階層欄，列這顆組合的散料樹 ──
+  _partChildren(partNo) {   // 回 [{id,name,kind,nodes:[{partNo,name,qty,depth}]}]（逐案·整棵子樹縮排）
+    const res = [];
+    (DATA.projects || []).forEach(proj => {
+      const models = (proj.bomModels && proj.bomModels.length) ? proj.bomModels : [{ bomSheets: proj.bomSheets }];
+      let nodes = [];
+      for (const m of models) {
+        const s = m.bomSheets && m.bomSheets.new;
+        if (!s || !s.grid || s.partNoIdx == null || s.levelIdx == null) continue;   // 無階層欄→無法判下階
+        const g = s.grid, pIdx = s.partNoIdx, lIdx = s.levelIdx, nameIdx = this._nameIdxOf(s);
+        const lvl = i => { const n = parseFloat(g[i] && g[i][lIdx]); return isNaN(n) ? null : n; };
+        for (let i = 1; i < g.length; i++) {
+          if (String(g[i] && g[i][pIdx] == null ? '' : g[i][pIdx]).trim() !== partNo) continue;
+          const cur = lvl(i); if (cur == null) continue;
+          const sub = [];
+          for (let j = i + 1; j < g.length; j++) {
+            const lj = lvl(j); if (lj == null) continue;
+            if (lj <= cur) break;   // 回到同層/更淺→子樹結束
+            const cpn = String(g[j][pIdx] == null ? '' : g[j][pIdx]).trim(); if (!cpn) continue;
+            const qty = s.qtyIdx != null ? (g[j][s.qtyIdx] === '' || g[j][s.qtyIdx] == null ? 1 : this._num(g[j][s.qtyIdx])) : 1;
+            sub.push({ partNo: cpn, name: nameIdx >= 0 ? String(g[j][nameIdx] == null ? '' : g[j][nameIdx]).trim() : '', qty, depth: lj - cur });
+          }
+          if (sub.length) { nodes = sub; break; }   // 取第一個「有子件」的出現位置
+        }
+        if (nodes.length) break;
+      }
+      if (nodes.length) res.push({ id: proj.id, name: proj.name, kind: this._projKind(proj), nodes });
+    });
+    return res;
+  },
+  _childrenHtml(p) {
+    const trees = this._partChildren(p.partNo);
+    if (!trees.length) return `<div class="mat-emptyk">此料為最底層散料（葉節點）·無下階組成——或引用它的專案 BOM 未帶階層（Level）欄、無法展開。</div>`;
+    return `<div class="mat-wtree">${trees.map(t => `
+      <div class="mat-wuse">
+        <div class="mat-wuse-h">${this._esc(t.name)} <span class="mat-kind ${t.kind.toLowerCase()}">${t.kind}</span></div>
+        ${t.nodes.map(n => `<div class="mat-wnode" style="padding-left:${2 + n.depth * 16}px">└─ <b>${this._esc(n.partNo)}</b> <span class="tnm">${this._esc(n.name)}</span>${n.qty ? ` <span class="mat-mchip">×${n.qty}</span>` : ''}</div>`).join('')}
+      </div>`).join('')}</div>`;
+  },
+  importFromProject(pid) {
+    const proj = (DATA.projects || []).find(p => p.id === pid); if (!proj) return;
+    const mats = this._extractProjectMaterials(proj);
+    if (!mats.length) { U.toast('此案 BOM 解析不到料號（可能只有整機列或欄位未對應）'); return; }
+    this._openImportPreview(proj.name, mats, 'project');
+  },
+  _allNewProjectParts() {   // #1 B 方案：掃全部有 BOM 專案·抽尚未在主檔的新料號（去重·合併來源案名）
+    const have = new Set(Store.parts.all().map(p => p.partNo));
+    const out = {};
+    (DATA.projects || []).forEach(proj => {
+      if (!this._projHasBom(proj)) return;
+      this._extractProjectMaterials(proj).forEach(m => {
+        const pn = String(m.partNo == null ? '' : m.partNo).trim();
+        if (!pn || have.has(pn)) return;
+        if (!out[pn]) out[pn] = { partNo: pn, name: m.name || '', price: m.price || 0, qty: m.qty || 0, projs: [] };
+        if (!out[pn].name && m.name) out[pn].name = m.name;
+        if (!out[pn].price && m.price) out[pn].price = m.price;
+        if (out[pn].projs.indexOf(proj.name) < 0) out[pn].projs.push(proj.name);
+      });
+    });
+    return Object.values(out);
+  },
+  _autoImportProjectParts(proj) {   // 有 BOM 的專案→自動把 BOM 料號帶入主檔（缺口/需求即時算·Paul 2026-07-11：有 BOM 就該自動帶·免手動點內層）
+    if (!proj || !this._projHasBom(proj)) return 0;
+    const have = new Set(Store.parts.all().map(p => p.partNo));
+    const mats = this._extractProjectMaterials(proj).filter(m => { const pn = String(m.partNo == null ? '' : m.partNo).trim(); return pn && !have.has(pn); });
+    if (!mats.length) return 0;
+    const today = this._today();
+    mats.forEach(m => DATA.parts.push({ partId: 'pt_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), partNo: String(m.partNo).trim(), name: m.name || '', category: '其他', status: 'Released', ver: '', spec: '', vendor: '', unitPrice: this._num(m.price), leadTime: 0, internalBuffer: null, moq: 0, safetyStock: 0, onHand: 0, inTransit: 0, alternates: '', history: [{ field: '建立', from: '', to: 'BOM 自動帶入', at: today, note: proj.name, by: DATA.settings._role || '' }], createdAt: today, sourceProject: proj.name }));
+    Store.parts.save();
+    return mats.length;
+  },
+  importAllNewParts() {   // 頂端 banner「檢視並全部帶入」→ 複用帶入預覽 Modal（全新料·全勾·過確認符合 §21.11）
+    const news = this._allNewProjectParts();
+    if (!news.length) { U.toast('沒有新料號待帶入'); return; }
+    this._openImportPreview('全部專案 BOM · 新料號', news.map(n => ({ partNo: n.partNo, name: n.name, price: n.price, qty: n.qty })), 'project');
+  },
+
+  // ═══ §21.17 模具費用（獨立 Store.molds·物料子分頁·分攤多案自動加進專案 BOM「一次性·模具」）═══
+  _moldProjName(pid) { const p = (DATA.projects || []).find(x => x.id === pid); return p ? p.name : '(未指定)'; },
+  _moldTwd(m) { return Math.round(App._moldTwd(m)); },   // canonical TWD（模具 base→TWD·§21.17 1a·清單/總額口徑一致）
+  _moldAllocHtml(m) { const al = m.allocations || []; return al.length ? al.map(a => `<span class="mold-alloc-chip">${this._esc(this._moldProjName(a.projId))} ${a.sharePct}%</span>`).join('') : '<span class="mat-st resolved">未分攤</span>'; },
+  _moldHtml() {
+    const molds = Store.molds.all() || [];
+    const total = molds.reduce((s, m) => s + this._moldTwd(m), 0);
+    const rows = molds.map(m => `<tr>
+      <td>${this._esc(m.moldName || '(未命名)')}</td><td>${this._esc(m.vendor || '')}</td><td class="r">${this._esc(m.cavity || '')}</td>
+      <td class="r">${this._moldTwd(m).toLocaleString()}</td>
+      <td class="mold-alloc-cell" onclick="Materials.editMoldAlloc('${m.id}')" title="點此設定分攤：可加分到其他專案並設比例（合計 100%）">${this._moldAllocHtml(m)}<span class="mold-editbtn">✏ 改／加分攤</span></td>
+      <td class="mold-src" title="${this._esc(m.quoteFile || '')}">${m.quoteFile ? this._esc(m.quoteFile) : '—'}</td><td>${this._esc(m.date || '')}</td>
+      <td class="c"><span class="mold-act del" onclick="Materials.delMold('${m.id}')">刪</span></td></tr>`).join('');
+    return `<div class="mold-wrap">
+      <div class="mat-tbar"><div style="flex:1;min-width:0"><b>模具費用清單</b> · 共 ${molds.length} 副 · 總額 <b>${total.toLocaleString()}</b> TWD <span style="color:var(--ink3);font-size:12px">（獨立資產·非料號·分攤到各案「一次性·模具」費）</span></div>
+        <button class="btn-ghost" onclick="Materials.addManualMold()">＋ 手動新增</button><button class="btn-mat" onclick="Materials.openMoldImport()">📄 匯入模具報價單</button></div>
+      ${molds.length ? `<div class="mat-pv-wrap"><table class="mat-pv mold-tbl"><thead><tr><th>模具名稱</th><th>廠商</th><th class="r">模穴</th><th class="r">費用(TWD)</th><th>分攤專案(比例)</th><th>來源單</th><th>登記日</th><th class="c"></th></tr></thead><tbody>${rows}</tbody></table></div>`
+        : `<div class="mat-empty"><div class="mat-empty-ic">🔧</div><div class="mat-empty-t">還沒有模具費用</div><div class="mat-empty-d">匯入模具報價單（PDF·AI 視覺辨識）或手動新增；分攤到專案後自動加進該案 BOM 損益「一次性·模具」費。</div><button class="btn-mat" onclick="Materials.openMoldImport()">📄 匯入模具報價單</button></div>`}</div>`;
+  },
+  openMoldImport() { const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.pdf,.png,.jpg,.jpeg'; inp.onchange = () => { const f = inp.files && inp.files[0]; if (f) Materials._moldPick(f); }; inp.click(); },
+  async _moldPick(f) {
+    App.openLoadingModal('模具報價匯入', '解析中 …請稍候');
+    try {
+      let images = [];
+      if (/\.pdf$/i.test(f.name)) {
+        if (typeof pdfjsLib === 'undefined') { App.closeModal(); U.toast('PDF 元件未載入', 'warning'); return; }
+        if (!pdfjsLib.GlobalWorkerOptions.workerSrc) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        const buf = await f.arrayBuffer(); const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+        for (let i = 1; i <= Math.min(pdf.numPages, 5); i++) { const page = await pdf.getPage(i); const vp = page.getViewport({ scale: 2 }); const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height; await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise; images.push(cv.toDataURL('image/jpeg', 0.82)); }
+      } else { images = [await new Promise((res, rej) => { const rd = new FileReader(); rd.onload = () => res(rd.result); rd.onerror = rej; rd.readAsDataURL(f); })]; }
+      if (!this._hasGemini()) { App.closeModal(); U.toast('模具報價需 AI 視覺辨識 · 請先在設定貼 Gemini 金鑰', 'warning'); return; }
+      App.setLoadingMsg('AI 辨識模具報價中 …（Gemini·約數秒）');
+      let out; try { out = await this._geminiMolds(images); } catch (e) { App.closeModal(); U.toast('AI 辨識失敗：' + (e && e.message || e), 'warning'); return; }
+      const items = (out.items || []).filter(it => it && (String(it.moldName || '').trim() || this._num(it.amount)));
+      if (!items.length) { App.closeModal(); U.toast('沒讀到模具明細 · 可手動新增', 'warning'); return; }
+      this._openMoldPreview(items, { srcName: f.name, vendor: String(out.vendor || '').trim(), currency: this._normCurr(out.currency) });
+    } catch (e) { App.closeModal(); U.toast('解析失敗：' + (e && e.message || e), 'warning'); }
+  },
+  async _geminiMolds(images) {
+    const prompt = '這是模具/開模報價單的掃描影像。抽取每一副模具（或每個開模項目）。\n規則：\n1. moldName=模具/項目名稱、cavity=模穴數(看不到留空字串)、amount=金額(未稅·純數字·去逗號與貨幣符號)、note=備註。\n2. vendor=報價廠商、currency=幣別(TWD/USD/CNY/JPY/EUR·看不到 TWD)。\n3. 略過抬頭/電話/地址/合計/空白列。找不到回 items:[]。';
+    const schema = { type: 'OBJECT', properties: { vendor: { type: 'STRING' }, currency: { type: 'STRING' }, items: { type: 'ARRAY', items: { type: 'OBJECT', properties: { moldName: { type: 'STRING' }, cavity: { type: 'STRING' }, amount: { type: 'NUMBER' }, note: { type: 'STRING' } } } } } };
+    return App.geminiVision(images, prompt, schema);
+  },
+  _openMoldPreview(items, meta) {
+    const projs = DATA.projects || [];
+    const cur0 = meta.currency || 'NTD', base0 = meta.baseCurrency || 'NTD';
+    const conv0 = App._normCurA(cur0) !== App._normCurA(base0);
+    this._mimp = { srcName: meta.srcName || '模具單', vendor: meta.vendor || '', currency: cur0, baseCurrency: base0, rate: conv0 ? App._ratePref.get(cur0) : 1, date: this._today(), proj: projs[0] ? projs[0].id : '', rows: items.map(it => ({ moldName: String(it.moldName || '').trim(), cavity: String(it.cavity || '').trim(), price: this._num(it.amount) })) };
+    App.closeModal();
+    App.openModal({ title: '模具報價匯入 · 可編輯預覽', wide: true, body: `<div id="mimp"></div>`, footer: `<div style="display:flex;gap:10px;width:100%"><div style="flex:1"></div><button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._saveMoldImport()">✓ 儲存並帶入</button></div>` });
+    this._mimpRender();
+  },
+  _mimpConv() { const im = this._mimp; return App._normCurA(im.currency) !== App._normCurA(im.baseCurrency); },
+  _mimpTwd(r) { return Math.round(this._num(r.price) * (this._mimpConv() ? this._num(this._mimp.rate) : 1)); },
+  _mimpRender() {
+    const im = this._mimp; if (!im) return; const box = document.getElementById('mimp'); if (!box) return;
+    const projs = DATA.projects || [], conv = this._mimpConv(), CURR = ['NTD', 'TWD', 'USD', 'CNY', 'JPY', 'EUR'];
+    const projOpts = sel => projs.map(p => `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('');
+    const rows = im.rows.map((r, i) => `<tr>
+      <td class="l"><input class="imp2-in" style="width:180px" value="${this._esc(r.moldName)}" placeholder="模具名稱" onchange="Materials._mimpCell(${i},'moldName',this.value)"></td>
+      <td class="c"><input class="imp2-in" style="width:44px" value="${this._esc(r.cavity)}" onchange="Materials._mimpCell(${i},'cavity',this.value)"></td>
+      <td class="r"><input class="imp2-in" style="width:84px" value="${r.price || ''}" onchange="Materials._mimpCell(${i},'price',this.value)"></td>
+      <td class="r b">${this._mimpTwd(r).toLocaleString()}</td>
+      <td class="l">${im.proj ? this._esc(this._moldProjName(im.proj)) : '<span class="imp2-muted">暫不分攤</span>'} <span class="imp2-muted">100%</span></td>
+      <td class="c"><span class="imp2-del" onclick="Materials._mimpDel(${i})">✕</span></td></tr>`).join('');
+    const total = im.rows.reduce((s, r) => s + this._mimpTwd(r), 0);
+    box.innerHTML = `<div class="imp2-top"><span class="imp2-src">🔧 ${this._esc(im.srcName)}</span></div>
+      <div class="imp2-ctl">
+        <div class="imp2-fld"><span>廠商</span><input class="mat-sel" value="${this._esc(im.vendor)}" onchange="Materials._mimpMeta('vendor',this.value)"></div>
+        <div class="imp2-fld"><span>分攤專案（整批 · 預設 100%）</span><select class="mat-sel" onchange="Materials._mimpMeta('proj',this.value)"><option value="">— 暫不分攤 —</option>${projOpts(im.proj)}</select></div>
+        <div class="imp2-fld"><span>報價來源幣別 → 換算基準幣別 · 匯率</span><div class="imp2-cur"><select class="mat-sel wc" onchange="Materials._mimpMeta('currency',this.value)">${CURR.map(c => `<option ${c === im.currency ? 'selected' : ''}>${c}</option>`).join('')}</select><span class="imp2-x">→</span><select class="mat-sel wc" onchange="Materials._mimpMeta('baseCurrency',this.value)">${CURR.map(c => `<option ${c === im.baseCurrency ? 'selected' : ''}>${c}</option>`).join('')}</select><span class="imp2-x">1 ${this._esc(im.currency)} =</span><input class="mat-sel wr" value="${im.rate}" ${!conv ? 'disabled' : ''} onchange="Materials._mimpMeta('rate',this.value)"><span class="imp2-x">${this._esc(im.baseCurrency)}</span></div></div>
+        <div class="imp2-fld"><span>單據日期</span><input type="date" class="mat-sel" value="${im.date}" onchange="Materials._mimpMeta('date',this.value)"></div></div>
+      <div class="imp2-tblwrap"><table class="imp2-tbl"><thead><tr><th class="l">模具名稱</th><th class="c">模穴</th><th class="r">金額 ${this._esc(im.currency)}</th><th class="r">換算 ${this._esc(im.baseCurrency)}</th><th class="l">分攤專案</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6" class="imp2-empty">無</td></tr>'}</tbody>
+        <tfoot><tr><td class="l" colspan="3"><span class="imp2-add" onclick="Materials._mimpAdd()">＋ 新增列</span> · ${im.rows.length} 副</td><td class="r b">${total.toLocaleString()}</td><td colspan="2"></td></tr></tfoot></table></div>
+      <div class="imp2-bn quote" style="margin-top:10px">整批指定<b>一個專案（100%）</b>；一副模具要多案分攤→存後到「模具費用」清單點「分攤」細調比例。</div>`;
+  },
+  _mimpCell(i, f, v) { const r = this._mimp.rows[i]; if (!r) return; if (f === 'price') r[f] = this._num(v); else r[f] = v; this._mimpRender(); },
+  _mimpMeta(f, v) { const im = this._mimp; if (f === 'rate') im.rate = Math.max(0, Number(v) || 0); else { im[f] = v; if (f === 'currency' || f === 'baseCurrency') im.rate = this._mimpConv() ? App._ratePref.get(im.currency) : 1; } this._mimpRender(); },
+  _mimpDel(i) { this._mimp.rows.splice(i, 1); this._mimpRender(); },
+  _mimpAdd() { this._mimp.rows.push({ moldName: '', cavity: '', price: 0 }); this._mimpRender(); },
+  addManualMold() { this._openMoldPreview([{ moldName: '', cavity: '', amount: 0 }], { srcName: '手動新增', vendor: '', currency: 'NTD', baseCurrency: 'NTD' }); },
+  _saveMoldImport() {
+    const im = this._mimp; if (!im) return;
+    const rows = im.rows.filter(r => String(r.moldName || '').trim() || this._num(r.price));
+    if (!rows.length) { U.toast('沒有可儲存的模具'); return; }
+    App.confirmModal({ title: '確認儲存並帶入？', msg: `${rows.length} 副模具寫入模具清單 · 各案「一次性·模具」費即時加總（改了無法還原·可到清單調）。`, okText: '確認帶入', cancelText: '再想想', onConfirm: () => {
+      App._ratePref.set(im.currency, im.rate);
+      const today = Materials._today(); let n = 0;
+      rows.forEach(r => { const twd = Materials._mimpTwd(r); Store.molds.add({ id: 'md_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), moldName: String(r.moldName || '').trim() || '(未命名模具)', cavity: String(r.cavity || '').trim(), vendor: im.vendor, currency: im.currency, baseCurrency: im.baseCurrency, price: Materials._num(r.price), rate: Materials._num(im.rate), priceTwd: twd, quoteFile: im.srcName, date: im.date || today, allocations: im.proj ? [{ projId: im.proj, sharePct: 100 }] : [], history: [{ field: '建立', from: '', to: '匯入模具報價' + (im.vendor ? '·' + im.vendor : ''), at: today, note: im.proj ? '分攤 ' + Materials._moldProjName(im.proj) + ' 100%' : '未分攤', by: DATA.settings._role || '' }] }); n++; });
+      App.closeModal(); Materials._mimp = null; U.toast(`✓ 已存 ${n} 副模具 · 專案模具費已更新`); Materials.render();
+    } });
+  },
+  delMold(id) { App.confirmModal({ title: '刪除模具？', msg: '刪除後各案模具費即時重算。', okText: '刪除', cancelText: '取消', onConfirm: () => { Store.molds.remove(id); U.toast('已刪除模具'); Materials.render(); } }); },
+  editMoldAlloc(id) {
+    const m = Store.molds.find(id); if (!m) return; const projs = DATA.projects || [];
+    this._malloc = { id, rows: (m.allocations && m.allocations.length) ? m.allocations.map(a => ({ projId: a.projId, sharePct: a.sharePct })) : [{ projId: projs[0] ? projs[0].id : '', sharePct: 100 }] };
+    App.openModal({ title: '分攤設定 · ' + this._esc(m.moldName || '模具'), body: `<div id="malloc"></div>`, footer: `<div style="display:flex;gap:10px;width:100%;align-items:center"><span id="malloc-sum" style="flex:1;font-size:12px"></span><button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" id="malloc-save" onclick="Materials._saveMoldAlloc()">儲存分攤</button></div>` });
+    this._mallocRender();
+  },
+  _mallocRender() {
+    const ma = this._malloc; if (!ma) return; const box = document.getElementById('malloc'); if (!box) return; const projs = DATA.projects || [];
+    const projOpts = sel => projs.map(p => `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('');
+    box.innerHTML = ma.rows.map((r, i) => `<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><select class="mat-sel" style="flex:1" onchange="Materials._mallocCell(${i},'projId',this.value)"><option value="">— 選專案 —</option>${projOpts(r.projId)}</select><input class="imp2-in" style="width:64px" value="${r.sharePct}" onchange="Materials._mallocCell(${i},'sharePct',this.value)"><span>%</span><span class="imp2-del" onclick="Materials._mallocDel(${i})">✕</span></div>`).join('') + `<span class="mold-act" onclick="Materials._mallocAdd()">＋ 加一案</span>`;
+    const valid = ma.rows.filter(r => r.projId && parseFloat(r.sharePct) > 0);
+    const sum = valid.reduce((s, r) => s + (parseFloat(r.sharePct) || 0), 0);
+    const ok = valid.length > 0 && sum === 100;
+    const el = document.getElementById('malloc-sum');
+    if (el) el.innerHTML = ok ? `合計 <b style="color:var(--sage-800)">100% ✓</b>`
+      : `合計 <b style="color:var(--rose-ink)">${sum}%</b> · <span style="color:var(--rose-ink)">⚠️ 分攤合計須為 100%${sum > 100 ? '（溢出 ' + (sum - 100) + '%·請調降）' : sum < 100 ? '（尚缺 ' + (100 - sum) + '%）' : ''}</span>`;
+    const btn = document.getElementById('malloc-save'); if (btn) btn.disabled = !ok;
+  },
+  _mallocCell(i, f, v) { const r = this._malloc.rows[i]; if (!r) return; if (f === 'sharePct') r[f] = Math.max(0, Number(v) || 0); else r[f] = v; this._mallocRender(); },
+  _mallocAdd() { this._malloc.rows.push({ projId: '', sharePct: 0 }); this._mallocRender(); },
+  _mallocDel(i) { this._malloc.rows.splice(i, 1); this._mallocRender(); },
+  _saveMoldAlloc() {
+    const ma = this._malloc; if (!ma) return;
+    const rows = ma.rows.filter(r => r.projId && parseFloat(r.sharePct) > 0);
+    const sum = rows.reduce((s, r) => s + (parseFloat(r.sharePct) || 0), 0);
+    if (rows.length && sum !== 100) return;   // 阻斷已由「儲存」按鈕 disabled＋紅字內聯處理（不用 toast·標準警告用內聯/彈窗）
+    const m = Store.molds.find(ma.id); if (!m) return;
+    m.allocations = rows.map(r => ({ projId: r.projId, sharePct: parseFloat(r.sharePct) || 0 }));
+    (m.history = m.history || []).push({ field: '分攤', from: '', to: rows.length ? rows.map(r => this._moldProjName(r.projId) + ' ' + r.sharePct + '%').join('、') : '未分攤', at: this._today(), note: '', by: DATA.settings._role || '' });
+    Store.molds.save();
+    App.closeModal(); this._malloc = null; U.toast('✓ 分攤已更新 · 專案模具費重算'); this.render();
+  },
+  // 帶入預覽 Modal（專案帶入／Excel 就地導入共用·規則13）：srcKind='project'|'excel'
+  _openImportPreview(srcName, mats, srcKind) {
+    srcKind = srcKind || 'project';
+    const data = mats.map(m => {   // 比對主檔狀態：new/same/conf
+      const ex = Store.parts.all().find(p => p.partNo === m.partNo);
+      let st = 'new';
+      if (ex) st = (this._num(ex.unitPrice) === this._num(m.price)) ? 'same' : 'conf';
+      return { pn: m.partNo, nm: m.name, qty: m.qty, price: m.price, st, master: ex ? this._num(ex.unitPrice) : null };
+    });
+    this._imp = { projName: srcName, srcKind, data, checked: {}, pick: {}, batch: 'keep' };
+    data.forEach(d => { this._imp.checked[d.pn] = true; if (d.st === 'conf') this._imp.pick[d.pn] = 'master'; });
+    App.closeModal();
+    const priceHd = srcKind === 'excel' ? 'Excel 單價' : '專案單價';
+    App.openModal({
+      title: (srcKind === 'excel' ? '從 Excel 就地導入物料 · ' : '從專案帶入物料 · ') + this._esc(srcName), wide: true,
+      body: `<div class="mat-imp-sum" id="mat-imp-sum"></div><div class="mat-cfbar" id="mat-imp-cf"></div><div class="mat-pv-wrap"><table class="mat-pv"><thead><tr><th style="width:32px"></th><th>料號 / 品名</th><th class="r">用量</th><th class="r">${priceHd}</th><th>帶入狀態</th></tr></thead><tbody id="mat-imp-tb"></tbody></table></div>`,
+      footer: `<div style="display:flex;align-items:center;gap:10px;width:100%"><span class="mat-imp-selinfo" id="mat-imp-selinfo"></span><div style="flex:1"></div><button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._doImport()">帶入勾選料號到主檔</button></div>`,
+    });
+    this._renderImp();
+  },
+  // ── Case B 選項 B：Excel 就地導入（§21.14 C·施工序⑤）──
+  // 複用 BOM 解析（parseBomAoa/extractBomRows）＋欄位對應精靈（renderImportMapping）＋帶入預覽（_openImportPreview·規則13）
+  openExcelImport() {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.xlsx,.xls,.csv';
+    inp.onchange = () => { const f = inp.files && inp.files[0]; if (f) Materials._excelPick(f); };
+    inp.click();
+  },
+  async _excelPick(file) {
+    U.toast('讀取 ' + file.name + ' …');
+    const parsed = await parseBomAoa(file);
+    if (!parsed.ok) { U.toast('⚠ ' + (parsed.errors || []).join('；'), 'warning'); return; }
+    this._excelExtract(file.name, parsed.candidates[0].aoa, null);   // 多分頁取第一個含 BOM 表頭者（比照 WBS 匯入）
+  },
+  _excelExtract(srcName, aoa, mapping) {
+    const ex = extractBomRows(aoa, mapping ? { mapping } : {});
+    if (ex.needMapping) {   // 必要欄（料號）對不上→欄位對應精靈，選好回頭再抽
+      App.renderImportMapping({
+        title: 'Excel 料號欄位對應', specs: BOM_COLUMNS, headerCells: ex.headerCells,
+        resolved: ex.resolved, requiredKeys: BOM_REQUIRED_KEYS, domain: 'bom',
+        onConfirm: m => Materials._excelExtract(srcName, aoa, m),
+      });
+      return;
+    }
+    if (!ex.ok) { U.toast('⚠ ' + (ex.errors || []).join('；'), 'warning'); return; }
+    const out = {};   // 去重成 {partNo,name,price,qty}（同 _extractProjectMaterials 口徑）
+    (ex.rows || []).forEach(r => {
+      const pn = String(r.partNo == null ? '' : r.partNo).trim(); if (!pn) return;
+      if (!out[pn]) out[pn] = { partNo: pn, name: '', price: 0, qty: 0 };
+      if (!out[pn].name && r.partName) out[pn].name = String(r.partName).trim();
+      if (!out[pn].price && r.price) out[pn].price = this._num(r.price);
+      out[pn].qty += (this._num(r.qty) || 0);
+    });
+    const mats = Object.values(out);
+    if (!mats.length) { U.toast('Excel 解析不到料號（每列都缺料號欄）'); return; }
+    this._openImportPreview(srcName, mats, 'excel');
+  },
+  _renderImp() {
+    const im = this._imp; if (!im) return; const data = im.data;
+    const nnew = data.filter(d => d.st === 'new').length, ncf = data.filter(d => d.st === 'conf').length, nex = data.filter(d => d.st !== 'new').length;
+    document.getElementById('mat-imp-sum').innerHTML = `該案 BOM 共 <b>${data.length}</b> 料號 · <span class="s-new">🆕 新料號 <b>${nnew}</b></span> · <span class="s-ex">✅ 已在主檔 <b>${nex}</b></span> · <span class="s-cf">⚠ 單價衝突 <b>${ncf}</b></span>`;
+    const cf = document.getElementById('mat-imp-cf');
+    cf.style.display = ncf ? 'flex' : 'none';
+    cf.innerHTML = ncf ? `<span>⚠ <b>${ncf}</b> 筆已在主檔、單價不同。整批處理：</span><div class="opts">${[['keep', '保留主檔價'], ['proj', '採用專案價'], ['row', '逐筆決定']].map(o => `<button class="${im.batch === o[0] ? 'on' : ''}" onclick="Materials._cfMode('${o[0]}')">${o[1]}</button>`).join('')}</div>` : '';
+    document.getElementById('mat-imp-tb').innerHTML = data.map(d => {
+      const ck = im.checked[d.pn] ? 'checked' : '';
+      let stHtml, extra = '';
+      if (d.st === 'new') stHtml = '<span class="mat-st new">🆕 新料號</span>';
+      else if (d.st === 'same') stHtml = '<span class="mat-st same">✅ 已在主檔 · 同價</span>';
+      else {
+        const pick = im.pick[d.pn], delta = this._num(d.price) - this._num(d.master);
+        const dtxt = delta < 0 ? `<span class="mat-delta down">(−$${Math.abs(delta).toLocaleString()} 降價)</span>` : delta > 0 ? `<span class="mat-delta up">(+$${delta.toLocaleString()} 漲價)</span>` : '';
+        stHtml = `<span class="mat-st resolved">✅ ${pick === 'proj' ? '採用專案價' : '保留主檔價'}</span>`;
+        extra = `<div class="mat-confrow"><div class="mat-confprice">主檔 <span class="o">${this._money(d.master)}</span> → 專案 <b>${this._money(d.price)}</b> ${dtxt}</div><div class="mat-rowpick"><button class="${pick === 'master' ? 'on' : ''}" onclick="Materials._rowPick('${d.pn}','master')">用主檔</button><button class="${pick === 'proj' ? 'on' : ''}" onclick="Materials._rowPick('${d.pn}','proj')">用專案</button></div></div>`;
+      }
+      return `<tr><td><input type="checkbox" class="mat-ck" ${ck} onchange="Materials._impCk('${d.pn}')"></td><td><div class="pn">${this._esc(d.pn)}</div><div class="nm">${this._esc(d.nm) || '<span style=\"color:var(--ink4)\">（品名待補）</span>'}</div>${extra}</td><td class="r">×${d.qty}</td><td class="r">${this._money(d.price)}</td><td>${stHtml}</td></tr>`;
+    }).join('');
+    const sel = data.filter(d => im.checked[d.pn]).length;
+    document.getElementById('mat-imp-selinfo').textContent = `已勾選 ${sel} / ${data.length} 筆${sel < data.length ? '（未勾的不參與本次導入）' : ''}`;
+  },
+  _cfMode(m) { const im = this._imp; im.batch = m; if (m !== 'row') im.data.forEach(d => { if (d.st === 'conf') im.pick[d.pn] = (m === 'keep' ? 'master' : 'proj'); }); this._renderImp(); },
+  _rowPick(pn, c) { const im = this._imp; im.pick[pn] = c; const cf = im.data.filter(d => d.st === 'conf'); im.batch = cf.every(d => im.pick[d.pn] === 'master') ? 'keep' : cf.every(d => im.pick[d.pn] === 'proj') ? 'proj' : 'row'; this._renderImp(); },
+  _impCk(pn) { this._imp.checked[pn] = !this._imp.checked[pn]; this._renderImp(); },
+  _doImport() {
+    const im = this._imp; if (!im) return;
+    const today = this._today(); let nNew = 0, nUpd = 0, nSkip = 0;
+    im.data.forEach(d => {
+      if (!im.checked[d.pn]) { nSkip++; return; }
+      if (d.st === 'new') {
+        Store.parts.add({ partId: 'pt_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), partNo: d.pn, name: d.nm || '', category: '其他', status: 'Released', ver: '', spec: '', vendor: '', unitPrice: this._num(d.price), leadTime: 0, internalBuffer: null, moq: 0, safetyStock: 0, onHand: 0, inTransit: 0, alternates: '', history: [], createdAt: today, sourceProject: im.projName });
+        nNew++;
+      } else if (d.st === 'conf') {
+        const useProj = im.pick[d.pn] === 'proj';
+        if (useProj) { const ex = Store.parts.all().find(p => p.partNo === d.pn); if (ex) { (ex.history = ex.history || []).push({ field: '單價', from: this._money(ex.unitPrice), to: this._money(d.price), at: today, note: (im.srcKind === 'excel' ? '從 Excel 導入（' : '從專案帶入（') + im.projName + '）採用' + (im.srcKind === 'excel' ? '此表' : '專案') + '價', by: DATA.settings._role || '' }); ex.unitPrice = this._num(d.price); nUpd++; } }
+        else nSkip++;   // 保留主檔價＝不改
+      } else nSkip++;   // same
+    });
+    Store.parts.save();
+    App.closeModal();
+    U.toast(`✓ 已帶入 ${nNew + nUpd} 顆（${nNew} 新 / ${nUpd} 更新 / ${nSkip} 略過）`);
+    this._imp = null;
+    this.render();   // 停留物料頁·重繪（有料號後轉清單/表格）
+  },
+
+  // ── §21.16 模糊匯入器：可編輯預覽 Modal＋三向分流（報價單/訂單/需求·2a 核心·上傳串接見 openImporterFile）──
+  _impTypes: [
+    { k: 'quote', label: '💰 更新報價' },
+    { k: 'order', label: '📥 採購到料 ＋' },
+    { k: 'demand', label: '📤 額外需求 −' },
+  ],
+  _impBanner: {
+    quote: { cls: 'quote', txt: '💰 <b>更新廠商報價</b> · 不影響庫存 — 存比價紀錄，勾「覆蓋」更新主檔單價/交期，連動缺口替代料價差。' },
+    order: { cls: 'order', txt: '📥 <b>登記採購到料</b> · 庫存 ＋ — 進缺口總表期末結存（加）。需指定專案＋階段。' },
+    demand: { cls: 'demand', txt: '📤 <b>扣減額外需求</b> · 庫存 − — 進缺口總表期末結存（扣）。如客戶追加、實驗損壞。需指定專案＋階段。' },
+  },
+  _impSt(r) { return r.master == null ? 'new' : (this._impTwd(r) === r.master ? 'same' : 'conf'); },   // 狀態即時衍生：比「換算後 TWD」對主檔（非原幣·否則 USD 報價恆判價異）
+  _impStBadge(r) { const st = this._impSt(r); return st === 'new' ? '<span class="mat-st new">新增</span>' : st === 'same' ? '<span class="mat-st same">已有</span>' : '<span class="mat-st resolved">價異</span>'; },
+  _impRestat(r) { const ex = (DATA.parts || []).find(p => p.partNo === r.pn); return { master: ex ? this._num(ex.unitPrice) : null, onHand: ex ? this._num(ex.onHand) : null }; },
+  _impRow(r) { const pn = String(r.partNo == null ? '' : r.partNo).trim(); const base = { pn, nm: (r.name || '').trim(), price: this._num(r.price), qty: this._num(r.qty), lt: this._num(r.lt != null ? r.lt : r.leadTime), arrive: r.arrive || r.arriveDate || '', reason: r.reason || '', cover: false }; return Object.assign(base, this._impRestat(base)); },
+  openImporter(rows, meta) {
+    meta = meta || {}; const projs = DATA.projects || [];
+    const _c0 = meta.currency || 'TWD', _b0 = meta.baseCurrency || 'TWD';
+    this._imp2 = { srcName: meta.srcName || '匯入檔', docType: meta.docType || 'quote', vendor: meta.vendor || '', currency: _c0, baseCurrency: _b0, rate: meta.rate != null ? meta.rate : (_c0 !== _b0 ? App._ratePref.get(_c0) : 1), scope: 'proj', projId: meta.projId || (projs[0] ? projs[0].id : ''), stage: '', showOrig: true, showTwd: true, ocrText: meta.ocrText || '', ocrImg: meta.ocrImg || '', rows: (rows || []).map(r => this._impRow(r)) };
+    App.openModal({ title: '模糊匯入 · 可編輯預覽', wide: true, body: `<div id="imp2"></div>`,
+      footer: `<div style="display:flex;align-items:center;gap:10px;width:100%"><span class="imp2-dest" id="imp2-dest"></span><div style="flex:1"></div><button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._saveImporter()">✓ 儲存並帶入</button></div>` });
+    this._impRender();
+  },
+  // ── 2b 上傳/解析/OCR 串接：Excel 走 parseBomAoa＋對應精靈／圖片走 tesseract OCR → openImporter ──
+  openImporterFile() {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.xlsx,.xls,.csv,.png,.jpg,.jpeg,.pdf';
+    inp.onchange = () => { const f = inp.files && inp.files[0]; if (f) Materials._importPick(f); };
+    inp.click();
+  },
+  async _importPick(f) {
+    if (/\.pdf$/i.test(f.name)) return this._importPdf(f);
+    if (/\.(png|jpe?g)$/i.test(f.name)) return this._importOcr(f);
+    U.toast('讀取 ' + f.name + ' …');
+    let aoa;
+    try { aoa = await this._readWorkbookAoa(f); } catch (e) { U.toast('讀檔失敗：' + (e && e.message || e), 'warning'); return; }
+    if (!aoa || !aoa.length) { U.toast('檔案沒有可讀資料'); return; }
+    this._importFromAoa(f.name, aoa, null);
+  },
+  async _readWorkbookAoa(f) {   // 直接讀成 AOA（不套 BOM「料號＋用量」閘門·報價/訂單只有數量無用量·§21.16）；取第一個非空分頁
+    const buffer = await f.arrayBuffer();
+    const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+    for (const nm of wb.SheetNames) {
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[nm], { header: 1, range: 0, defval: null });
+      if (aoa && aoa.some(r => r && r.some(c => c != null && String(c).trim() !== ''))) return aoa;
+    }
+    return null;
+  },
+  _importFromAoa(srcName, aoa, mapping, forceWizard) {   // 複用 extractBomRows＋欄位對應精靈（規則13）；forceWizard=PDF 等模糊來源一定先跳精靈讓使用者選欄·才不會自動帶錯值（Paul 2026-07-11）
+    const ex = extractBomRows(aoa, mapping ? { mapping } : {});
+    if (ex.needMapping || (forceWizard && !mapping)) {
+      let headerCells = ex.headerCells, resolved = ex.resolved;
+      if (!headerCells) {   // extractBomRows 自動成功時不回 headerCells·強制精靈時自己找表頭列（fuzzyFindHeaderRow·抓不到退第一個 ≥2 欄的列）
+        const hi = (typeof fuzzyFindHeaderRow === 'function') ? fuzzyFindHeaderRow(aoa, BOM_COLUMNS, 2) : -1;
+        const hrow = hi >= 0 ? aoa[hi] : (aoa.find(r => r && r.filter(c => c != null && String(c).trim() !== '').length >= 2) || aoa[0] || []);
+        headerCells = (hrow || []).map(h => String(h == null ? '' : h).trim());
+        resolved = (typeof fuzzyResolveColumns === 'function') ? (fuzzyResolveColumns(headerCells, BOM_COLUMNS).byKey || {}) : {};
+      }
+      App.renderImportMapping({ title: '匯入單據欄位對應 · 請先確認欄位再帶入', specs: BOM_COLUMNS, headerCells, resolved, requiredKeys: BOM_REQUIRED_KEYS, domain: 'bom', onConfirm: m => Materials._importFromAoa(srcName, aoa, m) });
+      return;
+    }
+    if (!ex.ok) { U.toast('⚠ ' + (ex.errors || []).join('；'), 'warning'); return; }
+    const rows = (ex.rows || []).map(r => ({ partNo: r.partNo, name: r.partName, price: r.price, qty: r.qty })).filter(r => String(r.partNo == null ? '' : r.partNo).trim());
+    if (!rows.length) { U.toast('解析不到料號（每列都缺料號欄）'); return; }
+    this.openImporter(rows, { srcName });
+  },
+  _ocrWordsToItems(data, page) {   // tesseract 字級 bbox → item(x/y)·同 PDF 文字座標（y 取負·OCR 上小下大轉成上到下）
+    page = page || 1;
+    return ((data && data.words) || []).filter(w => (w.text || '').trim()).map(w => { const b = w.bbox || {}; return { str: w.text, x: b.x0 || 0, y: -(b.y0 || 0), page }; });
+  },
+  _ocrTextToAoa(text) {   // 無字座標時退路：每行→按 2+ 空白/tab 切欄（OCR 欄間常留空白）
+    return (text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(l => l.split(/\s{2,}|\t/).map(c => c.trim()));
+  },
+  async _ocrToWizard(images, srcName) {   // 非 AI 退路：OCR 掃描圖 → 座標還原 AOA → 強制欄位對應精靈（Paul 2026-07-11 要求回到精靈配對·非空白表單）
+    App.setLoadingMsg('OCR 辨識中 …（首次載語言檔約數十秒）');
+    if (!window.tesseractWorker) window.tesseractWorker = await Tesseract.createWorker(['chi_tra', 'eng']);
+    const items = []; let otext = '';
+    for (let i = 0; i < images.length; i++) { const { data } = await window.tesseractWorker.recognize(images[i]); this._ocrWordsToItems(data, i + 1).forEach(it => items.push(it)); otext += (data && data.text || '') + '\n'; }
+    const aoa = items.length ? this._pdfItemsToAoa(items) : this._ocrTextToAoa(otext);
+    this._importFromAoa(srcName, aoa, null, true);   // forceWizard=true → 自動跳欄位對應精靈
+  },
+  _geminiKey() { try { const k = localStorage.getItem('PMCORE_GEMINI_KEY'); if (k && k.trim()) return k.trim(); } catch (e) {} const c = (typeof APP_CONFIG !== 'undefined') ? APP_CONFIG : {}; return String(c.GEMINI_API_KEY || '').trim(); },   // 設定頁本機金鑰優先·config.local.js 備援
+  _geminiModel() { try { const m = localStorage.getItem('PMCORE_GEMINI_MODEL'); if (m && m.trim()) return m.trim(); } catch (e) {} const c = (typeof APP_CONFIG !== 'undefined') ? APP_CONFIG : {}; return String(c.GEMINI_MODEL || '').trim() || 'gemini-flash-latest'; },
+  _hasGemini() { return !!this._geminiKey(); },
+  _normCurr(s) { const t = String(s == null ? '' : s).toUpperCase(); if (/USD|美金|美元/.test(t)) return 'USD'; if (/RMB|CNY|人民幣/.test(t)) return 'CNY'; if (/JPY|日圓|日元/.test(t)) return 'JPY'; if (/EUR|歐元/.test(t)) return 'EUR'; return 'TWD'; },
+  async _geminiExtract(images) {   // 報價單提示詞/欄位 → 委派共用 App.geminiVision（§21.16 路線2）
+    const prompt = '這是一或多張採購報價單的掃描影像。請抽取每一筆「料件明細列」，回傳結構化資料。\n規則：\n1. 只抽真正的料件/項目明細列；略過表頭、公司抬頭、電話地址、印章、簽名、頁尾、備註條款、空白列、「以下空白」等。\n2. qty(數量)、unitPrice(未稅單價) 只回純數字（去掉逗號、貨幣符號、單位如「元/PCS/pcs/個」）；看不到就填 0。\n3. partNo=料號/品號、name=品名、spec=規格、qty=數量、unitPrice=未稅單價、leadTime=交期天數(看不到填0)、note=備註。\n4. vendor=報價廠商名、currency=幣別(TWD/USD/CNY/JPY/EUR，看不到填 TWD)。\n5. 找不到任何明細就回 items:[]。';
+    const schema = { type: 'OBJECT', properties: { vendor: { type: 'STRING' }, currency: { type: 'STRING' }, items: { type: 'ARRAY', items: { type: 'OBJECT', properties: { partNo: { type: 'STRING' }, name: { type: 'STRING' }, spec: { type: 'STRING' }, qty: { type: 'NUMBER' }, unitPrice: { type: 'NUMBER' }, leadTime: { type: 'NUMBER' }, note: { type: 'STRING' } } } } } };
+    return App.geminiVision(images, prompt, schema);
+  },
+  async _importVision(images, srcName, refImg) {   // 掃描報價單 → Gemini 視覺辨識 → 預填可編輯預覽 Modal（§21.16 路線2）
+    App.setLoadingMsg('AI 辨識中 …（Gemini 視覺·約數秒）');
+    let out;
+    try { out = await this._geminiExtract(images); }
+    catch (e) { U.toast('AI 辨識失敗：' + (e && e.message || e) + ' — 改用欄位對應精靈', 'warning'); return this._ocrToWizard(images, srcName); }
+    const items = (out.items || []).filter(it => it && (String(it.partNo == null ? '' : it.partNo).trim() || String(it.name == null ? '' : it.name).trim()));
+    if (!items.length) { U.toast('AI 沒讀到明細列 — 改用欄位對應精靈', 'warning'); return this._ocrToWizard(images, srcName); }
+    const rows = items.map(it => ({ partNo: String(it.partNo == null ? '' : it.partNo).trim(), name: [String(it.name == null ? '' : it.name).trim(), String(it.spec == null ? '' : it.spec).trim()].filter(Boolean).join(' '), price: this._num(it.unitPrice), qty: this._num(it.qty), lt: this._num(it.leadTime) }));
+    this.openImporter(rows, { srcName, docType: 'quote', vendor: String(out.vendor == null ? '' : out.vendor).trim(), currency: this._normCurr(out.currency), ocrImg: refImg });
+    U.toast('✓ AI 已帶入 ' + rows.length + ' 筆 · 請核對數字/料號後儲存');
+  },
+  _impZoom() { const im = this._imp2; if (!im || !im.ocrImg) return; App.openModal({ title: '來源單據（放大）', wide: true, body: `<img style="max-width:100%;display:block;margin:0 auto" src="${im.ocrImg}" alt="來源單據">` }); },
+  async _importOcr(f) {   // 圖片報價單：有 Gemini 金鑰→AI 視覺預填；無或失敗→OCR→欄位對應精靈（§21.16）
+    App.openLoadingModal('模糊匯入 · 解析中', '讀取圖片 …');
+    try {
+      const dataUrl = await new Promise((res, rej) => { const rd = new FileReader(); rd.onload = () => res(rd.result); rd.onerror = rej; rd.readAsDataURL(f); });
+      if (this._hasGemini()) return this._importVision([dataUrl], f.name, dataUrl);
+      return this._ocrToWizard([dataUrl], f.name);
+    } catch (e) { App.closeModal(); U.toast('辨識失敗：' + (e && e.message || e), 'warning'); }
+  },
+  _pdfItemsToAoa(items) {   // PDF 文字 item（帶 x/y/page）→ 還原「列×欄」表格 AOA：x 起點分欄帶、y 分列（同 Excel AOA·再走欄位對應精靈）
+    if (!items.length) return [];
+    const xs = items.map(i => i.x).sort((a, b) => a - b);
+    const bands = [];   // 欄帶：x 起點排序·間隔 >40 才切新欄（欄間距 >> 字距·避免同格多字被拆欄）
+    xs.forEach(x => { if (!bands.length || x - bands[bands.length - 1] > 40) bands.push(x); });
+    const colOf = x => { let c = 0; for (let i = 0; i < bands.length; i++) { if (x >= bands[i] - 2) c = i; else break; } return c; };
+    const sorted = items.slice().sort((a, b) => a.page - b.page || b.y - a.y || a.x - b.x);   // page 升→y 降(上到下)→x 升
+    const aoa = []; let cur = null, curY = null, curPage = null;
+    sorted.forEach(it => {
+      if (cur && it.page === curPage && Math.abs(it.y - curY) <= 4) { const c = colOf(it.x); cur[c] = (cur[c] ? cur[c] + ' ' : '') + it.str; }
+      else { cur = new Array(bands.length).fill(''); curY = it.y; curPage = it.page; cur[colOf(it.x)] = it.str; aoa.push(cur); }
+    });
+    return aoa.map(r => r.map(c => (c && c.trim()) || null));
+  },
+  async _importPdf(f) {   // PDF：文字層→座標還原表格 AOA→欄位對應精靈（同 Excel）；無文字層＝掃描型→逐頁 render OCR·§21.16 Phase②
+    if (typeof pdfjsLib === 'undefined') { U.toast('PDF 元件未載入（pdf.js）', 'warning'); return; }
+    if (!pdfjsLib.GlobalWorkerOptions.workerSrc) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    App.openLoadingModal('模糊匯入 · 解析中', '正在讀取 PDF …');
+    try {
+      const buf = await f.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      const items = []; let charCount = 0;
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        tc.items.forEach(it => { const s = (it.str || '').trim(); if (!s) return; charCount += s.length; items.push({ str: it.str, x: it.transform[4], y: it.transform[5], page: i }); });
+      }
+      if (charCount >= 20) {   // 文字型→表格 AOA→**強制先跳欄位對應精靈**（Paul：一定先讓使用者選欄配對才進 Modal·不自動帶錯）
+        this._importFromAoa(f.name, this._pdfItemsToAoa(items), null, true);
+      } else {   // 掃描型（無文字層）→逐頁 render 成圖：有 Gemini 金鑰走 AI 視覺預填·無則退 OCR 人工填（§21.16 路線2）
+        App.setLoadingMsg('掃描件 · 轉檔中 …');
+        const pageImgs = [];
+        for (let i = 1; i <= Math.min(pdf.numPages, 5); i++) {
+          const page = await pdf.getPage(i);
+          const vp = page.getViewport({ scale: 2 });
+          const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+          await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+          pageImgs.push(cv.toDataURL('image/jpeg', 0.82));   // JPEG 壓縮·上傳體積大減→加速（掃描件辨識足夠）
+        }
+        if (this._hasGemini()) return this._importVision(pageImgs, f.name, pageImgs[0]);
+        return this._ocrToWizard(pageImgs, f.name);   // 無金鑰→OCR→欄位對應精靈
+      }
+    } catch (e) { App.closeModal(); U.toast('PDF 解析失敗：' + (e && e.message || e), 'warning'); }
+  },
+  _impType(k) { this._imp2.docType = k; if (k !== 'quote' && this._imp2.scope === 'all') this._imp2.scope = 'proj'; this._impRender(); },
+  _impVendor(v) { this._imp2.vendor = v; },
+  _impCurr(v) { this._imp2.currency = v; this._imp2.rate = v === this._imp2.baseCurrency ? 1 : App._ratePref.get(v); this._impRender(); },
+  _impBaseCurr(v) { this._imp2.baseCurrency = v; if (v === this._imp2.currency) this._imp2.rate = 1; this._impRender(); },
+  _impRate(v) { this._imp2.rate = Math.max(0, Number(v) || 0); this._impRender(); },
+  _impScope(v) { this._imp2.scope = v; this._impRender(); },
+  _impProj(v) { this._imp2.projId = v; this._imp2.stage = ''; this._impRender(); },
+  _impStage(v) { this._imp2.stage = v; },
+  _impShow(f) { this._imp2[f] = !this._imp2[f]; this._impRender(); },
+  _impCell(i, f, v) { const r = this._imp2.rows[i]; if (!r) return; if (f === 'pn') { r.pn = String(v).trim(); Object.assign(r, this._impRestat(r)); } else if (f === 'nm' || f === 'arrive' || f === 'reason') r[f] = v; else { r[f] = this._num(v); if (f === 'price') Object.assign(r, this._impRestat(r)); } this._impRender(); },
+  _impCover(i) { const r = this._imp2.rows[i]; if (r) r.cover = !r.cover; this._impRender(); },
+  _impCoverAll() { const im = this._imp2, all = im.rows.length > 0 && im.rows.every(r => r.cover); im.rows.forEach(r => r.cover = !all); this._impRender(); },
+  _impDelRow(i) { this._imp2.rows.splice(i, 1); this._impRender(); },
+  _impAddRow() { this._imp2.rows.push(this._impRow({ partNo: '', name: '', price: 0, qty: 0 })); this._impRender(); },
+  _impTwd(r) { return this._imp2.currency !== this._imp2.baseCurrency ? Math.round(this._num(r.price) * this._num(this._imp2.rate)) : Math.round(this._num(r.price)); },
+  _impPnCell(r, i) { return `<td class="l"><input class="imp2-in wpn" value="${this._esc(r.pn)}" placeholder="料號" onchange="Materials._impCell(${i},'pn',this.value)"><input class="imp2-in wnm" value="${this._esc(r.nm)}" placeholder="品名" onchange="Materials._impCell(${i},'nm',this.value)"></td>`; }
+  ,
+  _impRender() {
+    const im = this._imp2; if (!im) return; const box = document.getElementById('imp2'); if (!box) return;
+    const projs = DATA.projects || [], type = im.docType, conv = im.currency !== im.baseCurrency, CURR = ['TWD', 'NTD', 'USD', 'CNY', 'JPY', 'EUR'];
+    const seg = this._impTypes.map(t => `<span class="imp2-seg ${type === t.k ? 'on' : ''}" onclick="Materials._impType('${t.k}')">${t.label}</span>`).join('');
+    const bn = this._impBanner[type];
+    const projOpts = projs.map(p => `<option value="${p.id}" ${p.id === im.projId ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('');
+    const del = i => `<td class="c"><span class="imp2-del" onclick="Materials._impDelRow(${i})">✕</span></td>`;
+    let ctl = '', head = '', body = '', foot = '';
+    if (type === 'quote') {
+      const scopeCtl = `<label class="imp2-rd ${im.scope === 'proj' ? 'on' : ''}"><input type="radio" ${im.scope === 'proj' ? 'checked' : ''} onclick="Materials._impScope('proj')">指定案</label><select class="mat-sel" ${im.scope !== 'proj' ? 'disabled' : ''} onchange="Materials._impProj(this.value)">${projOpts}</select><label class="imp2-rd ${im.scope === 'all' ? 'on' : ''}"><input type="radio" ${im.scope === 'all' ? 'checked' : ''} onclick="Materials._impScope('all')">所有專案</label>`;
+      ctl = `<div class="imp2-fld"><span>廠商</span><input class="mat-sel" value="${this._esc(im.vendor)}" onchange="Materials._impVendor(this.value)"></div>
+        <div class="imp2-fld"><span>專案指定（綁價格/交期）</span><div class="imp2-scope">${scopeCtl}</div></div>
+        <div class="imp2-fld"><span>報價來源幣別 → 換算基準幣別 · 匯率</span><div class="imp2-cur"><select class="mat-sel wc" onchange="Materials._impCurr(this.value)">${CURR.map(c => `<option ${c === im.currency ? 'selected' : ''}>${c}</option>`).join('')}</select><span class="imp2-x">→</span><select class="mat-sel wc" onchange="Materials._impBaseCurr(this.value)">${CURR.map(c => `<option ${c === im.baseCurrency ? 'selected' : ''}>${c}</option>`).join('')}</select><span class="imp2-x">1 ${this._esc(im.currency)} =</span><input class="mat-sel wr" value="${im.rate}" ${!conv ? 'disabled' : ''} onchange="Materials._impRate(this.value)"><span class="imp2-x">${this._esc(im.baseCurrency)}</span></div></div>
+        <div class="imp2-fld"><span>顯示原幣欄</span><div class="imp2-show"><label><input type="checkbox" ${im.showOrig ? 'checked' : ''} onchange="Materials._impShow('showOrig')"> 顯示原幣單價</label></div></div>`;
+      const allCover = im.rows.length > 0 && im.rows.every(r => r.cover);
+      head = `<th class="l">料號 / 品名</th>${im.showOrig ? `<th class="r">新單價 ${this._esc(im.currency)}</th>` : ''}<th class="r">換算 ${this._esc(im.baseCurrency)}</th><th class="r">舊單價</th><th class="r">價差</th><th class="c">L/T</th><th class="c"><input type="checkbox" ${allCover ? 'checked' : ''} onchange="Materials._impCoverAll()"> 覆蓋主檔</th><th></th>`;
+      body = im.rows.map((r, i) => { const twd = this._impTwd(r), diff = r.master != null ? twd - r.master : null; const dh = diff == null ? '<span class="imp2-muted">新料</span>' : diff === 0 ? '<span class="imp2-muted">同價</span>' : `<span class="imp2-diff ${diff > 0 ? 'up' : 'down'}">${diff > 0 ? '+' : ''}${diff.toLocaleString()}</span>`;
+        return `<tr>${this._impPnCell(r, i)}${im.showOrig ? `<td class="r"><input class="imp2-in wpr" value="${r.price || ''}" onchange="Materials._impCell(${i},'price',this.value)"></td>` : ''}<td class="r b">${twd.toLocaleString()}</td><td class="r imp2-muted">${r.master != null ? r.master.toLocaleString() : '—'}</td><td class="r">${dh}</td><td class="c"><input class="imp2-in wlt" value="${r.lt || ''}" onchange="Materials._impCell(${i},'lt',this.value)"></td><td class="c"><input type="checkbox" ${r.cover ? 'checked' : ''} onchange="Materials._impCover(${i})"> ${this._impStBadge(r)}</td>${del(i)}</tr>`; }).join('');
+      const nnew = im.rows.filter(r => this._impSt(r) === 'new').length, ncf = im.rows.filter(r => this._impSt(r) === 'conf').length, nex = im.rows.filter(r => this._impSt(r) === 'same').length;
+      foot = `<td class="l" colspan="99"><span class="imp2-add" onclick="Materials._impAddRow()">＋ 新增列</span> · ${im.rows.length} 筆（${nnew} 新增 · ${ncf} 價異 · ${nex} 已有）</td>`;
+    } else {
+      const stages = im.projId ? this._demandStages(projs.find(p => p.id === im.projId) || {}).map(s => s.name) : [];
+      const vendorFld = type === 'order' ? `<div class="imp2-fld"><span>廠商</span><input class="mat-sel" value="${this._esc(im.vendor)}" onchange="Materials._impVendor(this.value)"></div>` : '';
+      ctl = `${vendorFld}<div class="imp2-fld"><span>指定專案</span><select class="mat-sel" onchange="Materials._impProj(this.value)">${projOpts}</select></div>
+        <div class="imp2-fld"><span>分配階段 <b class="req">*</b>（整張單一次）</span><select class="mat-sel ${im.stage ? '' : 'imp2-need'}" onchange="Materials._impStage(this.value)"><option value="">— 選階段 —</option>${stages.map(s => `<option ${s === im.stage ? 'selected' : ''}>${this._esc(s)}</option>`).join('')}</select></div>`;
+      const totQ = im.rows.reduce((a, r) => a + this._num(r.qty), 0);
+      if (type === 'order') {
+        head = `<th class="l">料號 / 品名</th><th class="c">預計到貨日</th><th class="r">採購數量</th><th></th>`;
+        body = im.rows.map((r, i) => `<tr>${this._impPnCell(r, i)}<td class="c"><input type="date" class="imp2-in wdt" value="${r.arrive || ''}" onchange="Materials._impCell(${i},'arrive',this.value)"></td><td class="r"><input class="imp2-in wq imp2-plus" value="${r.qty || ''}" onchange="Materials._impCell(${i},'qty',this.value)"></td>${del(i)}</tr>`).join('');
+        foot = `<td class="l" colspan="2"><span class="imp2-add" onclick="Materials._impAddRow()">＋ 新增列</span> · ${im.rows.length} 筆</td><td class="r b imp2-plus">＋${totQ.toLocaleString()} 顆</td><td></td>`;
+      } else {
+        head = `<th class="l">料號 / 品名</th><th class="r">現有庫存</th><th class="r">扣減數量</th><th class="l">原因 / 去向</th><th></th>`;
+        body = im.rows.map((r, i) => `<tr>${this._impPnCell(r, i)}<td class="r imp2-muted">${r.onHand != null ? r.onHand : '—'}</td><td class="r"><input class="imp2-in wq imp2-minus" value="${r.qty || ''}" onchange="Materials._impCell(${i},'qty',this.value)"></td><td class="l"><input class="imp2-in wrs" value="${this._esc(r.reason)}" placeholder="如：客戶追加/實驗損壞" onchange="Materials._impCell(${i},'reason',this.value)"></td>${del(i)}</tr>`).join('');
+        foot = `<td class="l" colspan="2"><span class="imp2-add" onclick="Materials._impAddRow()">＋ 新增列</span> · ${im.rows.length} 筆</td><td class="r b imp2-minus">−${totQ.toLocaleString()} 顆</td><td></td>`;
+      }
+    }
+    const ref = (im.ocrImg || im.ocrText) ? `<details class="imp2-ref"><summary class="imp2-ref-hd">📄 對照原始單據（點此展開／收合 · 辨識可能有誤 · 以單據為準 · 圖可再點放大）</summary><div class="imp2-ref-body">${im.ocrImg ? `<img class="imp2-ref-img" src="${im.ocrImg}" alt="來源單據" title="點擊放大" onclick="Materials._impZoom()">` : ''}${im.ocrText ? `<pre class="imp2-ref-pre">${this._esc(im.ocrText)}</pre>` : ''}</div></details>` : '';
+    box.innerHTML = `<div class="imp2-top"><div class="imp2-seg-wrap">${seg}</div><span class="imp2-src">${this._esc(im.srcName)}</span></div>
+      <div class="imp2-bn ${bn.cls}">${bn.txt}</div>
+      ${ref}
+      <div class="imp2-ctl">${ctl}</div>
+      <div class="imp2-tblwrap"><table class="imp2-tbl"><thead><tr>${head}</tr></thead><tbody>${body || `<tr><td colspan="9" class="imp2-empty">沒有列·點下方新增</td></tr>`}</tbody><tfoot><tr>${foot}</tr></tfoot></table></div>`;
+    const dest = document.getElementById('imp2-dest');
+    if (dest) dest.textContent = type === 'quote' ? '儲存後：報價寫入比價紀錄，勾「覆蓋」的料號同步主檔商情。' : (type === 'order' ? '儲存後：建到料 → 缺口總表期末結存 ＋。' : '儲存後：建額外需求 → 缺口總表期末結存 −。');
+  },
+  _impCoverMaster(r, im, twdPrice, today) {
+    const ex = Store.parts.all().find(p => p.partNo === r.pn);
+    if (ex) {
+      if (this._num(ex.unitPrice) !== twdPrice) { (ex.history = ex.history || []).push({ field: '單價', from: this._money(ex.unitPrice), to: this._money(twdPrice), at: today, note: '報價匯入覆蓋' + (im.vendor ? '·' + im.vendor : ''), by: DATA.settings._role || '' }); ex.unitPrice = twdPrice; }
+      if (this._num(r.lt) && this._num(ex.leadTime) !== this._num(r.lt)) ex.leadTime = this._num(r.lt);
+      if (im.vendor && ex.vendor !== im.vendor) ex.vendor = im.vendor;
+      Store.parts.save();
+    } else {
+      Store.parts.add({ partId: 'pt_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), partNo: r.pn, name: r.nm || '', category: '其他', status: 'Released', ver: '', spec: '', vendor: im.vendor || '', unitPrice: twdPrice, leadTime: this._num(r.lt), internalBuffer: null, moq: 0, safetyStock: 0, onHand: 0, inTransit: 0, alternates: '', history: [{ field: '建立', from: '', to: '報價匯入', at: today, note: im.vendor || '', by: DATA.settings._role || '' }], createdAt: today, sourceProject: im.srcName });
+    }
+  },
+  _saveImporter() {
+    const im = this._imp2; if (!im) return;
+    const rows = im.rows.filter(r => r.pn);
+    if (!rows.length) { U.toast('沒有可帶入的料號'); return; }
+    const projId = im.scope === 'all' ? null : im.projId;
+    if (im.docType !== 'quote') {
+      if (!projId) { U.toast('訂單/需求需指定專案（不能選「所有專案」）'); return; }
+      if (!im.stage) { U.toast('請選階段'); return; }
+    }
+    const label = (this._impTypes.find(t => t.k === im.docType) || {}).label;
+    App.confirmModal({ title: '確認儲存並帶入？', msg: `${label} · ${rows.length} 筆 · ${im.vendor || '—'}。帶入後缺口/主檔即時更新（改了無法還原）。`, okText: '確認帶入', cancelText: '再想想',
+      onConfirm: () => {
+        if (im.docType === 'quote') App._ratePref.set(im.currency, im.rate);
+        const today = Materials._today(); let nq = 0, nc = 0, ni = 0;
+        const docNo = Materials._genDocNo(im.docType), by = (DATA.settings && DATA.settings._role) || '';   // §21.16.6 單據編號＋操作員留痕
+        rows.forEach(r => {
+          if (im.docType === 'quote') {
+            const twd = Materials._impTwd(r);
+            Store.quotes.add({ id: 'q_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), partNo: r.pn, vendor: im.vendor, currency: im.currency, baseCurrency: im.baseCurrency, price: Materials._num(r.price), rate: Materials._num(im.rate), priceTwd: twd, leadTime: Materials._num(r.lt), arriveDate: r.arrive || '', projId, sourceFile: im.srcName, date: today, docNo, docType: 'quote', by }); nq++;
+            if (r.cover) { Materials._impCoverMaster(r, im, twd, today); nc++; }
+          } else {
+            const type = im.docType === 'order' ? '到料' : '額外需求';
+            const note = im.docType === 'order' ? ('訂單匯入' + (im.vendor ? '·' + im.vendor : '')) : (r.reason || '需求匯入');
+            Store.invTxns.add({ id: 'iv_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), projId, stage: im.stage, partNo: r.pn, type, qty: Materials._num(r.qty), date: (im.docType === 'order' ? (r.arrive || today) : today), note, docNo, docType: im.docType, srcName: im.srcName, vendor: im.vendor, by }); ni++;
+          }
+        });
+        App.closeModal(); Materials._imp2 = null;
+        U.toast(im.docType === 'quote' ? `✓ 已存 ${nq} 筆報價（${nc} 覆蓋主檔）` : `✓ 已帶入 ${ni} 筆 · 缺口已重算`);
+        Materials.render();
+      } });
+  },
+
+  // ── 需求來源 · 型號×階段台數矩陣（§21.15 D·專案專屬·§21.11 確認後才寫入）──
+  _jsq(s) { return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); },
+  _demandModels(proj) {   // 型號列：真多機種→bomModels（機種分頁·台數與用量同軸·§21.15 D #4 A1）；否則 variants 優先→單 bomModel→單案
+    if (this._isMultiModel(proj)) return proj.bomModels.map((m, i) => ({ id: m.id || ('m' + i), name: m.name || ('機種' + (i + 1)), bom: true }));
+    if (proj.variants && proj.variants.length) return proj.variants.map((v, i) => ({ id: v.id || ('v' + i), name: v.name || v.id || ('型號' + (i + 1)) }));
+    if (proj.bomModels && proj.bomModels.length) return proj.bomModels.map((m, i) => ({ id: m.id || ('m' + i), name: m.name || ('機種' + (i + 1)) }));
+    return [{ id: '_main', name: proj.name }];
+  },
+  // §21.15 D #4 A3：多機種列軸「機種分頁 ↔ 市售型號(variant)」對照（純顯示·不進計算）·map 存 proj.modelVariantMap[modelId]=variantId·未綁則依名稱猜
+  _modelVariantGuess(proj, modelName) {
+    const vs = proj.variants || []; if (!vs.length || !modelName) return '';
+    const norm = s => String(s == null ? '' : s).trim().toUpperCase().replace(/\s+/g, '');
+    const mn = norm(modelName);
+    const hit = vs.find(v => { const vn = norm(v.name); return vn && (vn === mn || mn.indexOf(vn) >= 0 || vn.indexOf(mn) >= 0); });
+    return hit ? (hit.id || '') : '';
+  },
+  _modelVariantId(proj, modelId, modelName) {
+    const map = proj.modelVariantMap || {};
+    if (map[modelId] != null) return map[modelId];   // '' ＝ 使用者明確清空對照
+    return this._modelVariantGuess(proj, modelName);
+  },
+  setModelVariant(pid, modelId, vid) {
+    const proj = (DATA.projects || []).find(p => p.id === pid); if (!proj) return;
+    (proj.modelVariantMap || (proj.modelVariantMap = {}))[modelId] = vid;
+    Store.projects.save(); this._renderTab();
+  },
+  _modelVariantCtrl(proj, m) {
+    const vs = proj.variants || [];
+    if (!vs.length) return '';   // 無立案市售型號→列名只顯機種分頁名
+    const cur = this._modelVariantId(proj, m.id, m.name);
+    return `<select class="dq-mvsel" onclick="event.stopPropagation()" onchange="Materials.setModelVariant('${this._jsq(proj.id)}','${this._jsq(m.id)}',this.value)" title="對照到立案的市售型號（僅顯示·不影響台數計算）"><option value="">（對照市售型號）</option>${vs.map(v => `<option value="${this._esc(v.id)}" ${cur === (v.id || '') ? 'selected' : ''}>${this._esc(v.name || v.id)}</option>`).join('')}</select>`;
+  },
+  _demandStages(proj) {   // 階段欄：getProjectStages 去重階段名（排 未分階段）·取最早起日
+    const raw = (App.getProjectStages(proj.id) || []).filter(s => s.name && s.name !== '未分階段');
+    const seen = {}, out = [];
+    raw.forEach(s => {
+      if (!seen[s.name]) { seen[s.name] = { name: s.name, start: s.earliestStart || '' }; out.push(seen[s.name]); }
+      else if (s.earliestStart && (!seen[s.name].start || s.earliestStart < seen[s.name].start)) seen[s.name].start = s.earliestStart;
+    });
+    return out;
+  },
+  _stageShort(iso) { if (!iso) return ''; const d = new Date(iso); if (isNaN(d.getTime())) return ''; const day = d.getDate(); return (d.getMonth() + 1) + '/' + (day <= 10 ? '初' : day <= 20 ? '中' : '底'); },
+  _firstDataProjId() {   // 預設跳「有 BOM 資料」的專案（非 projects[0]·避免預設落在空專案·Paul 2026-07-11 UX）
+    const projs = DATA.projects || [];
+    const d = projs.find(p => this._projHasBom(p));
+    return (d || projs[0] || {}).id || '';
+  },
+  _matProjId() {   // 三 tab（需求來源/缺口總表/庫存異動）共用「目前專案」·單一真實來源
+    let pid = this._state.matProj;
+    if (!(pid && (DATA.projects || []).some(p => p.id === pid))) { pid = this._firstDataProjId(); this._state.matProj = pid; }
+    return pid;
+  },
+  _demandProjId() { return this._matProjId(); },
+  _dqEnsureDraft(pid) {   // draft = 儲存值 deep copy（§21.11 改 draft·確認才落地）
+    if (!this._state.dqDraft || this._state.dqDraft._pid !== pid) this._state.dqDraft = { _pid: pid, q: JSON.parse(JSON.stringify((DATA.stageQty || {})[pid] || {})) };
+    return this._state.dqDraft;
+  },
+  _dqGet(vid, stage) { const d = this._state.dqDraft; return (d && d.q[vid] && d.q[vid][stage] != null) ? this._num(d.q[vid][stage]) : 0; },
+  setDemandProj(pid) { this._state.matProj = pid; this._state.dqDraft = null; this._renderTab(); },
+  setDq(vid, stage, val) {
+    const d = this._dqEnsureDraft(this._demandProjId());
+    (d.q[vid] || (d.q[vid] = {}))[stage] = val === '' ? 0 : Math.max(0, Math.round(Number(val) || 0));
+    this._renderTab();
+  },
+  _dqDirty(pid) { return JSON.stringify((DATA.stageQty || {})[pid] || {}) !== JSON.stringify((this._state.dqDraft && this._state.dqDraft.q) || {}); },
+  saveDq() {
+    const pid = this._demandProjId(), d = this._state.dqDraft; if (!d) return;
+    App.confirmModal({ title: '儲存並重新計算？', msg: '台數存檔後會重算缺口總表（結存/缺口/下單日）。物料資料改了無法還原先前值。', okText: '確認儲存', cancelText: '再想想',
+      onConfirm: () => { (DATA.stageQty || (DATA.stageQty = {}))[pid] = JSON.parse(JSON.stringify(d.q)); Store.stageQty.save(); U.toast('✓ 台數已儲存·缺口總表已重算'); Materials._state.dqDraft = null; Materials._renderTab(); } });
+  },
+  cancelDq() { this._state.dqDraft = null; this._renderTab(); },
+  _demandHtml() {
+    const projs = (DATA.projects || []);
+    if (!projs.length) return `<div class="mat-empty"><div class="mat-empty-ic">🧮</div><div class="mat-empty-t">還沒有專案</div><div class="mat-empty-d">先建 NPI／ECN 專案，才能填各型號各階段的生產台數。</div></div>`;
+    const pid = this._demandProjId(), proj = projs.find(p => p.id === pid);
+    this._dqEnsureDraft(pid);
+    const projSel = `<select class="mat-sel" onchange="Materials.setDemandProj(this.value)">${projs.map(p => `<option value="${p.id}" ${p.id === pid ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('')}</select>`;
+    const models = this._demandModels(proj), stages = this._demandStages(proj);
+    if (!stages.length) return `<div class="dq-bar"><span class="dq-lb">需求來源專案</span>${projSel}</div><div class="mat-empty"><div class="mat-empty-ic">🗓</div><div class="mat-empty-t">此案還沒有分階段</div><div class="mat-empty-d">「${this._esc(proj.name)}」的任務尚未設定階段（task.stage）。先在專案頁把任務分階段，台數矩陣才有欄可填。</div></div>`;
+    const multi = this._isMultiModel(proj), umaps = multi ? this._modelUsageMaps(proj) : null;   // §21.15 D #4：多機種→台數×用量 per-model 同軸精算
+    const totals = {};
+    stages.forEach(s => { totals[s.name] = models.reduce((a, m) => a + this._dqGet(m.id, s.name), 0); });
+    const cellVal = (mt, s) => multi ? umaps.reduce((a, u) => a + this._dqGet(u.id, s) * this._num((u.usage[mt.partNo] || {}).qty), 0) : totals[s] * (this._num(mt.qty) || 0);
+    const usageTip = mt => { if (!multi) return mt.qty ? '每台用量 ' + mt.qty : ''; const ps = umaps.map(u => { const q = this._num((u.usage[mt.partNo] || {}).qty); return q ? u.name + ' ' + q + '/台' : null; }).filter(Boolean); return ps.length ? '每台用量 · ' + ps.join('、') : '此料號未用於任一機種'; };
+    const headLbl = multi ? '機種（BOM 分頁）' : '型號';
+    const head = `<tr><th class="dq-lead">${headLbl}</th>${stages.map(s => `<th>${this._esc(s.name)}<span class="dq-dt">${this._stageShort(s.start)}</span></th>`).join('')}</tr>`;
+    const rows = models.map(m => `<tr><td class="dq-lead"><span class="dq-mn">${this._esc(m.name)}</span>${multi ? this._modelVariantCtrl(proj, m) : ''}</td>${stages.map(s => `<td class="dq-cell"><input type="number" min="0" class="dq-in" value="${this._dqGet(m.id, s.name)}" onchange="Materials.setDq('${this._jsq(m.id)}','${this._jsq(s.name)}',this.value)"></td>`).join('')}</tr>`).join('');
+    const foot = `<tr class="dq-foot"><td class="dq-lead">合計台數</td>${stages.map(s => `<td>${totals[s.name]}</td>`).join('')}</tr>`;
+    const mats = this._extractProjectMaterials(proj).slice(0, 15);
+    const calcBody = mats.length ? mats.map(mt => `<tr><td class="dq-lead" title="${this._esc(usageTip(mt))}">${this._esc(mt.partNo)} <span class="dq-use">${this._esc(mt.name)}${multi ? ' · 各機種' : (mt.qty ? ' · ' + mt.qty + '/台' : '')}</span></td>${stages.map(s => `<td>${cellVal(mt, s.name)}</td>`).join('')}</tr>`).join('')
+      : `<tr><td class="dq-lead" colspan="${stages.length + 1}"><span class="mat-emptyk">此案尚未帶入 BOM 料號（先做 BOM 比對或從專案帶入），即時試算才有料。</span></td></tr>`;
+    const dirty = this._dqDirty(pid);
+    return `
+      <div class="dq-bar"><span class="dq-lb">需求來源專案</span>${projSel}<span class="dq-info">${models.length} ${multi ? '機種' : '型號'} · ${stages.length} 階段 · 庫存口徑「本專案專屬·階段隔離」${multi ? ' · 多機種：台數×用量逐機種精算' : ''}</span></div>
+      <div class="dq-panel">
+        <div class="dq-scroll"><table class="dq-mx dq-matrix"><thead>${head}</thead><tbody>${rows}</tbody><tfoot>${foot}</tfoot></table></div>
+        <div class="dq-calc-note">🔄 即時試算：合計台數 × BOM 每台用量 ＝ 各階段整機耗用（存檔後進缺口總表「−整機耗用」）</div>
+        <div class="dq-scroll"><table class="dq-mx dq-calc dq-matrix"><thead><tr><th class="dq-lead">物料（每台用量）</th>${stages.map(s => `<th>${this._esc(s.name)}</th>`).join('')}</tr></thead><tbody>${calcBody}</tbody></table></div>
+      </div>
+      <div class="dq-save ${dirty ? 'on' : ''}">
+        ${dirty ? '<span class="dq-dirty">● 有未儲存變更</span>' : '<span class="dq-clean">✓ 已是最新（與缺口總表同步）</span>'}
+        <div style="flex:1"></div>
+        ${dirty ? '<button class="btn-ghost" onclick="Materials.cancelDq()">取消變更</button>' : ''}
+        <button class="btn-mat" onclick="Materials.saveDq()" ${dirty ? '' : 'disabled'}>儲存並重新計算</button>
+        <div class="dq-hint">提示：改完台數請點右側「儲存並重新計算」，確認後系統才會更新缺口總表（在此之前不會即時落地）。</div>
+      </div>
+      ${this._machineHtml(proj, stages)}`;
+  },
+
+  // ── 樣機去向與結存（整機層台帳·§21.15 E·Store.machineTxns）──
+  _machineUses: ['送商檢', '長期運轉', '客戶送樣', '報廢損壞'],
+  _mgTxns(pid, stage) { return (DATA.machineTxns || []).filter(t => t.projId === pid && t.stage === stage); },
+  _mgProduced(pid, models, stage) { const q = (DATA.stageQty || {})[pid] || {}; return models.reduce((a, m) => a + this._num((q[m.id] || {})[stage]), 0); },   // 產出＝已存台數（非 draft）
+  _mgUsed(pid, stage, use) { return this._mgTxns(pid, stage).filter(t => !use || t.use === use).reduce((a, t) => a + this._num(t.qty), 0); },
+  // §21.15 E RD 後續規劃留用需求（per 專案×階段·手填要留幾台·留存 < 此值→橘警告＋一鍵回矩陣補做）
+  _rdPlanGet(pid, stage) { return this._num(((DATA.rdPlan || {})[pid] || {})[stage]); },
+  setRdPlan(pid, stage, val) { const q = (DATA.rdPlan || (DATA.rdPlan = {}))[pid] || (DATA.rdPlan[pid] = {}); q[stage] = Math.max(0, Math.round(Number(val) || 0)); Store.rdPlan.save(); this._renderTab(); },
+  gotoMatrixRefill(stage, gap) { U.toast('「' + stage + '」留存不足規劃 ' + gap + ' 台·請在上方台數矩陣加做'); const el = document.querySelector('#page-materials .dq-mx'); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); },
+  toggleMgDetail(stage) { this._state.mgExpand = (this._state.mgExpand === stage) ? null : stage; this._renderTab(); },
+  openMgTxn(pid, stage) {
+    App.openModal({ title: '登記樣機領用 · ' + this._esc(stage),
+      body: `<div class="mat-form"><div class="mat-fgrid">
+        <label class="mat-fld"><span>用途 <b class="req">*</b></span><select id="mg-use">${this._machineUses.map(u => `<option>${u}</option>`).join('')}</select></label>
+        <label class="mat-fld"><span>數量 <b class="req">*</b></span><input id="mg-qty" type="number" min="1" value="1"></label>
+        <label class="mat-fld mat-fwide"><span>備註（選填）</span><input id="mg-note" placeholder="例：CNS 認證送件 / 5000hr 耐久 / 客戶 A 送樣"></label>
+      </div></div>`,
+      footer: `<button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._addMgTxn('${this._jsq(pid)}','${this._jsq(stage)}')">確認登記</button>` });
+  },
+  _addMgTxn(pid, stage) {
+    const use = (document.getElementById('mg-use') || {}).value || this._machineUses[0];
+    const qty = Math.max(1, Math.round(Number((document.getElementById('mg-qty') || {}).value) || 0));
+    const note = ((document.getElementById('mg-note') || {}).value || '').trim();
+    Store.machineTxns.add({ id: 'mg_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), projId: pid, stage, use, qty, note, date: this._today() });
+    App.closeModal(); U.toast('✓ 已登記領用 ' + use + ' ×' + qty); this._state.mgExpand = stage; this._renderTab();
+  },
+  askDelMgTxn(id) {
+    const t = (DATA.machineTxns || []).find(x => x.id === id); if (!t) return;
+    App.confirmModal({ title: '刪除這筆領用？', msg: `${t.use} ×${t.qty}${t.note ? '（' + t.note + '）' : ''}`, okText: '刪除', okClass: 'danger', cancelText: '取消',
+      onConfirm: () => { Store.machineTxns.remove(id); U.toast('已刪除領用'); Materials._renderTab(); } });
+  },
+  _machineHtml(proj, stages) {
+    const pid = proj.id, models = this._demandModels(proj), uses = this._machineUses;
+    const rows = stages.map(s => {
+      const produced = this._mgProduced(pid, models, s.name), used = this._mgUsed(pid, s.name), remain = produced - used;
+      const rdNeed = this._rdPlanGet(pid, s.name), short = Math.max(0, rdNeed - remain);
+      const rc = remain < 0 ? 'bad' : short > 0 ? 'warn' : remain === 0 ? 'zero' : 'ok';
+      const exp = this._state.mgExpand === s.name, txns = this._mgTxns(pid, s.name);
+      const detail = exp ? `<tr class="mg-detail"><td colspan="${uses.length + 4}"><div class="mg-list">
+        <span class="mg-h">領用明細</span>
+        ${txns.length ? txns.map(t => `<span class="mg-chip"><b>${this._esc(t.use)}</b> ×${t.qty}${t.note ? ' <span class="mg-note">' + this._esc(t.note) + '</span>' : ''} <span class="mg-d">${t.date}</span> <span class="mg-x" onclick="Materials.askDelMgTxn('${t.id}')">✕</span></span>`).join('') : '<span class="mat-emptyk">此階段尚無領用</span>'}
+        <span class="mg-add" onclick="Materials.openMgTxn('${this._jsq(pid)}','${this._jsq(s.name)}')">＋ 登記一筆</span>
+      </div></td></tr>` : '';
+      return `<tr class="${exp ? 'mg-on' : ''}">
+        <td class="dq-lead">${this._esc(s.name)}</td><td>${produced}</td>
+        ${uses.map(u => { const n = this._mgUsed(pid, s.name, u); return `<td class="${n ? '' : 'mg-z'}">${n || '—'}</td>`; }).join('')}
+        <td class="mg-remain ${rc}">${remain}</td>
+        <td class="mg-rd"><input type="number" min="0" class="mg-rdin" value="${rdNeed || ''}" placeholder="—" onchange="Materials.setRdPlan('${this._jsq(pid)}','${this._jsq(s.name)}',this.value)">${short > 0 ? `<span class="mg-short">缺 ${short} <span class="mg-refill" onclick="Materials.gotoMatrixRefill('${this._jsq(s.name)}',${short})">補做▸</span></span>` : ''}</td>
+        <td><span class="mg-reg" onclick="Materials.toggleMgDetail('${this._jsq(s.name)}')">${exp ? '收合 ▴' : '登記/明細 ▾'}</span></td>
+      </tr>${detail}`;
+    }).join('');
+    return `
+      <div class="mat-mgh">樣機去向與結存</div>
+      <ul class="mat-mgh-list"><li>本表追蹤各階段樣機的實際流向；領用後剩餘的台數暫存於 RD（留存＝產出−領用，領走不多耗料）。</li><li>填「RD 規劃留用」＝這階段要自留幾台；當規劃留用大於實際留存，系統自動示警並提供「補做」回台數矩陣。</li></ul>
+      <div class="dq-panel">
+        <div class="dq-scroll"><table class="dq-mx mg-tbl">
+          <thead><tr><th class="dq-lead">階段</th><th>產出</th>${uses.map(u => `<th>${u}</th>`).join('')}<th>留存(RD)</th><th>RD 規劃留用</th><th>登記</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>
+      </div>`;
+  },
+
+  // ── 缺口總表 · §21.5 三維滾動結存引擎（專案專屬 per 階段桶·全 derived·§21.15 A/B/F）──
+  _invSum(pid, stage, partNo, type) { return (DATA.invTxns || []).filter(t => t.projId === pid && t.stage === stage && t.partNo === partNo && t.type === type).reduce((a, t) => a + this._num(t.qty), 0); },
+  _invTxnsFor(pid, stage, partNo, type) { return (DATA.invTxns || []).filter(t => t.projId === pid && t.stage === stage && t.partNo === partNo && t.type === type); },   // §21.16.6 入口B：對帳單數字→來源交易明細
+  _invCount(pid, stage, partNo) { const c = (DATA.invTxns || []).filter(t => t.projId === pid && t.stage === stage && t.partNo === partNo && t.type === '盤點'); if (!c.length) return null; const latest = c.reduce((a, b) => ((b.date || '') >= (a.date || '') ? b : a)); return this._num(latest.qty); },   // 取日期最新的盤點（同日則後登記者·對齊庫存異動列表 date 遞減顯示口徑）
+  _stageMachines(pid, models, stage) { const q = (DATA.stageQty || {})[pid] || {}; return models.reduce((a, m) => a + this._num((q[m.id] || {})[stage]), 0); },
+  _savedQty(pid, modelId, stage) { const q = ((DATA.stageQty || {})[pid] || {})[modelId] || {}; return this._num(q[stage]); },   // 已存台數（非 draft）· per (案×機種×階段)
+  _balanceFor(proj) {   // 回 [{partNo,name,rows:[逐階段結存],worst,buyQty,health,needDate,orderByDate,daysToOrder,...}]·只算已帶入主檔的料
+    const pid = proj.id, models = this._demandModels(proj), stages = this._demandStages(proj);
+    const multi = this._isMultiModel(proj), umaps = multi ? this._modelUsageMaps(proj) : null;   // §21.15 D #4：多機種→耗用逐機種精算
+    const stageDate = {}; stages.forEach(s => { stageDate[s.name] = s.start; });   // 階段→起日（採購時間軸/最晚下單日用）
+    const today = this._today();
+    const mats = this._extractProjectMaterials(proj).filter(mt => (DATA.parts || []).some(p => p.partNo === mt.partNo));
+    return mats.map(mt => {
+      const part = (DATA.parts || []).find(p => p.partNo === mt.partNo) || {};
+      const safety = this._num(part.safetyStock), usage = this._num(mt.qty);
+      let begin = 0, worst = 0;   // §21.6① 決策B：各案期初一律 0（master onHand 僅 UI 參考·不參與推演）·本案可用料由「庫存異動→到料」登記為唯一來源
+      const rows = stages.map(s => {
+        const arrive = this._invSum(pid, s.name, mt.partNo, '到料');
+        // 耗用＝多機種：Σ(該機種台數 × 該機種每台用量)；單機種：合計台數 × 每台用量（§21.15 D #4 A1）
+        const consume = multi ? umaps.reduce((a, u) => a + this._savedQty(pid, u.id, s.name) * this._num((u.usage[mt.partNo] || {}).qty), 0) : this._stageMachines(pid, models, s.name) * usage;
+        const extra = this._invSum(pid, s.name, mt.partNo, '額外需求');
+        const sysEnd = begin + arrive - consume - extra;
+        const counted = this._invCount(pid, s.name, mt.partNo);
+        const diff = counted != null ? counted - sysEnd : null;
+        const end = counted != null ? counted : sysEnd;
+        const health = end < 0 ? 'bad' : end < safety ? 'warn' : 'ok';
+        const row = { stage: s.name, begin, arrive, consume, extra, sysEnd, counted, diff, end, health };
+        begin = end; if (end < worst) worst = end;
+        return row;
+      });
+      const moq = this._num(part.moq) || 1, deficit = safety - worst;
+      const buyQty = deficit > 0 ? Math.max(moq, Math.ceil(deficit / moq) * moq) : 0;
+      const firstShort = rows.find(r => r.health !== 'ok'), firstShortStage = firstShort ? firstShort.stage : null;
+      const leadTotal = this._leadTotal(part);
+      const needDate = firstShortStage ? (stageDate[firstShortStage] || '') : '';   // 需要日＝首個缺口階段起日
+      const orderByDate = needDate ? this._addDays(needDate, -leadTotal) : '';       // 最晚下單日＝需要日 − 買料前置
+      const daysToOrder = orderByDate ? this._daysBetween(today, orderByDate) : null; // 剩幾天可下單（負＝逾期）
+      return { partNo: mt.partNo, name: part.name || mt.name || '', vendor: part.vendor || '', rows, worst, safety, buyQty, onHand: this._num(part.onHand),
+        leadTotal, health: worst < 0 ? 'bad' : worst < safety ? 'warn' : 'ok', firstShortStage, needDate, orderByDate, daysToOrder };
+    });
+  },
+  _gapProjId() { return this._matProjId(); },
+  setGapProj(pid) { if (pid === '__ALL') { this._state.gapAll = true; } else { this._state.gapAll = false; this._state.matProj = pid; } this._state.gapExpand = null; this._renderTab(); },
+  toggleGapDetail(pn) { this._state.gapExpand = (this._state.gapExpand === pn) ? null : pn; this._renderTab(); },
+  // §21.15 Phase⑤ 替代料建議：解析主檔 alternates（逗號/、/空白分隔料號）→ 查主檔單價與價差（無 PO 模組·改一鍵複製料號供線下下單）
+  _altSuggest(partNo) {
+    const part = (DATA.parts || []).find(p => p.partNo === partNo);
+    if (!part || !part.alternates) return [];
+    const price = this._num(part.unitPrice);
+    return String(part.alternates).split(/[,、;；\s]+/).map(s => s.trim()).filter(Boolean).map(no => {
+      const alt = (DATA.parts || []).find(p => p.partNo === no);
+      return { no, name: alt ? (alt.name || '') : '', price: alt ? this._num(alt.unitPrice) : null, diff: alt ? this._num(alt.unitPrice) - price : null, inMaster: !!alt };
+    });
+  },
+  copyAlt(no) {
+    U.copy(no, '✓ 已複製替代料號 ' + no, '替代料號：' + no);   // §27 收斂共用 U.copy（等值·rule10）
+  },
+  _gapHtml() {
+    const projs = (DATA.projects || []);
+    if (!projs.length) return `<div class="mat-empty"><div class="mat-empty-ic">📊</div><div class="mat-empty-t">還沒有專案</div><div class="mat-empty-d">先建 NPI／ECN 專案。</div></div>`;
+    const ALL = !!this._state.gapAll;
+    const pid = this._gapProjId(), proj = projs.find(p => p.id === pid);
+    const projSel = `<select class="mat-sel" onchange="Materials.setGapProj(this.value)"><option value="__ALL" ${ALL ? 'selected' : ''}>📊 綜合看板（所有專案彙總）</option>${projs.map(p => `<option value="${p.id}" ${!ALL && p.id === pid ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('')}</select>`;
+    if (ALL) return this._gapAllHtml(projSel);
+    this._autoImportProjectParts(proj);   // 有 BOM 就自動帶入主檔（免手動·Paul 2026-07-11）
+    const bal = this._balanceFor(proj), hasQty = Object.keys((DATA.stageQty || {})[pid] || {}).length > 0;
+    const bar = `<div class="gap-bar"><span class="dq-lb">目前查看專案</span>${projSel}</div>`;
+    const qtyAlert = hasQty ? '' : `<div class="mat-alert-qty">⚠ 系統提示：本專案目前尚未填寫生產台數（物料耗用計算為 0）。請先至「需求來源」分頁填寫台數，系統才能為您精準推算物料缺口。</div>`;
+    if (!bal.length) return `${bar}${qtyAlert}<div class="mat-empty"><div class="mat-empty-ic">📊</div><div class="mat-empty-t">此案 BOM 還沒有可帶入的料號</div><div class="mat-empty-d">有 BOM 分析的專案，料號會自動帶入這裡；此案目前抽不到料號——先到專案的「BOM · 成本」頁做 BOM 分析（或該案只有整機列、無散料）。</div><button class="btn-ghost" onclick="Materials.setTab('parts')">看料號主檔</button></div>`;
+    const short = bal.filter(b => b.health === 'bad').length, warn = bal.filter(b => b.health === 'warn').length;
+    const orderNow = bal.filter(b => b.daysToOrder != null && b.daysToOrder <= 0).length;
+    const kpi = [['bad', '已缺料', short], ['warn', '將缺料', warn], ['mat', '今日該下單', orderNow], ['neu', '本案料號', bal.length]];
+    const kpiHtml = kpi.map(c => `<div class="mat-kpi mat-kpi-${c[0]}"><div class="mat-kpi-k">${c[1]}</div><div class="mat-kpi-v">${c[2]}<small>項</small></div></div>`).join('');
+    const rank = h => h === 'bad' ? 0 : h === 'warn' ? 1 : 2;
+    const abn = bal.filter(b => b.health !== 'ok').sort((a, b) => rank(a.health) - rank(b.health) || b.buyQty - a.buyQty);
+    const abnHtml = abn.length ? abn.map(b => this._gapRowHtml(b, pid)).join('') : `<div class="gap-allok">✓ 目前無缺料——所有料號各階段期末結存都在安全庫存以上。${hasQty ? '' : '（此案尚未填台數，耗用為 0）'}</div>`;
+    return `${bar}${qtyAlert}<div class="mat-kpirow">${kpiHtml}</div>
+      <div class="gap-sec-h">異常待辦 <span class="gap-cnt">${abn.length}</span><span class="gap-sec-hint">缺料與告警一起列 · 點料號看各階段結存對帳單</span></div>
+      <div class="dq-panel gap-list">${abn.length ? '<div class="gap-head"><span>料號 / 品名</span><span>下單時機</span><span class="r">最低期末</span><span class="r">建議量</span><span></span></div>' : ''}${abnHtml}</div>
+      ${this._procTimelineHtml(abn)}`;
+  },
+  _gapAllHtml(projSel) {   // 綜合看板：所有專案缺口彙總·KPI 全站加總·異常待辦跨案串接（Paul 2026-07-11·B 方案·不加 Tab）
+    const projs = DATA.projects || [];
+    let rows = [];
+    projs.forEach(p => { this._autoImportProjectParts(p); this._balanceFor(p).forEach(b => rows.push(Object.assign({ _projName: p.name, _projId: p.id }, b))); });
+    const short = rows.filter(b => b.health === 'bad').length, warn = rows.filter(b => b.health === 'warn').length;
+    const orderNow = rows.filter(b => b.daysToOrder != null && b.daysToOrder <= 0).length;
+    const kpi = [['bad', '全站已缺料', short], ['warn', '全站將缺料', warn], ['mat', '今日該下單', orderNow], ['neu', '全站料號', rows.length]];
+    const kpiHtml = kpi.map(c => `<div class="mat-kpi mat-kpi-${c[0]}"><div class="mat-kpi-k">${c[1]}</div><div class="mat-kpi-v">${c[2]}<small>項</small></div></div>`).join('');
+    const rank = h => h === 'bad' ? 0 : h === 'warn' ? 1 : 2;
+    const abn = rows.filter(b => b.health !== 'ok').sort((a, b) => rank(a.health) - rank(b.health) || (b.buyQty || 0) - (a.buyQty || 0));
+    const abnHtml = abn.length ? abn.map(b => {
+      const o = this._gapOrderLabel(b);
+      return `<div class="gap-allrow ${b.health}" onclick="Materials.setGapProj('${b._projId}')" title="點看此案缺口對帳單"><span class="gap-allproj">${this._esc(b._projName)}</span><span class="gap-allpn"><b>${this._esc(b.partNo)}</b>${b.name ? ' <span class="tnm">' + this._esc(b.name) + '</span>' : ''}</span><span class="gap-allst ${b.health}"><span class="gap-st-lb"><span class="gap-dot ${b.health}"></span>${o.label}</span>${o.cd ? `<span class="gap-cd ${o.over ? 'over' : ''}">${o.cd}</span>` : ''}</span><span class="gap-allworst">最低期末 <b class="${b.worst < 0 ? 'neg' : ''}">${b.worst}</b></span><span class="gap-allbuy">建議下單 <b>${b.buyQty || 0}</b></span></div>`;
+    }).join('') : `<div class="gap-allok">✓ 全站目前無缺料——所有專案各料號各階段期末結存都在安全庫存以上。</div>`;
+    const bar = `<div class="gap-bar"><span class="dq-lb">缺口總表專案</span>${projSel}<span class="dq-info">全站 ${rows.length} 料號 · ${projs.length} 個專案彙總</span></div>`;
+    return `${bar}<div class="mat-kpirow">${kpiHtml}</div>
+      <div class="gap-sec-h">全站異常待辦 <span class="gap-cnt">${abn.length}</span><span class="gap-sec-hint">跨專案彙總 · 點任一列跳到該案缺口對帳單</span></div>
+      <div class="dq-panel gap-list">${abn.length ? '<div class="gap-allhead"><span>專案</span><span>料號 / 品名</span><span>下單時機</span><span class="r">最低期末</span><span class="r">建議量</span></div>' : ''}${abnHtml}</div>`;
+  },
+  // 下單時機文案（單案列／綜合看板列共用·規則13）：回 {label, cd, over}
+  _gapOrderLabel(b) {
+    let label = b.health === 'bad' ? '已缺料·盡快下單' : '將缺料·安排下單', cd = '', over = false;
+    if (b.daysToOrder != null) {
+      if (b.daysToOrder < 0) { label = '建議今日下單'; cd = '逾期 ' + (-b.daysToOrder) + ' 天'; over = true; }
+      else if (b.daysToOrder <= 7) { label = '本週需執行'; cd = '剩 ' + b.daysToOrder + ' 天'; }
+      else { label = '安排下單'; cd = b.daysToOrder + ' 天內'; }
+    }
+    return { label, cd, over };
+  },
+  // ── 採購時間軸（§21.12·§21.15 B·買料前置條 vs 今日線 vs 需要日·逾期紅）──
+  _procTimelineHtml(abn) {
+    const wd = abn.filter(b => b.orderByDate && b.needDate);
+    if (!wd.length) return '';
+    const today = this._today();
+    const all = [today].concat(wd.map(b => b.orderByDate)).concat(wd.map(b => b.needDate));
+    const min = all.reduce((a, d) => d < a ? d : a), max = all.reduce((a, d) => d > a ? d : a);
+    const span = Math.max(1, this._daysBetween(min, max));
+    const pct = d => Math.max(0, Math.min(100, (this._daysBetween(min, d) / span) * 100));
+    const tpct = pct(today);
+    const rows = wd.map(b => {
+      const l = pct(b.orderByDate), r = pct(b.needDate), over = b.daysToOrder < 0;
+      return `<div class="pt-row"><div class="pt-lab"><b>${this._esc(b.partNo)}</b>${b.vendor ? ' <span>' + this._esc(b.vendor) + '</span>' : ''}</div>
+        <div class="pt-track"><div class="pt-today" style="left:${tpct}%"></div>
+          <div class="pt-bar ${over ? 'over' : 'soon'}" style="left:${l}%;width:${Math.max(1.5, r - l)}%">前置 ${b.leadTotal} 天${over ? '·逾期' : ''}</div>
+          <div class="pt-need" style="left:${r}%" title="需要日 ${b.needDate}"></div></div></div>`;
+    }).join('');
+    return `<div class="gap-sec-h">採購時間軸 <span class="gap-sec-hint">買料前置期（下單窗口）· 紅線＝今日 · 前置條左端越過今日＝逾期紅</span></div>
+      <div class="dq-panel pt-panel"><div class="pt-scroll">${rows}</div>
+        <div class="pt-legend"><span><i class="sw soon"></i>下單窗口（前置期）</span><span><i class="sw over"></i>已逾期·需立即發 PO</span><span><i class="sw need"></i>需要日（缺料階段）</span><span><i class="sw today"></i>今日</span></div>
+      </div>`;
+  },
+  _gapRowHtml(b, pid) {
+    const exp = this._state.gapExpand === b.partNo;
+    const srcCell = (stage, type, val) => {   // §21.16.6 入口B：有來源交易→可點超連結追溯
+      const n = val || 0;
+      if (!n || !pid || !this._invTxnsFor(pid, stage, b.partNo, type).length) return `<td>${n}</td>`;
+      return `<td><span class="gap-src" onclick="event.stopPropagation();Materials.traceSource('${this._jsq(pid)}','${this._jsq(stage)}','${this._jsq(b.partNo)}','${type}')" title="點看來源單據">${n}</span></td>`;
+    };
+    const { label, cd, over } = this._gapOrderLabel(b);
+    const alts = exp ? this._altSuggest(b.partNo) : [];
+    const altHtml = alts.length ? `<div class="gap-alt"><span class="gap-alt-h">🔀 替代料建議</span>${alts.map(a => `<span class="gap-alt-chip${a.inMaster ? '' : ' out'}"><b>${this._esc(a.no)}</b>${a.name ? ' <span class="gap-alt-nm">' + this._esc(a.name) + '</span>' : ''}${a.inMaster ? ` <span class="gap-alt-pr">$${a.price}</span>${a.diff !== 0 ? `<span class="gap-alt-diff ${a.diff > 0 ? 'up' : 'down'}">${a.diff > 0 ? '+' : ''}${a.diff}</span>` : '<span class="gap-alt-diff">同價</span>'}` : ' <span class="gap-alt-outt">主檔未帶入</span>'} <span class="gap-alt-copy" onclick="event.stopPropagation();Materials.copyAlt('${this._jsq(a.no)}')">⧉ 複製</span></span>`).join('')}<span class="gap-alt-note">系統無 PO 模組·此處提供替代料號＋價差供線下下單</span></div>` : '';
+    const detail = exp ? `<div class="gap-detail"><div class="dq-scroll"><table class="dq-mx">
+      <thead><tr><th class="dq-lead">階段</th>${b.rows.map(r => `<th>${this._esc(r.stage)}</th>`).join('')}</tr></thead>
+      <tbody>
+        <tr class="gap-endrow"><td class="dq-lead">期末結存</td>${b.rows.map(r => `<td class="gap-end ${r.health}">${r.end}</td>`).join('')}</tr>
+        <tr><td class="dq-lead">期初</td>${b.rows.map(r => `<td>${r.begin}</td>`).join('')}</tr>
+        <tr><td class="dq-lead">＋到料</td>${b.rows.map(r => srcCell(r.stage, '到料', r.arrive)).join('')}</tr>
+        <tr><td class="dq-lead">−整機耗用</td>${b.rows.map(r => `<td>${r.consume || 0}</td>`).join('')}</tr>
+        <tr><td class="dq-lead">−額外需求</td>${b.rows.map(r => srcCell(r.stage, '額外需求', r.extra)).join('')}</tr>
+        <tr><td class="dq-lead">盤點/盤差</td>${b.rows.map(r => `<td>${r.counted != null ? r.counted + '·' + (r.diff >= 0 ? '+' : '') + r.diff : '—'}</td>`).join('')}</tr>
+      </tbody></table></div>
+      <div class="gap-note">各案<b>期初一律 0</b>，本案可用料由「庫存異動→到料」登記；期初＋到料−整機耗用（Σ機種台數×該機種每台用量）−額外需求＝期末，有盤點以實際往下結轉。安全庫存 ${b.safety}·買料前置 ${b.leadTotal} 天${b.onHand > 0 ? `·<span title="主檔全域現有量·僅參考·未自動配進本案期初">主檔全域現有 ${b.onHand} 顆（未配本案）</span>` : ''}${b.buyQty > 0 ? `·建議下單 <b style="color:var(--mat)">+${b.buyQty}</b>（補到安全水位·取至 MOQ）` : ''}。（到料/額外/盤點＝庫存異動 tab 登記·Phase③⑤）</div>${altHtml}</div>` : '';
+    return `<div class="gap-row r-${b.health} ${exp ? 'on' : ''}" onclick="Materials.toggleGapDetail('${this._jsq(b.partNo)}')">
+      <div class="gap-main"><div class="gap-pn"><span class="gap-dot ${b.health}"></span><b>${this._esc(b.partNo)}</b> <span class="gap-nm">${this._esc(b.name)}${b.vendor ? ' · ' + this._esc(b.vendor) : ''}</span></div>
+        <div class="gap-reason">${b.firstShortStage ? this._esc(b.firstShortStage) + ' 階段起低於安全水位' : '低於安全水位'} · 買料前置 ${b.leadTotal} 天</div></div>
+      <div class="gap-status ${b.health}"><span class="gap-st-lb"><span class="gap-dot ${b.health}"></span>${label}</span>${cd ? `<span class="gap-cd ${over ? 'over' : ''}">${cd}</span>` : ''}</div>
+      <div class="gap-worst">最低期末<b class="${b.worst < 0 ? 'neg' : ''}">${b.worst}</b></div>
+      <div class="gap-buy">${b.buyQty > 0 ? '<b>+' + b.buyQty + '</b>' : '—'}</div>
+      <div class="gap-chev">${exp ? '▴' : '▾'}</div>
+    </div>${detail}`;
+  },
+
+  // ── 庫存異動 · 事實交易登記（§21.6②·§21.15 ⑤·Store.invTxns·§21.11 確認後才寫入）──
+  _invTypes: ['到料', '額外需求', '盤點'],
+  _invProjId() { return this._matProjId(); },
+  setInvProj(pid) { this._state.matProj = pid; this._renderTab(); },
+  _invPartOpts(proj) {   // 該案 BOM 且已在主檔的料號（無則退全部主檔料）
+    const mats = this._extractProjectMaterials(proj).filter(m => (DATA.parts || []).some(p => p.partNo === m.partNo));
+    const src = mats.length ? mats.map(m => m.partNo) : (DATA.parts || []).map(p => p.partNo);
+    return [...new Set(src)];
+  },
+  openInvTxn(pid) {
+    const proj = (DATA.projects || []).find(p => p.id === pid); if (!proj) return;
+    const stages = this._demandStages(proj), parts = this._invPartOpts(proj);
+    if (!stages.length) { U.toast('此案尚無階段（先在專案頁分階段）'); return; }
+    if (!parts.length) { U.toast('此案尚無帶入主檔的料號（先去料號主檔帶入）'); return; }
+    App.openModal({ title: '登記庫存異動 · ' + this._esc(proj.name),
+      body: `<div class="mat-form"><div class="mat-fgrid">
+        <label class="mat-fld"><span>類型 <b class="req">*</b></span><select id="iv-type" onchange="Materials._invTypeHint()">${this._invTypes.map(t => `<option>${t}</option>`).join('')}</select></label>
+        <label class="mat-fld"><span>階段 <b class="req">*</b></span><select id="iv-stage">${stages.map(s => `<option>${this._esc(s.name)}</option>`).join('')}</select></label>
+        <label class="mat-fld"><span>料號 <b class="req">*</b></span><select id="iv-part">${parts.map(p => `<option>${this._esc(p)}</option>`).join('')}</select></label>
+        <label class="mat-fld"><span id="iv-qtylb">到貨數量 <b class="req">*</b></span><input id="iv-qty" type="number" value="1"></label>
+        <label class="mat-fld"><span>日期</span><input id="iv-date" type="date" value="${this._today()}"></label>
+        <label class="mat-fld mat-fwide"><span>備註（選填）</span><input id="iv-note" placeholder="例：PO#1234 到貨 / 品保樣領用 / 月底盤點"></label>
+      </div><div class="mat-fmore-box"><div>📥 <b>到料</b> ＝ 增加庫存</div><div>📤 <b>額外需求</b> ＝ 扣減庫存（品保樣／封樣／客戶追加）</div><div>🔢 <b>盤點</b> ＝ 以實際數校正庫存、往下結轉</div></div></div>`,
+      footer: `<button class="btn-ghost" onclick="App.closeModal()">取消</button><button class="btn-mat" onclick="Materials._askAddInvTxn('${this._jsq(pid)}')">確認登記</button>` });
+  },
+  _invTypeHint() {
+    const t = (document.getElementById('iv-type') || {}).value, lb = document.getElementById('iv-qtylb');
+    if (lb) lb.innerHTML = (t === '盤點' ? '實際盤點數' : t === '額外需求' ? '額外需求數量' : '到貨數量') + ' <b class="req">*</b>';
+  },
+  _askAddInvTxn(pid) {
+    const type = (document.getElementById('iv-type') || {}).value, stage = (document.getElementById('iv-stage') || {}).value, partNo = (document.getElementById('iv-part') || {}).value;
+    const qty = this._num((document.getElementById('iv-qty') || {}).value), date = (document.getElementById('iv-date') || {}).value || this._today(), note = ((document.getElementById('iv-note') || {}).value || '').trim();
+    if (type === '盤點') { if (qty < 0) { U.toast('盤點數不可為負'); return; } } else if (qty <= 0) { U.toast('數量需 > 0'); return; }
+    App.confirmModal({ title: '確認登記此筆異動？', msg: `${type} · ${stage} · ${partNo} · ${qty}。登記後缺口總表會即時重算（改了無法還原）。`, okText: '確認登記', cancelText: '再想想',
+      onConfirm: () => { Store.invTxns.add({ id: 'iv_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), projId: pid, stage, partNo, type, qty, date, note }); App.closeModal(); U.toast('✓ 已登記 ' + type + ' · 缺口總表已重算'); Materials._renderTab(); } });
+  },
+  askDelInvTxn(id) {
+    const t = (DATA.invTxns || []).find(x => x.id === id); if (!t) return;
+    App.confirmModal({ title: '刪除這筆異動？', msg: `${t.type} · ${t.stage} · ${t.partNo} · ${t.qty}`, okText: '刪除', okClass: 'danger', cancelText: '取消',
+      onConfirm: () => { Store.invTxns.remove(id); U.toast('已刪除·缺口總表已重算'); Materials._renderTab(); } });
+  },
+  _invHtml() {
+    const projs = (DATA.projects || []);
+    if (!projs.length) return `<div class="mat-empty"><div class="mat-empty-ic">📦</div><div class="mat-empty-t">還沒有專案</div></div>`;
+    const pid = this._invProjId(), proj = projs.find(p => p.id === pid);
+    const projSel = `<select class="mat-sel" onchange="Materials.setInvProj(this.value)">${projs.map(p => `<option value="${p.id}" ${p.id === pid ? 'selected' : ''}>${this._esc(p.name)}</option>`).join('')}</select>`;
+    const txns = (DATA.invTxns || []).filter(t => t.projId === pid).slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const typeCls = t => t === '到料' ? 'in' : t === '盤點' ? 'count' : 'out';
+    const rows = txns.map(t => `<tr>
+      <td>${this._esc(t.date)}</td><td>${this._esc(t.stage)}</td><td class="dq-lead">${this._esc(t.partNo)}</td>
+      <td><span class="iv-tag ${typeCls(t.type)}">${this._esc(t.type)}</span></td>
+      <td class="r">${t.type === '到料' ? '+' : t.type === '額外需求' ? '−' : '＝'}${this._num(t.qty)}</td>
+      <td class="iv-note">${this._esc(t.note) || '—'}</td>
+      <td class="r"><span class="iv-x" onclick="Materials.askDelInvTxn('${t.id}')">✕</span></td>
+    </tr>`).join('');
+    const body = txns.length ? `<div class="dq-panel"><div class="dq-scroll"><table class="dq-mx iv-tbl">
+      <thead><tr><th>日期</th><th>階段</th><th class="dq-lead">料號</th><th>類型</th><th class="r">數量</th><th>備註</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div></div>`
+      : `<div class="mat-empty"><div class="mat-empty-ic">📦</div><div class="mat-empty-t">此案尚無庫存異動</div><div class="mat-empty-d">登記到料／額外需求／盤點，缺口總表的結存就會即時反映。</div></div>`;
+    return `
+      <div class="gap-bar"><span class="dq-lb">庫存異動專案</span>${projSel}<span class="dq-info">${txns.length} 筆 · 到料＋／額外−／盤點校正 → 缺口總表即時重算</span><button class="btn-mat" style="margin-left:auto" onclick="Materials.openInvTxn('${this._jsq(pid)}')">＋ 登記異動</button></div>
+      ${body}`;
+  },
+
+  // ── §21.16.6 匯入歷史與來源追溯（入口A 單據歷史清單＋入口B 對帳單來源彈窗）──
+  _docPrefix(docType) { return docType === 'quote' ? 'QT' : docType === 'order' ? 'PO' : 'RQ'; },
+  _docTypeLabel(t) { return t === 'quote' ? '報價單' : t === 'order' ? '採購單' : t === 'demand' ? '需求單' : '單據'; },
+  _genDocNo(docType) {   // 單據編號 QT/PO/RQ-YYYYMMDD-NNN（掃 quotes＋invTxns 同前綴當日流水號＋1）
+    const head = this._docPrefix(docType) + '-' + this._today().replace(/-/g, '') + '-';
+    let max = 0;
+    const scan = arr => (arr || []).forEach(o => { if (o && typeof o.docNo === 'string' && o.docNo.indexOf(head) === 0) { const n = parseInt(o.docNo.slice(head.length), 10); if (n > max) max = n; } });
+    scan(DATA.quotes); scan(DATA.invTxns);
+    return head + String(max + 1).padStart(3, '0');
+  },
+  _projName(pid) { if (pid == null || pid === '') return '所有專案通用'; const p = (DATA.projects || []).find(x => x.id === pid); return p ? p.name : '（已刪專案）'; },
+  _docList() {   // derived：把帶 docNo 的 quotes＋invTxns 依 docNo 彙整成單據清單
+    const map = {};
+    const feed = arr => (arr || []).forEach(o => {
+      if (!o || !o.docNo) return;
+      const d = map[o.docNo] || (map[o.docNo] = { docNo: o.docNo, docType: o.docType || 'quote', vendor: o.vendor || '', projId: (o.projId != null ? o.projId : null), date: o.date || '', by: o.by || '', srcName: o.srcName || o.sourceFile || '', items: 0 });
+      d.items++;
+      if (!d.vendor && o.vendor) d.vendor = o.vendor;
+      if (!d.srcName && (o.srcName || o.sourceFile)) d.srcName = o.srcName || o.sourceFile;
+      if (d.projId == null && o.projId != null) d.projId = o.projId;
+    });
+    feed(DATA.quotes); feed(DATA.invTxns);
+    return Object.keys(map).map(k => map[k]).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.docNo.localeCompare(a.docNo));
+  },
+  setDocType(k) { this._state.docType = k; this._renderTab(); },
+  _docsHtml() {
+    const docs = this._docList(), filt = this._state.docType || 'all';
+    const seg = (k, label) => `<button class="${filt === k ? 'on' : ''}" onclick="Materials.setDocType('${k}')">${label}</button>`;
+    const bar = `<div class="gap-bar"><span class="dq-lb">匯入單據歷史</span><div class="mat-seg">${seg('all', '全部')}${seg('quote', '報價單')}${seg('order', '採購單')}${seg('demand', '需求單')}</div><span class="dq-info">共 ${docs.length} 張單據 · 由「智慧匯入單據」自動編號留痕</span></div>`;
+    const show = docs.filter(d => filt === 'all' || d.docType === filt);
+    if (!show.length) return `${bar}<div class="mat-empty"><div class="mat-empty-ic">🗂</div><div class="mat-empty-t">${docs.length ? '此類別尚無單據' : '尚無匯入單據'}</div><div class="mat-empty-d">用「料號主檔 → 📄 智慧匯入單據」上傳報價單／訂單／需求，每次匯入會自動編號並記錄於此，可回查來源。</div></div>`;
+    const rows = show.map(d => `<tr class="doc-row" onclick="Materials.openDocDetail('${this._jsq(d.docNo)}')">
+      <td class="dq-lead"><b>${this._esc(d.docNo)}</b></td>
+      <td><span class="iv-tag ${d.docType === 'quote' ? 'count' : d.docType === 'order' ? 'in' : 'out'}">${this._docTypeLabel(d.docType)}</span></td>
+      <td>${this._esc(d.vendor) || '—'}</td>
+      <td>${this._esc(this._projName(d.projId))}</td>
+      <td>${this._esc(d.date) || '—'}</td>
+      <td>${this._esc(d.by) || '—'}</td>
+      <td class="r">${d.items}</td>
+      <td class="doc-src">${this._esc(d.srcName) || '—'}</td>
+    </tr>`).join('');
+    return `${bar}<div class="dq-panel"><div class="dq-scroll"><table class="dq-mx iv-tbl doc-tbl">
+      <thead><tr><th class="dq-lead">單據編號</th><th>類型</th><th>來源廠商</th><th>指定專案</th><th>匯入時間</th><th>操作員</th><th class="r">品項數</th><th>來源檔</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+      <div class="mat-hint">點任一列展開該單明細。系統不保留原始檔（現場重生原則）——「來源檔」僅記錄上傳檔名供對照。</div></div>`;
+  },
+  openDocDetail(docNo) {
+    const quotes = (DATA.quotes || []).filter(q => q.docNo === docNo), invs = (DATA.invTxns || []).filter(t => t.docNo === docNo);
+    const isQuote = quotes.length > 0, src = isQuote ? quotes : invs;
+    if (!src.length) { U.toast('查無此單據'); return; }
+    const meta = src[0];
+    const head = `<div class="doc-meta">
+      <div><span class="k">單據編號</span><b>${this._esc(docNo)}</b></div>
+      <div><span class="k">類型</span>${this._docTypeLabel(meta.docType)}</div>
+      <div><span class="k">來源廠商</span>${this._esc(meta.vendor) || '—'}</div>
+      <div><span class="k">指定專案</span>${this._esc(this._projName(meta.projId))}</div>
+      <div><span class="k">匯入時間</span>${this._esc(meta.date) || '—'}</div>
+      <div><span class="k">操作員</span>${this._esc(meta.by) || '—'}</div>
+      <div><span class="k">來源檔</span>${this._esc(meta.srcName || meta.sourceFile) || '—'}</div>
+    </div>`;
+    const table = isQuote
+      ? `<table class="dq-mx doc-dtl"><thead><tr><th class="dq-lead">料號</th><th class="r">單價(原幣)</th><th class="r">換算 ${this._esc(meta.baseCurrency || 'TWD')}</th><th>幣別</th><th class="r">L/T</th><th>到貨日</th></tr></thead><tbody>${quotes.map(q => `<tr><td class="dq-lead">${this._esc(q.partNo)}</td><td class="r">${this._money(q.price)}</td><td class="r">${this._money(q.priceTwd)}</td><td>${this._esc(q.currency) || '—'}</td><td class="r">${this._num(q.leadTime) || '—'}</td><td>${this._esc(q.arriveDate) || '—'}</td></tr>`).join('')}</tbody></table>`
+      : `<table class="dq-mx doc-dtl"><thead><tr><th class="dq-lead">料號</th><th>階段</th><th>類型</th><th class="r">數量</th><th>日期</th><th>備註</th></tr></thead><tbody>${invs.map(t => `<tr><td class="dq-lead">${this._esc(t.partNo)}</td><td>${this._esc(t.stage)}</td><td><span class="iv-tag ${t.type === '到料' ? 'in' : t.type === '盤點' ? 'count' : 'out'}">${this._esc(t.type)}</span></td><td class="r">${this._num(t.qty)}</td><td>${this._esc(t.date)}</td><td class="iv-note">${this._esc(t.note) || '—'}</td></tr>`).join('')}</tbody></table>`;
+    App.openModal({ title: '單據明細 · ' + this._esc(docNo), wide: true, body: `<div class="doc-detail">${head}<div class="dq-scroll">${table}</div></div>`, footer: `<div style="flex:1"></div><button class="btn-ghost" onclick="App.closeModal()">關閉</button>` });
+  },
+  traceSource(pid, stage, partNo, type) {   // 入口B：某階段某料號的到料/額外需求→來源單據清單
+    const txns = this._invTxnsFor(pid, stage, partNo, type).slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    if (!txns.length) { U.toast('無來源資料'); return; }
+    const label = type === '到料' ? '＋到料' : '−額外需求';
+    const items = txns.map(t => {
+      const tr = !!t.docNo;
+      return `<div class="trace-item${tr ? '' : ' manual'}">
+        <div class="trace-h"><b>${label} ${this._num(t.qty)}</b> · ${this._esc(t.date)}</div>
+        <div class="trace-d">${tr ? `此資料來自 ${this._esc(t.date)} 匯入的${this._docTypeLabel(t.docType)} <b>${this._esc(t.docNo)}</b>${t.vendor ? ' · 廠商 ' + this._esc(t.vendor) : ''}${t.srcName ? ' · 來源檔 ' + this._esc(t.srcName) : ''}` : '手動於「庫存異動」分頁登記'}${t.note ? ' · ' + this._esc(t.note) : ''}</div>
+        ${tr ? `<div class="trace-x"><span class="trace-link" onclick="Materials.openDocDetail('${this._jsq(t.docNo)}')">看單據明細 →</span></div>` : ''}</div>`;
+    }).join('');
+    App.openModal({ title: '來源追溯 · ' + this._esc(partNo) + '（' + this._esc(stage) + '·' + type + '）', body: `<div class="trace-box">${items}</div>`, footer: `<div style="flex:1"></div><button class="btn-ghost" onclick="App.closeModal()">關閉</button>` });
+  },
+};
