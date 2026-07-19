@@ -116,7 +116,7 @@
         <li><b>匯入檔案：</b>將錄音檔直接拖曳至 Buzz 視窗中。</li>
         <li><b>參數設定（彈出視窗，每一欄照下面選）：</b>
           <ul class="bz-sub">
-            <li><b>模型：</b><code>Whisper</code>＋<code>Medium</code>（正式會議紀錄建議·中文最穩）。趕時間可用 <code>Small</code>（快·草稿等級）；<b>預設的 <code>Tiny</code> 中文幾乎不能用，務必更改</b>。</li>
+            <li><b>模型：</b><code>Whisper</code>＋<code>Large</code>（實測＝正式紀錄等級·轉譯最慢、模型檔最大）；電腦跑不動或趕時間改 <code>Medium</code>（平衡）／<code>Small</code>（快·草稿）；<b>預設的 <code>Tiny</code> 中文幾乎不能用，務必更改</b>。</li>
             <li><b>任務：</b><code>轉錄</code></li>
             <li><b>語言：</b><code>中文</code>（Buzz 記住的是「上次的選擇」——要轉英文或其他語言的錄音時，每次轉譯前在這個視窗把「語言」改成該語言即可）</li>
             <li><b>匯出格式：</b>勾選 <code>TXT</code>＋<code>SRT</code></li>
