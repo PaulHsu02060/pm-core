@@ -353,8 +353,8 @@ App.showSettingsTab=function(btn,id){if(id!=="範本"&&App._tplDraft&&App._tplDi
           <div><input type="text" id="set-dept" value="${U.esc(s.department||"")}" placeholder="例：研發部"></div>
         </div>
       </div>
-      <!-- Google OAuth + 白名單 -->
-      <div class="settings-section">
+      <!-- Google OAuth + 白名單（so-online：離線包免登入·整卡隱藏——彙整回饋#6 同步 UI 拔淨） -->
+      <div class="settings-section so-online">
         <div class="ss-title">🔐 Google 登入</div>
         <div class="ss-desc">用 Google 帳號登入，資料以 Gmail 區分，各使用者完全獨立</div>
 

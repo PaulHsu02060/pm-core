@@ -1,5 +1,6 @@
 /*! PM-Core (c) 2026 Paul Hsu. All Rights Reserved. Proprietary — see LICENSE. */
-App.buildProjectHeaderHtml=function(){const proj=this.getProj(this.currentProjectId);if(!proj)return"";return`<div class="proj-header">
+App.buildProjectHeaderHtml=function(){const proj=this.getProj(this.currentProjectId);if(!proj)return"";const prevNames={home:"首頁",workspace:"個人工作台",portfolio:"全專案總覽",materials:"物料分析",gantt:"跨專案時程",reportgen:"報表產出",transcripts:"會議逐字稿",settings:"設定",archive:"專案檔案室"};const back=this._prevPage&&this._prevPage!=="project"&&prevNames[this._prevPage]?`<button class="tb-action ghost proj-back" onclick="App.showPage('${this._prevPage}')" title="回到剛才的頁面繼續看其他專案">← 回${prevNames[this._prevPage]}</button>`:"";return`<div class="proj-header">
+        ${back}
         <div style="flex:1; min-width:0;">
           <div class="proj-name">
             ${U.esc(proj.name)}
